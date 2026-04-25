@@ -197,13 +197,18 @@ def handle_extract_track_name_change(track_name_value: str, mode: str):
 
 
 def handle_extract_src_audio_change(src_audio_path, mode: str):
-    """Auto-fill audio duration from source audio in Extract/Lego mode."""
+    """Auto-fill audio duration from source audio in Extract/Lego mode.
+
+    Reads duration directly via soundfile to avoid the training-module
+    safe_path guard, which rejects Gradio-uploaded files stored under the
+    system temp directory (e.g. AppData\\Local\\Temp\\gradio\\... on Windows).
+    """
     if mode not in ("Extract", "Lego") or not src_audio_path:
         return gr.update()
     try:
-        # Late import avoids loading training audio helpers unless this path is used.
-        from acestep.training.dataset_builder_modules.audio_io import get_audio_duration
-        duration = get_audio_duration(src_audio_path)
+        import soundfile as sf
+        info = sf.info(src_audio_path)
+        duration = int(info.duration)
         if duration and duration > 0:
             return gr.update(value=float(duration))
     except Exception as e:

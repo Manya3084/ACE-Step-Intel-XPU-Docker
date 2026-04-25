@@ -221,5 +221,52 @@ class ModeUiStateClearingTests(unittest.TestCase):
             self.assertFalse(result[idx].get("interactive"))
 
 
+try:
+    from acestep.ui.gradio.events.generation.mode_ui import handle_extract_src_audio_change
+    _EXTRACT_IMPORT_ERROR = None
+except Exception as exc:  # pragma: no cover - environment dependency guard
+    handle_extract_src_audio_change = None
+    _EXTRACT_IMPORT_ERROR = exc
+
+
+@unittest.skipIf(handle_extract_src_audio_change is None,
+                 f"handle_extract_src_audio_change import unavailable: {_EXTRACT_IMPORT_ERROR}")
+class ExtractSrcAudioDurationTests(unittest.TestCase):
+    """Regression tests for issue #1118 — Gradio temp-path 'safe root' rejection.
+
+    Gradio uploads land under the system temp dir (e.g. AppData\\Local\\Temp\\gradio
+    on Windows), which is outside the project safe-root. The handler must read
+    duration without invoking the training-module path-safety guard.
+    """
+
+    def test_returns_noop_for_non_extract_lego_mode(self):
+        """Non-Extract/Lego modes should return an empty update without inspecting the file."""
+        result = handle_extract_src_audio_change("/anywhere/file.wav", "Custom")
+        self.assertNotIn("value", getattr(result, "_props", {}) or {})
+
+    def test_returns_noop_for_empty_src_audio(self):
+        """Empty src_audio should short-circuit without raising."""
+        result = handle_extract_src_audio_change("", "Extract")
+        self.assertNotIn("value", getattr(result, "_props", {}) or {})
+
+    def test_reads_duration_from_gradio_temp_path_without_safe_path(self):
+        """A Gradio temp path outside the project safe root must NOT raise."""
+        from unittest.mock import patch, MagicMock
+        fake_info = MagicMock(duration=42.7)
+        gradio_temp_path = r"C:\Users\test\AppData\Local\Temp\gradio\abc\song.wav"
+        with patch("soundfile.info", return_value=fake_info) as mock_info:
+            result = handle_extract_src_audio_change(gradio_temp_path, "Extract")
+            mock_info.assert_called_once_with(gradio_temp_path)
+        # Result should carry a positive numeric value without exception.
+        self.assertEqual(getattr(result, "_props", {}).get("value"), 42.0)
+
+    def test_swallows_invalid_audio_errors(self):
+        """A bad/unreadable file should be logged-and-skipped, not raised."""
+        from unittest.mock import patch
+        with patch("soundfile.info", side_effect=RuntimeError("bad file")):
+            result = handle_extract_src_audio_change("/tmp/bogus.wav", "Lego")
+        self.assertNotIn("value", getattr(result, "_props", {}) or {})
+
+
 if __name__ == "__main__":
     unittest.main()
