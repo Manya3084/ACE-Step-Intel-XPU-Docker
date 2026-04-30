@@ -128,3 +128,35 @@ def resolve_is_pure_base_model(
     )
     actual_model = init_params.get("config_path", default_model) if init_params else default_model
     return is_pure_base_model((actual_model or "").lower())
+
+
+def resolve_is_sft_model(
+    dit_handler: Any,
+    init_params: dict[str, Any] | None,
+    service_pre_initialized: bool,
+) -> bool:
+    """Resolve whether the initial-render model is an SFT variant.
+
+    Mirrors ``resolve_is_pure_base_model`` but checks for SFT.  Used so
+    SFT users see ``GENERATION_MODES_SFT`` (which includes Edit, #1156)
+    on first render — without this they'd fall through to the turbo
+    list and have to wait for a config refresh to see the Edit mode.
+    """
+    from acestep.ui.gradio.events.generation.model_config import is_sft_model
+
+    if service_pre_initialized and init_params and "dit_handler" in init_params:
+        config_path = init_params.get("config_path", "")
+        return is_sft_model((config_path or "").lower())
+
+    available_models = dit_handler.get_available_acestep_v15_models()
+    default_model = (
+        "acestep-v15-xl-turbo"
+        if "acestep-v15-xl-turbo" in available_models
+        else (
+            "acestep-v15-turbo"
+            if "acestep-v15-turbo" in available_models
+            else (available_models[0] if available_models else None)
+        )
+    )
+    actual_model = init_params.get("config_path", default_model) if init_params else default_model
+    return is_sft_model((actual_model or "").lower())

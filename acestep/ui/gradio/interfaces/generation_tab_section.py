@@ -4,9 +4,17 @@ from typing import Any
 
 import gradio as gr
 
-from acestep.constants import GENERATION_MODES_BASE, GENERATION_MODES_TURBO
+from acestep.constants import (
+    GENERATION_MODES_BASE,
+    GENERATION_MODES_SFT,
+    GENERATION_MODES_TURBO,
+)
 
-from .generation_defaults import compute_init_defaults, resolve_is_pure_base_model
+from .generation_defaults import (
+    compute_init_defaults,
+    resolve_is_pure_base_model,
+    resolve_is_sft_model,
+)
 from .generation_tab_primary_controls import (
     build_hidden_generation_state,
     build_mode_selector_controls,
@@ -64,7 +72,20 @@ def create_generation_tab_section(
         init_params=init_params,
         service_pre_initialized=service_pre_initialized,
     )
-    initial_mode_choices = GENERATION_MODES_BASE if is_pure_base_model else GENERATION_MODES_TURBO
+    # SFT variants also support flow-edit (#1156), so they need their
+    # own mode list on initial render — without this fallback SFT users
+    # would not see the Edit dropdown until a later config refresh.
+    is_sft_model_selected = resolve_is_sft_model(
+        dit_handler=dit_handler,
+        init_params=init_params,
+        service_pre_initialized=service_pre_initialized,
+    )
+    if is_pure_base_model:
+        initial_mode_choices = GENERATION_MODES_BASE
+    elif is_sft_model_selected:
+        initial_mode_choices = GENERATION_MODES_SFT
+    else:
+        initial_mode_choices = GENERATION_MODES_TURBO
 
     with gr.Group():
         mode_controls = build_mode_selector_controls(initial_mode_choices)
