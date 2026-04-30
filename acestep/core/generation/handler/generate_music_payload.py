@@ -60,6 +60,9 @@ class GenerateMusicPayloadMixin:
                 "seed_value": seed_value_for_ui,
                 "retake_seed_value": retake_seed_value_for_ui,
                 "retake_variance": retake_variance,
+                "retake_source_session_dir": outputs.get("retake_source_session_dir"),
+                "retake_source_track_index": outputs.get("retake_source_track_index"),
+                "retake_source_latent_mix_ratio": outputs.get("retake_source_latent_mix_ratio"),
             }
         else:
             src_latents = outputs.get("src_latents")
@@ -84,6 +87,10 @@ class GenerateMusicPayloadMixin:
                 "seed_value": seed_value_for_ui,
                 "retake_seed_value": retake_seed_value_for_ui,
                 "retake_variance": retake_variance,
+                "retake_source_session_dir": outputs.get("retake_source_session_dir"),
+                "retake_source_track_index": outputs.get("retake_source_track_index"),
+                "retake_source_latent_mix_ratio": outputs.get("retake_source_latent_mix_ratio"),
+                "retake_repaint_mask": outputs.get("retake_repaint_mask"),
                 "encoder_hidden_states": (
                     encoder_hidden_states.detach().cpu()
                     if encoder_hidden_states is not None

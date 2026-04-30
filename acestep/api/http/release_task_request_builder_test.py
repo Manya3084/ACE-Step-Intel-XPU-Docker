@@ -14,10 +14,10 @@ class _FakeParser:
 
         self._values = values
 
-    def get(self, key: str):
+    def get(self, key: str, default=None):
         """Return raw value for ``key`` from parser payload."""
 
-        return self._values.get(key)
+        return self._values.get(key, default)
 
     def str(self, key: str, default: str = "") -> str:
         """Return string value for ``key`` with default fallback."""
@@ -133,6 +133,35 @@ class ReleaseTaskRequestBuilderTests(unittest.TestCase):
 
         self.assertEqual("<|audio_code_7|>", request.audio_code_string)
         self.assertAlmostEqual(0.6, request.cover_noise_strength)
+
+    def test_build_request_forwards_session_retake_fields(self):
+        """Builder should include session-backed retake request fields."""
+        parser = _FakeParser(
+            {
+                "repaint_mode": "most natural",
+                "source_session_dir": "/tmp/source-session",
+                "source_track_index": 2,
+                "source_latent_mix_ratio": 0.25,
+                "save_session_artifacts": True,
+                "session_output_dir": "/tmp/out-session",
+            }
+        )
+
+        request = build_generate_music_request(
+            parser=parser,
+            request_model_cls=lambda **kwargs: SimpleNamespace(**kwargs),
+            default_dit_instruction="default-instruction",
+            lm_default_temperature=0.85,
+            lm_default_cfg_scale=2.5,
+            lm_default_top_p=0.9,
+        )
+
+        self.assertEqual("most natural", request.repaint_mode)
+        self.assertEqual("/tmp/source-session", request.source_session_dir)
+        self.assertEqual(2, request.source_track_index)
+        self.assertAlmostEqual(0.25, request.source_latent_mix_ratio)
+        self.assertTrue(request.save_session_artifacts)
+        self.assertEqual("/tmp/out-session", request.session_output_dir)
 
 
 if __name__ == "__main__":

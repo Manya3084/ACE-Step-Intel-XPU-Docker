@@ -1,10 +1,18 @@
 """Unit tests for lrc_utils module."""
 
 import unittest
+from tempfile import TemporaryDirectory
+from unittest.mock import MagicMock, patch
 
+from acestep.ui.gradio.events.results.feature_cache import (
+    build_storable_extra_outputs,
+    persist_feature_cache,
+)
+from acestep.ui.gradio.events.results.feature_cache_test import _extra_outputs
 from acestep.ui.gradio.events.results.lrc_utils import (
-    parse_lrc_to_subtitles,
     _format_vtt_timestamp,
+    generate_lrc_handler,
+    parse_lrc_to_subtitles,
     save_lrc_to_file,
 )
 
@@ -118,6 +126,43 @@ class SaveLrcToFileTests(unittest.TestCase):
         # Should have a value pointing to a .lrc file
         self.assertIn("value", result)
         self.assertTrue(result["value"].endswith(".lrc"))
+
+
+class GenerateLrcHandlerTests(unittest.TestCase):
+    """Cover LRC generation from disk-backed feature cache."""
+
+    def test_loads_feature_cache_for_manual_lrc_generation(self):
+        """Manual LRC should load per-sample tensors from cache paths."""
+        extra_outputs = _extra_outputs()
+        with TemporaryDirectory() as cache_dir:
+            persist_feature_cache(extra_outputs, cache_dir)
+            storable = build_storable_extra_outputs(extra_outputs, [], [])
+            batch_queue = {
+                0: {
+                    "generation_params": {"audio_duration": -1},
+                    "extra_outputs": storable,
+                }
+            }
+            dit_handler = MagicMock()
+            dit_handler.get_lyric_timestamp.return_value = {
+                "success": True,
+                "lrc_text": "[00:01.00]hello",
+            }
+            gpu_config = MagicMock(save_memory_mode=False)
+            with patch("acestep.gpu_config.get_global_gpu_config", return_value=gpu_config):
+                update, _accordion, updated_queue = generate_lrc_handler(
+                    dit_handler,
+                    2,
+                    0,
+                    batch_queue,
+                    "en",
+                    8,
+                )
+
+        self.assertEqual("[00:01.00]hello", update["value"])
+        call_kwargs = dit_handler.get_lyric_timestamp.call_args.kwargs
+        self.assertEqual(tuple(call_kwargs["pred_latent"].shape), (1, 4, 3))
+        self.assertEqual("[00:01.00]hello", updated_queue[0]["lrcs"][1])
 
 
 if __name__ == "__main__":

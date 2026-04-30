@@ -15,6 +15,11 @@ from acestep.constants import DEFAULT_DIT_INSTRUCTION
 from acestep.core.generation.handler.repaint_waveform_splice import (
     apply_repaint_waveform_splice,
 )
+from acestep.core.generation.handler.retake_latents import (
+    build_retake_mask,
+    splice_retake_latents,
+)
+from acestep.core.generation.handler.retake_session import is_session_retake_mode
 from acestep.gpu_config import (
     DIT_INFERENCE_VRAM_PER_BATCH,
     VRAM_SAFETY_MARGIN_GB,
@@ -32,13 +37,18 @@ def _resolve_repaint_config(
     Higher *strength* means more aggressive repainting (less source preservation).
 
     Args:
-        mode: One of ``"conservative"``, ``"balanced"``, or ``"aggressive"``.
+        mode: One of ``"auto"``, ``"most natural"``, ``"retake"``,
+            ``"conservative"``, ``"balanced"``, or ``"aggressive"``.
         strength: 0.0 = conservative (max preservation), 1.0 = aggressive
             (pure diffusion).  Only effective in balanced mode.
 
     Returns:
         Tuple of ``(injection_ratio, crossfade_frames, wav_crossfade_sec)``.
     """
+    if is_session_retake_mode(mode):
+        return 0.0, 0, 0.0
+    if mode == "auto":
+        mode = "balanced"
     strength = max(0.0, min(1.0, strength))
     if mode == "aggressive":
         return 0.0, 0, 0.0
@@ -223,6 +233,11 @@ class GenerateMusicMixin:
         repaint_wav_crossfade_sec: float = 0.0,
         repaint_mode: str = "balanced",
         repaint_strength: float = 0.5,
+        source_session_dir: Optional[str] = None,
+        source_track_index: int = 1,
+        source_latent_mix_ratio: float = 0.3,
+        repainting_regions: Optional[List[Dict[str, float]]] = None,
+        retake_source_latents: Optional[torch.Tensor] = None,
         retake_seed: Optional[Union[str, float, int]] = None,
         retake_variance: float = 0.0,
         flow_edit_morph: bool = False,
@@ -258,6 +273,13 @@ class GenerateMusicMixin:
             use_tiled_decode: Whether tiled VAE decode is used.
             latent_shift: Additive latent post-processing value.
             latent_rescale: Multiplicative latent post-processing value.
+            source_session_dir: Optional source session directory for
+                session-backed repaint retake.
+            source_track_index: One-based source track index used for retake.
+            source_latent_mix_ratio: Source latent mix ratio for retake noise
+                initialization.
+            repainting_regions: Optional multi-region edit list for retake.
+            retake_source_latents: Loaded source final latents for retake.
             progress: Optional callback taking ``(ratio, desc=...)``.
 
         Returns:
@@ -273,11 +295,14 @@ class GenerateMusicMixin:
             readiness_error = self._validate_generate_music_readiness()
             return readiness_error
 
+        uses_session_retake = is_session_retake_mode(repaint_mode)
         task_type, instruction = self._resolve_generate_music_task(
             task_type=task_type,
             audio_code_string=audio_code_string,
             instruction=instruction,
         )
+        if uses_session_retake and task_type == "cover":
+            task_type = "text2music"
 
         # Turbo models bake guidance into the distillation process and do not
         # use CFG.  Forcing guidance_scale to 1.0 avoids double-application of
@@ -379,6 +404,8 @@ class GenerateMusicMixin:
             injection_ratio, resolved_cf_frames, resolved_wav_cf = (
                 _resolve_repaint_config(repaint_mode, repaint_strength)
             )
+            if uses_session_retake and retake_source_latents is None:
+                raise ValueError("repaint_mode='most natural' requires source session latents")
 
             service_run = self._run_generate_music_service_with_progress(
                 progress=progress,
@@ -407,6 +434,8 @@ class GenerateMusicMixin:
                 dcw_wavelet=dcw_wavelet,
                 repaint_crossfade_frames=resolved_cf_frames,
                 repaint_injection_ratio=injection_ratio,
+                retake_source_latents=retake_source_latents,
+                source_latent_mix_ratio=source_latent_mix_ratio if uses_session_retake else 0.0,
                 task_type=task_type,
                 actual_retake_seed_list=actual_retake_seed_list,
                 retake_variance=retake_variance,
@@ -428,6 +457,25 @@ class GenerateMusicMixin:
                 latent_shift=latent_shift,
                 latent_rescale=latent_rescale,
             )
+            if uses_session_retake and retake_source_latents is not None:
+                retake_mask = build_retake_mask(
+                    target_length=pred_latents.shape[1],
+                    sample_rate=self.sample_rate,
+                    repainting_start=repainting_start,
+                    repainting_end=repainting_end,
+                    repainting_regions=repainting_regions,
+                ).to(device=pred_latents.device)
+                pred_latents = splice_retake_latents(
+                    pred_latents=pred_latents,
+                    source_latents=retake_source_latents,
+                    repaint_mask=retake_mask,
+                    crossfade_frames=25,
+                )
+                outputs["target_latents"] = pred_latents
+                outputs["retake_source_session_dir"] = source_session_dir
+                outputs["retake_source_track_index"] = source_track_index
+                outputs["retake_source_latent_mix_ratio"] = source_latent_mix_ratio
+                outputs["retake_repaint_mask"] = retake_mask.detach().cpu()
             pred_wavs, pred_latents_cpu, time_costs = self._decode_generate_music_pred_latents(
                 pred_latents=pred_latents,
                 progress=progress,
@@ -438,6 +486,7 @@ class GenerateMusicMixin:
             repainting_end_batch = service_inputs.get("repainting_end_batch")
             do_wav_splice = (
                 repaint_mode != "aggressive"
+                and not uses_session_retake
                 and repainting_start_batch is not None
                 and repainting_end_batch is not None
             )

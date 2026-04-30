@@ -4,9 +4,13 @@ from __future__ import annotations
 
 from typing import List, Literal, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from acestep.constants import DEFAULT_DIT_INSTRUCTION
+from acestep.core.generation.handler.retake_session import (
+    MOST_NATURAL_REPAINT_MODE,
+    normalize_repaint_mode_alias,
+)
 
 
 class GenerateMusicRequest(BaseModel):
@@ -71,15 +75,51 @@ class GenerateMusicRequest(BaseModel):
         default=0.0,
         description="Waveform-level splice crossfade in seconds (0=hard cut)",
     )
-    repaint_mode: Literal["conservative", "balanced", "aggressive"] = Field(
-        default="balanced",
-        description="Repaint preservation mode: conservative (max src retention), balanced (tunable), aggressive (pure diffusion)",
+    repaint_mode: Literal[
+        "auto",
+        "conservative",
+        "balanced",
+        "aggressive",
+        "most natural",
+    ] = Field(
+        default="auto",
+        description=(
+            "Repaint preservation mode: auto, conservative, balanced, aggressive, "
+            f"or session-backed {MOST_NATURAL_REPAINT_MODE}"
+        ),
     )
     repaint_strength: float = Field(
         default=0.5,
         ge=0.0,
         le=1.0,
         description="Balanced-mode repaint intensity: 0.0=conservative (max source preservation), 1.0=aggressive (pure diffusion). Only used in balanced mode.",
+    )
+    source_session_dir: Optional[str] = Field(
+        default=None,
+        description="Reusable ACE-Step source session directory for repaint_mode='most natural'.",
+    )
+    source_track_index: int = Field(
+        default=1,
+        ge=1,
+        description="One-based source track index inside source_session_dir.",
+    )
+    source_latent_mix_ratio: float = Field(
+        default=0.3,
+        ge=0.0,
+        lt=1.0,
+        description="Retake source-latent mix ratio used for biased initial noise.",
+    )
+    repainting_regions: Optional[List[dict]] = Field(
+        default=None,
+        description="Optional multiple repaint regions, each with start/end seconds.",
+    )
+    save_session_artifacts: bool = Field(
+        default=False,
+        description="Persist generated audio codes and final latents for future retake.",
+    )
+    session_output_dir: Optional[str] = Field(
+        default=None,
+        description="Destination directory for reusable generation session artifacts.",
     )
     analysis_only: bool = False
     full_analysis_only: bool = False
@@ -123,6 +163,12 @@ class GenerateMusicRequest(BaseModel):
     lm_top_p: Optional[float] = 0.9
     lm_repetition_penalty: float = 1.0
     lm_negative_prompt: str = "NO USER INPUT"
+
+    @field_validator("repaint_mode", mode="before")
+    @classmethod
+    def _normalize_repaint_mode(cls, value):
+        """Accept legacy retake aliases while storing the public mode label."""
+        return normalize_repaint_mode_alias(value)
 
     class Config:
         """Legacy pydantic config preserving prior population semantics."""

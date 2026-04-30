@@ -39,6 +39,21 @@ def register_results_aux_handlers(
     # ========== Send to Remix / Repaint Handlers ==========
     # Mode-UI outputs shared with generation_mode.change — applied atomically
     # so we don't rely on a chained .change() event for visibility/label updates.
+    def make_repaint_handler(idx: int):
+        """Build a repaint transfer callback bound to one result card."""
+
+        return lambda audio, lm, ly, cap, cur_mode, batch_idx, queue: res_h.send_audio_to_repaint(
+            audio,
+            lm,
+            ly,
+            cap,
+            cur_mode,
+            batch_idx,
+            queue,
+            idx,
+            llm_handler,
+        )
+
     for btn_idx in range(1, 9):
         results_section[f"send_to_remix_btn_{btn_idx}"].click(
             fn=lambda audio, lm, ly, cap, cur_mode: res_h.send_audio_to_remix(
@@ -62,15 +77,15 @@ def register_results_aux_handlers(
             + list(mode_ui_outputs),
         )
         results_section[f"send_to_repaint_btn_{btn_idx}"].click(
-            fn=lambda audio, lm, ly, cap, cur_mode: res_h.send_audio_to_repaint(
-                audio, lm, ly, cap, cur_mode, llm_handler
-            ),
+            fn=make_repaint_handler(btn_idx),
             inputs=[
                 results_section[f"generated_audio_{btn_idx}"],
                 results_section["lm_metadata_state"],
                 generation_section["lyrics"],
                 generation_section["captions"],
                 generation_section["generation_mode"],
+                results_section["current_batch_index"],
+                results_section["batch_queue"],
             ],
             outputs=[
                 generation_section["src_audio"],
@@ -80,7 +95,11 @@ def register_results_aux_handlers(
                 generation_section["flow_edit_source_caption"],
                 generation_section["flow_edit_source_lyrics"],
             ]
-            + list(mode_ui_outputs),
+            + list(mode_ui_outputs)
+            + [
+                generation_section["source_session_dir"],
+                generation_section["source_track_index"],
+            ],
         )
 
     # ========== Score Calculation Handlers ==========

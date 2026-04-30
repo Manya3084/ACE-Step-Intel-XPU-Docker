@@ -51,6 +51,9 @@ def generate_with_batch_management(
     latent_rescale,
     repaint_mode,
     repaint_strength,
+    source_session_dir,
+    source_track_index,
+    source_latent_mix_ratio,
     retake_variance,
     retake_seed,
     flow_edit_morph,
@@ -93,6 +96,7 @@ def generate_with_batch_management(
         enable_normalization, normalization_db, fade_in_duration, fade_out_duration,
         latent_shift, latent_rescale,
         repaint_mode, repaint_strength,
+        source_session_dir, source_track_index, source_latent_mix_ratio,
         retake_variance, retake_seed,
         flow_edit_morph, flow_edit_source_caption, flow_edit_source_lyrics,
         flow_edit_n_min, flow_edit_n_max, flow_edit_n_avg,
@@ -169,6 +173,9 @@ def generate_with_batch_management(
         enable_normalization, normalization_db, fade_in_duration, fade_out_duration,
         latent_shift, latent_rescale,
         repaint_mode=repaint_mode, repaint_strength=repaint_strength,
+        source_session_dir=source_session_dir,
+        source_track_index=source_track_index,
+        source_latent_mix_ratio=source_latent_mix_ratio,
         retake_variance=retake_variance, retake_seed=retake_seed,
     )
 

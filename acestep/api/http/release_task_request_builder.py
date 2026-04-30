@@ -32,7 +32,16 @@ def build_generate_music_request(
     reference_audio = overrides.pop("reference_audio_path", None) or parser.str("reference_audio_path") or None
     src_audio = overrides.pop("src_audio_path", None) or parser.str("src_audio_path") or None
 
-    track_classes = parser.get("track_classes")
+    def _get_raw(key: str, default: Any = None) -> Any:
+        """Return raw parser value while supporting minimal parser stubs."""
+
+        try:
+            value = parser.get(key, default)
+        except TypeError:
+            value = parser.get(key)
+        return default if value is None else value
+
+    track_classes = _get_raw("track_classes")
     if track_classes is not None and isinstance(track_classes, str):
         track_classes = [track_classes]
 
@@ -56,7 +65,7 @@ def build_generate_music_request(
         inference_steps=parser.int("inference_steps", 8),
         guidance_scale=parser.float("guidance_scale", 7.0),
         use_random_seed=parser.bool("use_random_seed", True),
-        seed=parser.get("seed", -1),
+        seed=_get_raw("seed", -1),
         batch_size=parser.int("batch_size"),
         repainting_start=parser.float("repainting_start", 0.0),
         repainting_end=parser.float("repainting_end"),
@@ -74,8 +83,14 @@ def build_generate_music_request(
         repaint_wav_crossfade_sec=parser.float(
             "repaint_wav_crossfade_sec", 0.0,
         ),
-        repaint_mode=parser.str("repaint_mode", "balanced"),
+        repaint_mode=parser.str("repaint_mode", "auto"),
         repaint_strength=parser.float("repaint_strength", 0.5),
+        source_session_dir=parser.str("source_session_dir") or None,
+        source_track_index=parser.int("source_track_index", 1),
+        source_latent_mix_ratio=parser.float("source_latent_mix_ratio", 0.3),
+        repainting_regions=_get_raw("repainting_regions"),
+        save_session_artifacts=parser.bool("save_session_artifacts"),
+        session_output_dir=parser.str("session_output_dir") or None,
         use_adg=parser.bool("use_adg"),
         cfg_interval_start=parser.float("cfg_interval_start", 0.0),
         cfg_interval_end=parser.float("cfg_interval_end", 1.0),

@@ -5,21 +5,23 @@ Gradio generate button: validates GPU limits, calls the inference
 pipeline, saves audio files, and optionally runs auto-scoring and
 auto-LRC in a single streaming pass.
 """
-import os
 import json
+import os
 import time as time_module
+import uuid
 
 import gradio as gr
 import torch
 from loguru import logger
 
-from acestep.inference import generate_music, GenerationParams, GenerationConfig
 from acestep.audio_utils import save_audio
+from acestep.core.generation.handler.retake_session_save import save_generation_session_artifacts
 from acestep.gpu_config import (
-    get_global_gpu_config,
     check_duration_limit,
     check_batch_size_limit,
+    get_global_gpu_config,
 )
+from acestep.inference import GenerationConfig, GenerationParams, generate_music
 from acestep.ui.gradio.i18n import t
 from acestep.ui.gradio.events.generation_handlers import parse_and_validate_timesteps
 from acestep.ui.gradio.events.results.generation_info import (
@@ -29,6 +31,12 @@ from acestep.ui.gradio.events.results.generation_info import (
 from acestep.ui.gradio.events.results.generation_task_type import resolve_no_fsq_task_type
 from acestep.ui.gradio.events.results.audio_playback_updates import (
     build_audio_slot_update,
+)
+from acestep.ui.gradio.events.results.feature_cache import (
+    build_storable_extra_outputs,
+    feature_duration_seconds,
+    load_sample_feature_data,
+    persist_feature_cache,
 )
 from acestep.ui.gradio.events.results.scoring import calculate_score_handler
 from acestep.ui.gradio.events.results.lrc_utils import lrc_to_vtt_file
@@ -61,6 +69,9 @@ def generate_with_progress(
     latent_rescale,
     repaint_mode,
     repaint_strength,
+    source_session_dir="",
+    source_track_index=1,
+    source_latent_mix_ratio=0.3,
     retake_variance=0.0,
     retake_seed="",
     flow_edit_morph=False,
@@ -180,8 +191,13 @@ def generate_with_progress(
         fade_out_duration=fade_out_duration if fade_out_duration else 0.0,
         latent_shift=latent_shift,
         latent_rescale=latent_rescale,
-        repaint_mode=repaint_mode if repaint_mode else "balanced",
+        repaint_mode=repaint_mode if repaint_mode else "auto",
         repaint_strength=float(repaint_strength) if repaint_strength is not None else 0.5,
+        source_session_dir=source_session_dir or None,
+        source_track_index=int(source_track_index) if source_track_index else 1,
+        source_latent_mix_ratio=(
+            float(source_latent_mix_ratio) if source_latent_mix_ratio is not None else 0.3
+        ),
         retake_variance=float(retake_variance) if retake_variance is not None else 0.0,
         # Empty textbox -> None; otherwise a string is fine (handler.prepare_seeds parses it).
         retake_seed=(retake_seed.strip() or None) if isinstance(retake_seed, str) else retake_seed,
@@ -210,7 +226,22 @@ def generate_with_progress(
         mp3_sample_rate=mp3_sample_rate,
     )
 
-    result = generate_music(dit_handler, llm_handler, params=gen_params, config=gen_config, progress=progress)
+    result = generate_music(
+        dit_handler,
+        llm_handler,
+        params=gen_params,
+        config=gen_config,
+        progress=progress,
+    )
+    _persist_gradio_source_session(
+        result=result,
+        task_type=task_type,
+        audio_codes=text2music_audio_code_string,
+        think_enabled=bool(think_checkbox),
+        lm_initialized=bool(lm_initialized),
+        flow_edit_morph=bool(flow_edit_morph),
+    )
+    _persist_gradio_feature_cache(result)
 
     audio_outputs = [None] * 8
     all_audio_paths: list = []
@@ -393,7 +424,11 @@ def generate_with_progress(
     final_codes_display = [gr.skip()] * 8
     final_accordions = [gr.skip()] * 8
 
-    extra_to_store = {**result.extra_outputs, "lrcs": final_lrcs_list, "subtitles": final_subtitles_list}
+    extra_to_store = build_storable_extra_outputs(
+        result.extra_outputs,
+        final_lrcs_list,
+        final_subtitles_list,
+    )
     for k, v in extra_to_store.items():
         if isinstance(v, torch.Tensor) and v.is_cuda:
             extra_to_store[k] = v.cpu()
@@ -418,26 +453,89 @@ def _extract_sample_tensor(extra_outputs, sample_idx):
     Returns ``None`` when data is missing or incomplete.
     """
     try:
-        full_pred = extra_outputs.get("pred_latents")
-        if full_pred is None or sample_idx >= full_pred.shape[0]:
-            return None
-        data = {
-            "pred_latent": full_pred[sample_idx:sample_idx + 1],
-            "encoder_hidden_states": extra_outputs.get("encoder_hidden_states")[sample_idx:sample_idx + 1]
-                if extra_outputs.get("encoder_hidden_states") is not None else None,
-            "encoder_attention_mask": extra_outputs.get("encoder_attention_mask")[sample_idx:sample_idx + 1]
-                if extra_outputs.get("encoder_attention_mask") is not None else None,
-            "context_latents": extra_outputs.get("context_latents")[sample_idx:sample_idx + 1]
-                if extra_outputs.get("context_latents") is not None else None,
-            "lyric_token_ids": extra_outputs.get("lyric_token_idss")[sample_idx:sample_idx + 1]
-                if extra_outputs.get("lyric_token_idss") is not None else None,
-        }
-        if any(v is None for v in data.values()):
-            return None
-        return data
+        return load_sample_feature_data(extra_outputs, sample_idx)
     except Exception as e:
         print(f"[Auto Score] Failed to prepare tensor data for sample {sample_idx}: {e}")
         return None
+
+
+def _persist_gradio_source_session(
+    *,
+    result,
+    task_type: str,
+    audio_codes: str,
+    think_enabled: bool,
+    lm_initialized: bool,
+    flow_edit_morph: bool,
+) -> None:
+    """Save hidden source-session artifacts for Gradio text2music outputs.
+
+    The artifacts are used by "Send To Repaint" to enable session-backed
+    most-natural repaint without exposing filesystem fields in the UI.
+    """
+    if not _should_persist_gradio_source_session(
+        task_type=task_type,
+        audio_codes=audio_codes,
+        think_enabled=think_enabled,
+        lm_initialized=lm_initialized,
+        flow_edit_morph=flow_edit_morph,
+    ):
+        return
+    if not getattr(result, "success", False):
+        return
+    session_dir = _build_gradio_source_session_dir()
+    try:
+        save_generation_session_artifacts(result=result, session_dir=session_dir)
+    except (OSError, ValueError) as exc:
+        logger.warning("[gradio_repaint] Could not save source session artifacts: {}", exc)
+        return
+    result.extra_outputs["session_output_dir"] = session_dir
+
+
+def _persist_gradio_feature_cache(result) -> None:
+    """Save score/LRC feature tensors to disk and keep only paths in history."""
+    if not getattr(result, "success", False):
+        return
+    extra_outputs = result.extra_outputs or {}
+    if extra_outputs.get("feature_cache_files"):
+        return
+    cache_dir = extra_outputs.get("session_output_dir") or _build_gradio_feature_cache_dir()
+    try:
+        persist_feature_cache(extra_outputs, cache_dir)
+    except (OSError, RuntimeError) as exc:
+        logger.warning("[gradio_features] Could not save score/LRC feature cache: {}", exc)
+
+
+def _should_persist_gradio_source_session(
+    *,
+    task_type: str,
+    audio_codes: str,
+    think_enabled: bool,
+    lm_initialized: bool,
+    flow_edit_morph: bool,
+) -> bool:
+    """Return whether Gradio should save hidden retake source artifacts."""
+    if task_type != "text2music" or flow_edit_morph:
+        return False
+    if audio_codes and str(audio_codes).strip():
+        return True
+    return think_enabled and lm_initialized
+
+
+def _build_gradio_source_session_dir() -> str:
+    """Build a unique hidden session directory under Gradio outputs."""
+    stamp = time_module.strftime("%Y%m%d_%H%M%S")
+    suffix = uuid.uuid4().hex[:8]
+    path = os.path.join(DEFAULT_RESULTS_DIR, "source_sessions", f"{stamp}_{suffix}")
+    return os.path.abspath(path).replace("\\", "/")
+
+
+def _build_gradio_feature_cache_dir() -> str:
+    """Build a unique hidden feature-cache directory under Gradio outputs."""
+    stamp = time_module.strftime("%Y%m%d_%H%M%S")
+    suffix = uuid.uuid4().hex[:8]
+    path = os.path.join(DEFAULT_RESULTS_DIR, "feature_sessions", f"{stamp}_{suffix}")
+    return os.path.abspath(path).replace("\\", "/")
 
 
 def _run_auto_lrc(dit_handler, extra_outputs, sample_idx,
@@ -449,26 +547,24 @@ def _run_auto_lrc(dit_handler, extra_outputs, sample_idx,
     """
     logger.info(f"[auto_lrc] Starting LRC generation for sample {sample_idx + 1}")
     try:
-        pred_latents = extra_outputs.get("pred_latents")
-        enc_hs = extra_outputs.get("encoder_hidden_states")
-        enc_am = extra_outputs.get("encoder_attention_mask")
-        ctx_lat = extra_outputs.get("context_latents")
-        lyric_ids = extra_outputs.get("lyric_token_idss")
-
-        if not all(x is not None for x in [pred_latents, enc_hs, enc_am, ctx_lat, lyric_ids]):
+        feature_data = load_sample_feature_data(extra_outputs, sample_idx)
+        if feature_data is None:
             logger.warning(f"[auto_lrc] Missing required extra_outputs for sample {sample_idx + 1}")
             return
 
         actual_duration = audio_duration
         if actual_duration is None or actual_duration <= 0:
-            actual_duration = pred_latents.shape[1] / 25.0
+            actual_duration = feature_duration_seconds(feature_data)
+        if actual_duration is None:
+            logger.warning(f"[auto_lrc] Missing duration for sample {sample_idx + 1}")
+            return
 
         lrc_result = dit_handler.get_lyric_timestamp(
-            pred_latent=pred_latents[sample_idx:sample_idx + 1],
-            encoder_hidden_states=enc_hs[sample_idx:sample_idx + 1],
-            encoder_attention_mask=enc_am[sample_idx:sample_idx + 1],
-            context_latents=ctx_lat[sample_idx:sample_idx + 1],
-            lyric_token_ids=lyric_ids[sample_idx:sample_idx + 1],
+            pred_latent=feature_data["pred_latent"],
+            encoder_hidden_states=feature_data["encoder_hidden_states"],
+            encoder_attention_mask=feature_data["encoder_attention_mask"],
+            context_latents=feature_data["context_latents"],
+            lyric_token_ids=feature_data["lyric_token_ids"],
             total_duration_seconds=float(actual_duration),
             vocal_language=vocal_language or "en",
             inference_steps=int(inference_steps),

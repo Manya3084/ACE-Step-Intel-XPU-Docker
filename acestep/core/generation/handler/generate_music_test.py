@@ -205,6 +205,41 @@ class GenerateMusicMixinTests(unittest.TestCase):
         self.assertEqual(out["error"], "boom")
         self.assertIn("Error: boom", out["status_message"])
 
+    def test_most_natural_keeps_text2music_task_with_audio_codes(self):
+        """Session-backed retake should use audio-code hints without repaint task conditioning."""
+        host = _Host()
+        host._readiness_error = None
+
+        def _resolve_as_cover(**kwargs):
+            host.calls["_resolve_generate_music_task"] = kwargs
+            return "cover", "cover instruction"
+
+        host._resolve_generate_music_task = _resolve_as_cover
+        out = host.generate_music(
+            captions="cap",
+            lyrics="lyr",
+            audio_code_string="<|audio_code_1|>",
+            task_type="text2music",
+            repaint_mode="most natural",
+            retake_source_latents=torch.ones(4, 3),
+            repainting_start=1.0,
+            repainting_end=2.0,
+        )
+
+        self.assertEqual(out, host._final_payload)
+        self.assertEqual(
+            "text2music",
+            host.calls["_prepare_reference_and_source_audio"]["task_type"],
+        )
+        self.assertEqual(
+            "text2music",
+            host.calls["_prepare_generate_music_service_inputs"]["task_type"],
+        )
+        self.assertEqual(
+            "text2music",
+            host.calls["_run_generate_music_service_with_progress"]["task_type"],
+        )
+
 
 class VramPreflightCheckTests(unittest.TestCase):
     """Verify ``_vram_preflight_check`` respects CPU offload mode."""

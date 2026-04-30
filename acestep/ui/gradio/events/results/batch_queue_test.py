@@ -155,8 +155,8 @@ class StoreBatchInQueueTests(unittest.TestCase):
         self.assertFalse(offloaded.is_cuda, "Tensor should have been moved to CPU")
         self.assertEqual(offloaded.device.type, "cpu")
 
-    def test_store_offloads_only_previous_batch_cuda_tensors(self):
-        """Only the immediately preceding batch's CUDA tensors should be offloaded."""
+    def test_store_prunes_older_tensors_and_preserves_previous_batch(self):
+        """Older batch tensors are pruned while the immediately previous batch is preserved."""
         import torch
         tensor_a = torch.ones(1)
         tensor_b = torch.ones(2)
@@ -171,8 +171,7 @@ class StoreBatchInQueueTests(unittest.TestCase):
             generation_info="info",
             seeds="7",
         )
-        # Both batch 0 and batch 1 should still have their tensors (CPU tensors are untouched)
-        self.assertIn("pred_latents", queue[0]["extra_outputs"])
+        self.assertNotIn("pred_latents", queue[0]["extra_outputs"])
         self.assertIn("pred_latents", queue[1]["extra_outputs"])
 
     def test_store_first_batch_no_prev_cleanup(self):
@@ -235,6 +234,7 @@ class CaptureCurrentParamsTests(unittest.TestCase):
             "track_name", "complete_track_classes", "enable_normalization",
             "normalization_db", "fade_in_duration", "fade_out_duration",
             "latent_shift", "latent_rescale", "repaint_mode", "repaint_strength",
+            "source_session_dir", "source_track_index", "source_latent_mix_ratio",
         ]
         defaults = {f: None for f in fields}
         defaults.update(overrides)
@@ -253,6 +253,18 @@ class CaptureCurrentParamsTests(unittest.TestCase):
         result = capture_current_params(*args)
         self.assertEqual(result["repaint_mode"], "balanced")
         self.assertEqual(result["repaint_strength"], 0.5)
+
+    def test_source_session_params_included_in_capture(self):
+        """Session-backed repaint inputs must be captured for AutoGen batches."""
+        args = self._build_args(
+            source_session_dir="/tmp/session",
+            source_track_index=2,
+            source_latent_mix_ratio=0.25,
+        )
+        result = capture_current_params(*args)
+        self.assertEqual("/tmp/session", result["source_session_dir"])
+        self.assertEqual(2, result["source_track_index"])
+        self.assertAlmostEqual(0.25, result["source_latent_mix_ratio"])
 
     def test_capture_clears_audio_codes(self):
         """Audio codes should be cleared so AutoGen batches generate fresh content."""

@@ -6,6 +6,11 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 from loguru import logger
 
+from acestep.core.generation.handler.retake_latents import (
+    align_retake_source_latents,
+    build_retake_step_skip_timesteps,
+)
+
 
 class ServiceGenerateExecuteMixin:
     """Run diffusion execution for normalized service-generation requests."""
@@ -77,6 +82,8 @@ class ServiceGenerateExecuteMixin:
         timesteps: Optional[List[float]],
         repaint_crossfade_frames: int = 10,
         repaint_injection_ratio: float = 0.5,
+        retake_source_latents: torch.Tensor = None,
+        source_latent_mix_ratio: float = 0.0,
         sampler_mode: str = "euler",
         velocity_norm_threshold: float = 0.0,
         velocity_ema_factor: float = 0.0,
@@ -91,6 +98,31 @@ class ServiceGenerateExecuteMixin:
         """Build kwargs passed to model generation backends."""
         repaint_mask = payload.get("repaint_mask")
         clean_src_latents = payload.get("target_latents") if repaint_mask is not None else None
+        aligned_retake_source_latents = None
+        if retake_source_latents is not None:
+            aligned_retake_source_latents = align_retake_source_latents(
+                retake_source_latents,
+                target_length=payload["src_latents"].shape[1],
+                batch_size=payload["src_latents"].shape[0],
+                device=payload["src_latents"].device,
+                dtype=payload["src_latents"].dtype,
+            )
+
+        if aligned_retake_source_latents is not None and source_latent_mix_ratio > 0.0:
+            if source_latent_mix_ratio >= 1.0:
+                raise ValueError("source_latent_mix_ratio must be less than 1.0")
+            retake_timesteps = build_retake_step_skip_timesteps(
+                infer_steps=infer_steps,
+                mix_ratio=source_latent_mix_ratio,
+                shift=shift,
+            )
+            logger.info(
+                "[retake] Biasing initial noise from saved source latents: "
+                "mix_ratio={:.2f}, start_t={:.4f}, effective_steps={}",
+                float(source_latent_mix_ratio),
+                float(retake_timesteps[0]),
+                len(retake_timesteps) - 1,
+            )
 
         kwargs = {
             "text_hidden_states": payload["text_hidden_states"],
@@ -120,6 +152,8 @@ class ServiceGenerateExecuteMixin:
             "clean_src_latents": clean_src_latents,
             "repaint_crossfade_frames": repaint_crossfade_frames,
             "repaint_injection_ratio": repaint_injection_ratio,
+            "retake_source_latents": aligned_retake_source_latents,
+            "source_latent_mix_ratio": source_latent_mix_ratio,
             "sampler_mode": sampler_mode,
             "velocity_norm_threshold": velocity_norm_threshold,
             "velocity_ema_factor": velocity_ema_factor,
@@ -133,7 +167,45 @@ class ServiceGenerateExecuteMixin:
         }
         if timesteps is not None:
             kwargs["timesteps"] = torch.tensor(timesteps, dtype=torch.float32, device=self.device)
+        if aligned_retake_source_latents is not None and source_latent_mix_ratio > 0.0:
+            kwargs["timesteps"] = torch.tensor(retake_timesteps, dtype=torch.float32, device=self.device)
+            kwargs["retake_initial_noise_latents"] = aligned_retake_source_latents
+            kwargs["retake_initial_noise_timestep"] = float(retake_timesteps[0])
         return kwargs
+
+    def _generate_audio_with_optional_retake_noise(self, generate_kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """Run PyTorch generation with optional session-retake noise initialization."""
+        source_latents = generate_kwargs.get("retake_initial_noise_latents")
+        initial_timestep = generate_kwargs.get("retake_initial_noise_timestep")
+        model_kwargs = dict(generate_kwargs)
+        model_kwargs.pop("retake_initial_noise_latents", None)
+        model_kwargs.pop("retake_initial_noise_timestep", None)
+        model_kwargs.pop("retake_source_latents", None)
+        model_kwargs.pop("source_latent_mix_ratio", None)
+        if source_latents is None or initial_timestep is None:
+            return self.model.generate_audio(**model_kwargs)
+
+        original_prepare_noise = self.model.prepare_noise
+
+        def prepare_retake_noise(context_latents: torch.Tensor, seed: Any = None) -> torch.Tensor:
+            base_noise = original_prepare_noise(context_latents, seed)
+            source = source_latents.to(device=base_noise.device, dtype=base_noise.dtype)
+            if source.shape != base_noise.shape:
+                source = align_retake_source_latents(
+                    source,
+                    target_length=base_noise.shape[1],
+                    batch_size=base_noise.shape[0],
+                    device=base_noise.device,
+                    dtype=base_noise.dtype,
+                )
+            timestep = float(initial_timestep)
+            return timestep * base_noise + (1.0 - timestep) * source
+
+        self.model.prepare_noise = prepare_retake_noise
+        try:
+            return self.model.generate_audio(**model_kwargs)
+        finally:
+            self.model.prepare_noise = original_prepare_noise
 
     def _execute_service_generate_diffusion(
         self,
@@ -155,9 +227,9 @@ class ServiceGenerateExecuteMixin:
                 self, payload=payload, generate_kwargs=generate_kwargs,
                 seed_param=seed_param, flow_edit_ctx=flow_edit_ctx,
             )
-        dit_backend = (
-            "MLX (native)" if (self.use_mlx_dit and self.mlx_decoder is not None) else f"PyTorch ({self.device})"
-        )
+        uses_retake_noise = generate_kwargs.get("retake_initial_noise_latents") is not None
+        use_mlx_backend = self.use_mlx_dit and self.mlx_decoder is not None and not uses_retake_noise
+        dit_backend = "MLX (native)" if use_mlx_backend else f"PyTorch ({self.device})"
         logger.info(f"[service_generate] Generating audio... (DiT backend: {dit_backend})")
         with torch.inference_mode():
             with self._load_model_context("model"):
@@ -182,7 +254,7 @@ class ServiceGenerateExecuteMixin:
                     precomputed_lm_hints_25Hz=payload["precomputed_lm_hints_25Hz"],
                 )
 
-                if self.use_mlx_dit and self.mlx_decoder is not None:
+                if use_mlx_backend:
                     if generate_kwargs.get("dcw_enabled") and generate_kwargs.get("dcw_wavelet", "haar") != "haar":
                         logger.info(
                             "[service_generate] DCW enabled on MLX path with "
@@ -254,9 +326,9 @@ class ServiceGenerateExecuteMixin:
                         )
                     except Exception as exc:
                         logger.warning("[service_generate] MLX diffusion failed ({}); falling back to PyTorch.", exc)
-                        outputs = self.model.generate_audio(**generate_kwargs)
+                        outputs = self._generate_audio_with_optional_retake_noise(generate_kwargs)
                 else:
                     logger.info("[service_generate] DiT diffusion via PyTorch ({})...", self.device)
-                    outputs = self.model.generate_audio(**generate_kwargs)
+                    outputs = self._generate_audio_with_optional_retake_noise(generate_kwargs)
 
         return outputs, encoder_hidden_states, encoder_attention_mask, context_latents

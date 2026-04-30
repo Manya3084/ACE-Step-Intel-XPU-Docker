@@ -15,6 +15,10 @@ import gradio as gr
 from loguru import logger
 
 from acestep.ui.gradio.i18n import t
+from acestep.ui.gradio.events.results.feature_cache import (
+    feature_duration_seconds,
+    load_sample_feature_data,
+)
 from acestep.ui.gradio.events.results.generation_info import DEFAULT_RESULTS_DIR
 
 
@@ -223,7 +227,6 @@ def generate_lrc_handler(dit_handler, sample_idx, current_batch_index, batch_que
     Returns:
         Tuple of ``(lrc_display_update, details_accordion_update, batch_queue)``.
     """
-    import torch  # noqa: F401 – kept for tensor slicing
     from acestep.gpu_config import get_global_gpu_config
 
     if get_global_gpu_config().save_memory_mode:
@@ -242,31 +245,27 @@ def generate_lrc_handler(dit_handler, sample_idx, current_batch_index, batch_que
     if not extra_outputs:
         return gr.update(value=t("messages.lrc_no_extra_outputs"), visible=True), gr.skip(), batch_queue
 
-    pred_latents = extra_outputs.get("pred_latents")
-    encoder_hidden_states = extra_outputs.get("encoder_hidden_states")
-    encoder_attention_mask = extra_outputs.get("encoder_attention_mask")
-    context_latents = extra_outputs.get("context_latents")
-    lyric_token_idss = extra_outputs.get("lyric_token_idss")
-
-    if any(x is None for x in [pred_latents, encoder_hidden_states, encoder_attention_mask, context_latents, lyric_token_idss]):
-        return gr.update(value=t("messages.lrc_missing_tensors"), visible=True), gr.skip(), batch_queue
-
     idx0 = sample_idx - 1
-    if idx0 >= pred_latents.shape[0]:
+    if idx0 < 0:
         return gr.update(value=t("messages.lrc_sample_not_exist"), visible=True), gr.skip(), batch_queue
+    feature_data = load_sample_feature_data(extra_outputs, idx0)
+    if feature_data is None:
+        return gr.update(value=t("messages.lrc_missing_tensors"), visible=True), gr.skip(), batch_queue
 
     try:
         params = batch_data.get("generation_params", {})
         audio_duration = params.get("audio_duration", -1)
         if audio_duration is None or audio_duration <= 0:
-            audio_duration = pred_latents.shape[1] / 25.0
+            audio_duration = feature_duration_seconds(feature_data)
+        if audio_duration is None:
+            return gr.update(value=t("messages.lrc_missing_tensors"), visible=True), gr.skip(), batch_queue
 
         result = dit_handler.get_lyric_timestamp(
-            pred_latent=pred_latents[idx0:idx0 + 1],
-            encoder_hidden_states=encoder_hidden_states[idx0:idx0 + 1],
-            encoder_attention_mask=encoder_attention_mask[idx0:idx0 + 1],
-            context_latents=context_latents[idx0:idx0 + 1],
-            lyric_token_ids=lyric_token_idss[idx0:idx0 + 1],
+            pred_latent=feature_data["pred_latent"],
+            encoder_hidden_states=feature_data["encoder_hidden_states"],
+            encoder_attention_mask=feature_data["encoder_attention_mask"],
+            context_latents=feature_data["context_latents"],
+            lyric_token_ids=feature_data["lyric_token_ids"],
             total_duration_seconds=float(audio_duration),
             vocal_language=vocal_language or "en",
             inference_steps=int(inference_steps),

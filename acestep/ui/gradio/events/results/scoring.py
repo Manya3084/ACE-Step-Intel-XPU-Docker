@@ -8,6 +8,7 @@ import traceback
 import gradio as gr
 
 from acestep.ui.gradio.i18n import t
+from acestep.ui.gradio.events.results.feature_cache import load_sample_feature_data
 
 
 def calculate_score_handler(
@@ -213,27 +214,10 @@ def calculate_score_handler_with_selection(
     else:
         audio_codes_str = stored_codes if isinstance(stored_codes, str) else ""
 
-    # Extract tensor data for alignment scoring
     extra_tensor_data = None
     extra_outputs = batch_data.get("extra_outputs", {})
     if extra_outputs and dit_handler:
-        pred_latents = extra_outputs.get("pred_latents")
-        if pred_latents is not None:
-            idx0 = sample_idx - 1
-            if 0 <= idx0 < pred_latents.shape[0]:
-                try:
-                    extra_tensor_data = {
-                        "pred_latent": pred_latents[idx0:idx0 + 1],
-                        "encoder_hidden_states": extra_outputs.get("encoder_hidden_states")[idx0:idx0 + 1],
-                        "encoder_attention_mask": extra_outputs.get("encoder_attention_mask")[idx0:idx0 + 1],
-                        "context_latents": extra_outputs.get("context_latents")[idx0:idx0 + 1],
-                        "lyric_token_ids": extra_outputs.get("lyric_token_idss")[idx0:idx0 + 1],
-                    }
-                    if any(v is None for v in extra_tensor_data.values()):
-                        extra_tensor_data = None
-                except Exception as e:
-                    print(f"Error slicing tensor data for score: {e}")
-                    extra_tensor_data = None
+        extra_tensor_data = load_sample_feature_data(extra_outputs, sample_idx - 1)
 
     score_display = calculate_score_handler(
         llm_handler, audio_codes_str, caption, lyrics, lm_metadata,

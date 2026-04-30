@@ -496,10 +496,21 @@ async def release_task(request: Request, authorization: Optional[str] = Header(N
             repaint_wav_crossfade_sec=float(
                 get_param("repaint_wav_crossfade_sec", default=0.0) or 0.0,
             ),
-            repaint_mode=get_param("repaint_mode", default="balanced") or "balanced",
+            repaint_mode=get_param("repaint_mode", default="auto") or "auto",
             repaint_strength=float(
                 get_param("repaint_strength", default=0.5) or 0.5,
             ),
+            source_session_dir=get_param("source_session_dir", default=None),
+            source_track_index=int(get_param("source_track_index", default=1) or 1),
+            source_latent_mix_ratio=float(
+                get_param("source_latent_mix_ratio", default=0.3) or 0.3,
+            ),
+            repainting_regions=get_param("repainting_regions", default=None),
+            save_session_artifacts=to_bool(
+                get_param("save_session_artifacts", default=False),
+                False,
+            ),
+            session_output_dir=get_param("session_output_dir", default=None),
         )
 
         # Resolve seed(s) into List[int] for GenerationConfig.seeds
@@ -651,4 +662,3 @@ def setup_api_routes(demo, dit_handler, llm_handler, api_key: Optional[str] = No
     app.state.dit_handler = dit_handler
     app.state.llm_handler = llm_handler
     app.include_router(router)
-

@@ -4,12 +4,31 @@ This module contains mode-switch and simple-mode related handlers to keep
 ``events.__init__`` as a thin facade.
 """
 
+import os
 from typing import Any, Sequence
 
 import gradio as gr
 
 from .. import generation_handlers as gen_h
 from .context import GenerationWiringContext
+
+
+_BASE_REPAINT_MODE_CHOICES = ["auto", "conservative", "balanced", "aggressive"]
+_SESSION_REPAINT_MODE_CHOICES = ["auto", "most natural", "conservative", "balanced", "aggressive"]
+
+
+def _source_session_exists(source_session_dir) -> bool:
+    """Return whether a source session directory exists on disk."""
+    if not source_session_dir:
+        return False
+    return os.path.isdir(os.path.expanduser(str(source_session_dir).strip()))
+
+
+def _on_source_session_dir_change(source_session_dir, current_mode):
+    """Show most-natural repaint mode only when a session folder exists."""
+    choices = _SESSION_REPAINT_MODE_CHOICES if _source_session_exists(source_session_dir) else _BASE_REPAINT_MODE_CHOICES
+    value = current_mode if current_mode in choices else "auto"
+    return gr.update(choices=choices, value=value)
 
 
 def _on_repaint_mode_change(mode, current_strength, memory):
@@ -20,6 +39,9 @@ def _on_repaint_mode_change(mode, current_strength, memory):
     if mode == "aggressive":
         new_memory = current_strength if 0.0 < current_strength < 1.0 else memory
         return gr.update(value=1.0, interactive=False), new_memory
+    if mode in {"auto", "retake", "most natural"}:
+        new_memory = current_strength if 0.0 < current_strength < 1.0 else memory
+        return gr.update(value=new_memory, interactive=False), new_memory
     return gr.update(value=memory, interactive=True), memory
 
 
@@ -29,7 +51,7 @@ def _on_repaint_strength_change(strength, current_mode):
         return gr.update(value="conservative"), gr.update(interactive=False)
     if strength == 1.0 and current_mode != "aggressive":
         return gr.update(value="aggressive"), gr.update(interactive=False)
-    if current_mode != "balanced" and 0.0 < strength < 1.0:
+    if current_mode not in {"balanced", "auto", "retake", "most natural"} and 0.0 < strength < 1.0:
         return gr.update(value="balanced"), gr.update(interactive=True)
     return gr.skip(), gr.skip()
 
@@ -186,6 +208,14 @@ def register_generation_mode_handlers(
             generation_section["repaint_strength"],
             generation_section["repaint_strength_memory"],
         ],
+    )
+    generation_section["source_session_dir"].change(
+        fn=_on_source_session_dir_change,
+        inputs=[
+            generation_section["source_session_dir"],
+            generation_section["repaint_mode"],
+        ],
+        outputs=[generation_section["repaint_mode"]],
     )
     generation_section["repaint_strength"].change(
         fn=_on_repaint_strength_change,
