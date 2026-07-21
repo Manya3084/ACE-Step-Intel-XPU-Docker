@@ -10,7 +10,7 @@
 #
 # Usage:
 #   docker compose -f docker-compose.xpu.yml up -d --build
-#   open http://YOUR_OMV_IP:3003
+#   open http://YOUR_SERVER_IP:3003
 #
 # =============================================================================
 
@@ -29,13 +29,13 @@ services:
       - path: .env
         required: false
     environment:
-      # gradio-api = Gradio + --enable-api on 8001 (required by ace-step-ui)
       - ACESTEP_MODE=${ACESTEP_MODE:-gradio-api}
       - ACESTEP_LLM_BACKEND=${ACESTEP_LLM_BACKEND:-pt}
       - ACESTEP_INIT_SERVICE=${ACESTEP_INIT_SERVICE:-true}
       - ACESTEP_CONFIG_PATH=${ACESTEP_CONFIG_PATH:-acestep-v15-turbo}
       - ACESTEP_LM_MODEL_PATH=${ACESTEP_LM_MODEL_PATH:-acestep-5Hz-lm-1.7B}
       - ACESTEP_OFFLOAD_TO_CPU=${ACESTEP_OFFLOAD_TO_CPU:-true}
+      - ACESTEP_DTYPE=${ACESTEP_DTYPE:-}
       - ACESTEP_EXTRA_ARGS=${ACESTEP_EXTRA_ARGS:-}
       - TOKENIZERS_PARALLELISM=false
       - PYTORCH_DEVICE=xpu
@@ -86,6 +86,10 @@ services:
       - JWT_SECRET=${JWT_SECRET:-ace-step-ui-local-secret-change-me}
       - FRONTEND_URL=${FRONTEND_URL:-http://localhost:3003}
       - PEXELS_API_KEY=${PEXELS_API_KEY:-}
+      # Restart XPU from UI (requires docker.sock mount below)
+      - ENABLE_DOCKER_RESTART=${ENABLE_DOCKER_RESTART:-true}
+      - XPU_CONTAINER_NAME=${XPU_CONTAINER_NAME:-acestep-xpu}
+      - DOCKER_HOST=unix:///var/run/docker.sock
 
     ports:
       - "${UI_PORT:-3003}:3003"
@@ -94,6 +98,8 @@ services:
     volumes:
       - ui_data:/app/data
       - ui_audio:/app/server/public/audio
+      # Lets the UI restart acestep-xpu after NaN / stuck GPU state
+      - /var/run/docker.sock:/var/run/docker.sock
 
     restart: unless-stopped
 
