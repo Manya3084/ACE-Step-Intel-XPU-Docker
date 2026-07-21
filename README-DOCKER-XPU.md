@@ -13,7 +13,7 @@ Upstream ACE-Step supports Intel XPU in code and ships Windows `.bat` helpers. O
 
 | Goal | How this repo helps |
 |------|------------------------|
-| Run ACE-Step on **Intel Arc** (e.g. A770 16GB) | Custom `Dockerfile.xpu`, Level Zero / `/dev/dri`, PyTorch XPU nightly |
+| Run ACE-Step on **Intel Arc** (A/B series + Pro) | Custom `Dockerfile.xpu`, Level Zero / `/dev/dri`, PyTorch XPU nightly |
 | Run on a **home server / OMV** | `docker-compose.xpu.yml`, persistent volumes, LAN ports |
 | Use a **better UI on mobile** | ace-step-ui as a Compose service (polling-friendly) |
 | Keep **full features** working | Gradio API for generation, REST Format endpoint fixes, CORS, ffmpeg/ffprobe, arg alignment |
@@ -38,18 +38,82 @@ Phone / browser  →  :3003  (ace-step-ui)
                          │                 ├─ Gradio client → /generation_wrapper  (songs)
                          │                 └─ REST POST /format_input              (AI Format)
                          ▼
-                    Intel Arc A770 (XPU) via /dev/dri
+                    Intel Arc (XPU) via /dev/dri
 ```
 
 ---
 
-## Hardware tested
+## GPU settings recommendations (Arc A / B / Pro)
 
-| GPU | VRAM | Notes |
-|-----|------|--------|
-| **Intel Arc A770** | 16GB | Primary target; DiT turbo + 1.7B LM + CPU offload |
+Recommendations are driven primarily by **VRAM**. Always use **`ACESTEP_LLM_BACKEND=pt`** on Intel XPU (vLLM is CUDA-oriented). DiT default is **`acestep-v15-turbo`** for speed; switch to `acestep-v15-sft` / base only if you have headroom and want quality over speed.
 
-Other Arc A/B series with working host Level Zero drivers should work with the same image; adjust LM size / offload if VRAM is lower.
+Only the **A770 16GB** row is fully verified on this Docker stack so far. Other rows are reasoned from upstream VRAM tiers + public card memory sizes.
+
+### Consumer — Arc A-series (Alchemist)
+
+| GPU | VRAM | DiT | LM | CPU offload | Notes |
+|-----|------|-----|-----|-------------|--------|
+| **A310** | 4GB | `acestep-v15-turbo` | **off** (`INIT_LLM` false / no LM) | **on** | DiT-only; shortest songs; tight |
+| **A380** | 6GB | `acestep-v15-turbo` | off, or `0.6B` if stable | **on** | Prefer DiT-only first |
+| **A580** | 8GB | `acestep-v15-turbo` | `acestep-5Hz-lm-0.6B` | **on** | Batch 1; Format will be slow |
+| **A750** | 8GB | `acestep-v15-turbo` | `acestep-5Hz-lm-0.6B` | **on** | Same as A580; more cores, not more VRAM |
+| **A770** (8GB) | 8GB | `acestep-v15-turbo` | `acestep-5Hz-lm-0.6B` | **on** | Treat like A750 |
+| **A770** (16GB) | 16GB | `acestep-v15-turbo` | **`acestep-5Hz-lm-1.7B`** | **on** | **Primary verified config** |
+
+### Consumer — Arc B-series (Battlemage)
+
+| GPU | VRAM | DiT | LM | CPU offload | Notes |
+|-----|------|-----|-----|-------------|--------|
+| **B570** | 10GB | `acestep-v15-turbo` | `acestep-5Hz-lm-0.6B` (try `1.7B` if stable) | **on** | Start with 0.6B; OOM → stay on 0.6B |
+| **B580** | 12GB | `acestep-v15-turbo` | `acestep-5Hz-lm-0.6B` or **`1.7B`** | **on** | 1.7B usually OK with offload; good value tier |
+
+### Professional — Arc Pro A-series
+
+| GPU | VRAM | DiT | LM | CPU offload | Notes |
+|-----|------|-----|-----|-------------|--------|
+| **Pro A30M** | 4GB | `acestep-v15-turbo` | **off** | **on** | Mobile Pro; DiT-only |
+| **Pro A40 / A50** | 6GB | `acestep-v15-turbo` | off or `0.6B` | **on** | Same class as A380 |
+| **Pro A60M** | 8GB | `acestep-v15-turbo` | `acestep-5Hz-lm-0.6B` | **on** | Mobile workstation |
+| **Pro A60** | 12GB | `acestep-v15-turbo` | `0.6B` or **`1.7B`** | **on** | Same ballpark as B580 |
+
+### Professional — Arc Pro B-series & Flex
+
+| GPU | VRAM | DiT | LM | CPU offload | Notes |
+|-----|------|-----|-----|-------------|--------|
+| **Pro B50** | (check SKU) | `acestep-v15-turbo` | size by VRAM table below | by VRAM | Confirm VRAM with `clinfo` / vendor sheet |
+| **Pro B60** | ~24GB | turbo or sft | **`1.7B`** or try **`4B`** | optional | Headroom for larger LM / less offload |
+| **Pro B65 / B70** | 32GB | turbo / sft / XL* | **`1.7B`** or **`4B`** | off if stable | Best Pro quality tier |
+| **Flex 140** | 12GB | `acestep-v15-turbo` | `0.6B` or `1.7B` | **on** | Data-center / server Arc |
+| **Flex 170** | 16GB | `acestep-v15-turbo` | **`1.7B`** | **on** | Same class as A770 16GB |
+
+\*XL DiT (`acestep-v15-xl-*`) needs more VRAM (roughly ≥12GB with aggressive offload, ≥20GB comfortable). Prefer turbo 2B on ≤16GB cards.
+
+### Quick VRAM cheat sheet (any Intel XPU)
+
+| VRAM | Suggested LM | Offload | Batch |
+|------|--------------|---------|-------|
+| ≤6GB | none | on | 1 |
+| 8GB | 0.6B | on | 1 |
+| 10–12GB | 0.6B → try 1.7B | on | 1 |
+| 16GB | **1.7B** | on | 1–2 |
+| 24GB | 1.7B or 4B | optional | 2+ |
+| 32GB+ | 4B | optional / off | 2–4 |
+
+### `.env` knobs
+
+```bash
+ACESTEP_CONFIG_PATH=acestep-v15-turbo
+ACESTEP_LM_MODEL_PATH=acestep-5Hz-lm-1.7B   # or 0.6B / 4B / empty for DiT-only
+ACESTEP_LLM_BACKEND=pt
+ACESTEP_OFFLOAD_TO_CPU=true                 # false only if VRAM is comfortable
+ACESTEP_INIT_SERVICE=true
+```
+
+After changing models, recreate the XPU container so weights re-init:
+
+```bash
+docker compose -f docker-compose.xpu.yml up -d --force-recreate acestep-xpu
+```
 
 **Host requirements**
 
@@ -68,7 +132,7 @@ cd ACE-Step-Intel-XPU-Docker
 git checkout intel-xpu-docker
 
 cp .env.xpu.example .env
-# edit .env if needed (ports, model names, secrets)
+# edit .env for your GPU (see tables above)
 
 docker compose -f docker-compose.xpu.yml up -d --build
 ```
@@ -83,17 +147,15 @@ First boot downloads models and initializes DiT + LM (can take several minutes).
 
 ---
 
-## Defaults (A770 16GB)
+## Defaults shipped in `.env.xpu.example` (A770 16GB)
 
 | Setting | Value |
 |---------|--------|
 | DiT | `acestep-v15-turbo` |
 | LM | `acestep-5Hz-lm-1.7B` |
-| LM backend | `pt` (PyTorch; recommended on XPU) |
-| CPU offload | enabled (VRAM under 20GB tier) |
-| Mode | `gradio-api` (Gradio UI endpoints + API for ace-step-ui) |
-
-See `.env.xpu.example` for the full list.
+| LM backend | `pt` |
+| CPU offload | enabled |
+| Mode | `gradio-api` |
 
 ---
 
@@ -101,7 +163,7 @@ See `.env.xpu.example` for the full list.
 
 | Feature | Status |
 |---------|--------|
-| XPU detection / generation on Arc A770 | Working |
+| XPU detection / generation on Arc A770 16GB | Working |
 | Song generation via ace-step-ui → Gradio | Working |
 | AI Format (style / lyrics enhance) via `/format_input` | Working (often **~1–2 min** first call with offload) |
 | Mobile UI (leave browser and return) | Much more reliable than plain Gradio WebSockets |
@@ -151,8 +213,13 @@ curl -sS -m 300 -X POST http://127.0.0.1:8001/format_input \
 - Compose must pass `/dev/dri`
 - PyTorch must report `+xpu` and `torch.xpu.is_available() == True`
 
+**OOM / crashes on smaller cards**
+- Drop to `acestep-5Hz-lm-0.6B` or disable LM
+- Keep `ACESTEP_OFFLOAD_TO_CPU=true`
+- Batch size 1; shorter durations
+
 **Format button spins a long time**
-- Expected on first use: load 1.7B → generate → offload can take **1–3 minutes**
+- Expected on first use with 1.7B + offload: **1–3 minutes**
 - Backend is fine if `curl` to `/format_input` eventually returns `code: 200`
 
 **UI 500 on “Get Started” / CORS**
@@ -162,7 +229,7 @@ curl -sS -m 300 -X POST http://127.0.0.1:8001/format_input \
 - UI image patches `buildGradioArgs` to match current Gradio `/generation_wrapper` schema; rebuild UI after pulling
 
 **`pull access denied` for `acestep-xpu` / `acestep-ui`**
-- Those tags are **local builds**, not Docker Hub. Always `up --build` (do not expect a public pull)
+- Those tags are **local builds**, not Docker Hub. Always `up --build`
 
 ---
 
