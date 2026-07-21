@@ -34,7 +34,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV LANG=C.UTF-8
 ENV LC_ALL=C.UTF-8
 
-# ==================== System packages ====================
+# ==================== System packages + Intel GPU repository ====================
 RUN apt-get update && apt-get install -y --no-install-recommends \
         software-properties-common \
         build-essential \
@@ -43,6 +43,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         wget \
         ca-certificates \
         gnupg \
+        gpg-agent \
         # Audio
         libsndfile1 \
         libsndfile1-dev \
@@ -50,15 +51,29 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         # Python build deps
         libffi-dev \
         libssl-dev \
-        # Intel / Level Zero related (host drivers still required)
-        intel-opencl-icd \
-        intel-level-zero-gpu \
-        level-zero \
-        libze1 \
         # Useful utilities
-        clinfo \
         pciutils \
-    && add-apt-repository ppa:deadsnakes/ppa \
+    && rm -rf /var/lib/apt/lists/*
+
+# Add Intel GPU compute repository (required for Level Zero on Ubuntu 22.04)
+RUN wget -qO - https://repositories.intel.com/gpu/intel-graphics.key | \
+        gpg --yes --dearmor --output /usr/share/keyrings/intel-graphics.gpg \
+    && echo "deb [arch=amd64,i386 signed-by=/usr/share/keyrings/intel-graphics.gpg] https://repositories.intel.com/gpu/ubuntu jammy unified" | \
+        tee /etc/apt/sources.list.d/intel-gpu-jammy.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        # Level Zero + OpenCL (correct package names from Intel repo)
+        libze1 \
+        libze-intel-gpu1 \
+        intel-opencl-icd \
+        clinfo \
+        # Optional but useful for PyTorch XPU
+        libze-dev \
+        intel-ocloc \
+    && rm -rf /var/lib/apt/lists/*
+
+# Python 3.11 from deadsnakes
+RUN add-apt-repository ppa:deadsnakes/ppa \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
         python3.11 \
