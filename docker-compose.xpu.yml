@@ -1,0 +1,90 @@
+# =============================================================================
+# ACE-Step 1.5 — Docker Compose for Intel XPU / Arc GPUs
+# =============================================================================
+#
+# Target: Intel Arc A770 16GB (and other Arc / XPU devices)
+# Host OS: Linux (Debian / Ubuntu / OpenMediaVault)
+#
+# Prerequisites on the host:
+#   1. Latest Intel Arc / GPU drivers
+#   2. Level Zero + intel-opencl-icd packages
+#   3. /dev/dri accessible
+#
+# Usage:
+#   docker compose -f docker-compose.xpu.yml up --build
+#   docker compose -f docker-compose.xpu.yml up -d
+#   docker compose -f docker-compose.xpu.yml logs -f
+#
+#   # API mode:
+#   ACESTEP_MODE=api docker compose -f docker-compose.xpu.yml up
+#
+# =============================================================================
+
+services:
+  acestep-xpu:
+    build:
+      context: .
+      dockerfile: Dockerfile.xpu
+    image: acestep-xpu:latest
+    container_name: acestep-xpu
+
+    # ---- Intel GPU device access ----
+    # Pass the DRI devices. On most systems this is enough for Arc + Level Zero.
+    devices:
+      - /dev/dri:/dev/dri
+
+    # Some setups also benefit from these (uncomment if needed):
+    # group_add:
+    #   - video
+    #   - render
+
+    # ---- Environment ----
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      - ACESTEP_MODE=${ACESTEP_MODE:-gradio}
+      - ACESTEP_LLM_BACKEND=${ACESTEP_LLM_BACKEND:-pt}
+      - ACESTEP_INIT_SERVICE=${ACESTEP_INIT_SERVICE:-true}
+      # Recommended for A770 16GB
+      - ACESTEP_CONFIG_PATH=${ACESTEP_CONFIG_PATH:-acestep-v15-turbo}
+      - ACESTEP_LM_MODEL_PATH=${ACESTEP_LM_MODEL_PATH:-acestep-5Hz-lm-1.7B}
+      - ACESTEP_OFFLOAD_TO_CPU=${ACESTEP_OFFLOAD_TO_CPU:-true}
+      - ACESTEP_EXTRA_ARGS=${ACESTEP_EXTRA_ARGS:-}
+      - TOKENIZERS_PARALLELISM=false
+      # XPU / SYCL tuning
+      - PYTORCH_DEVICE=xpu
+      - TORCH_COMPILE_BACKEND=eager
+      - SYCL_CACHE_PERSISTENT=1
+      - SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS=1
+      - ZE_FLAT_DEVICE_HIERARCHY=COMPOSITE
+
+    # ---- Ports ----
+    ports:
+      - "${GRADIO_PORT:-7860}:7860"
+      - "${API_PORT:-8001}:8001"
+
+    # ---- Persistent volumes ----
+    volumes:
+      - ./checkpoints:/app/checkpoints
+      - hf_cache:/root/.cache/huggingface
+      - ./gradio_outputs:/app/gradio_outputs
+      - ./output:/app/output
+
+    # Shared memory helps with some PyTorch operations
+    shm_size: "2gb"
+
+    restart: unless-stopped
+
+    healthcheck:
+      test: >-
+        curl -sf http://localhost:7860/ > /dev/null 2>&1 ||
+        curl -sf http://localhost:8001/health > /dev/null 2>&1 ||
+        exit 1
+      interval: 30s
+      timeout: 15s
+      start_period: 300s
+      retries: 3
+
+volumes:
+  hf_cache:
