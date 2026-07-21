@@ -19,7 +19,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Clone ace-step-ui
 RUN git clone --depth 1 https://github.com/fspecii/ace-step-ui.git .
 
 # ---------------------------------------------------------------------------
@@ -31,7 +30,6 @@ import re
 p = Path("server/src/index.ts")
 text = p.read_text()
 new = """app.use(cors({
-  // Self-hosted / Docker: allow any origin (LAN, Tailscale, hostname, mobile)
   origin: true,
   credentials: true,
 }));"""
@@ -43,10 +41,10 @@ print("CORS patched OK")
 PY
 
 # ---------------------------------------------------------------------------
-# Patch 2: buildGradioArgs — align with current ACE-Step 1.5 /generation_wrapper
-# Upstream UI sends 51 args; current Gradio expects ~72 and includes sampler
-# at index 26 (euler|heun). Misalignment caused:
-#   Value:  is not in the list of choices: ['euler', 'heun']
+# Patch 2: buildGradioArgs aligned to live /generation_wrapper schema (72 args)
+# Index map taken from: curl http://acestep:8001/gradio_api/info
+# Critical: index 26 = sampler ('euler'|'heun')
+#           index 51 = score scale (number, min 0.01) — must NOT be a boolean
 # ---------------------------------------------------------------------------
 RUN python3 - <<'PY'
 from pathlib import Path
@@ -57,8 +55,7 @@ text = p.read_text()
 
 new_fn = r'''
 async function buildGradioArgs(params: GenerationParams): Promise<unknown[]> {
-  // Aligned to ACE-Step 1.5 Gradio /generation_wrapper public API (~72 params).
-  // Sampler MUST be "euler" or "heun" (index 26).
+  // Exact positional map for ACE-Step 1.5 Gradio /generation_wrapper (72 public params).
   const caption = params.style || 'pop music';
   const prompt = params.customMode ? caption : (params.songDescription || caption);
   const lyrics = params.instrumental ? '' : (params.lyrics || '');
@@ -74,116 +71,94 @@ async function buildGradioArgs(params: GenerationParams): Promise<unknown[]> {
     throw new Error(`Source audio file could not be loaded from: ${params.sourceAudioUrl}.`);
   }
 
+  // 72 entries, indices 0..71 — types must match Gradio schema defaults
   return [
-    // 0-19 — core generation inputs (same as older UI)
-    prompt,                                                          // 0 caption
-    lyrics,                                                          // 1 lyrics
-    params.bpm && params.bpm > 0 ? params.bpm : 0,                    // 2 bpm
-    params.keyScale || '',                                           // 3 key
-    params.timeSignature || '',                                      // 4 time signature
-    params.vocalLanguage || 'en',                                    // 5 language
-    params.inferenceSteps ?? 8,                                      // 6 dit steps
-    params.guidanceScale ?? 7.0,                                     // 7 guidance
-    params.randomSeed !== false,                                     // 8 random seed
-    String(params.seed ?? -1),                                       // 9 seed
-    referenceAudio,                                                  // 10 ref audio
-    params.duration && params.duration > 0 ? params.duration : -1,   // 11 duration
-    Math.min(Math.max(params.batchSize ?? 1, 1), 16),               // 12 batch size
-    sourceAudio,                                                     // 13 source audio
-    params.audioCodes || '',                                         // 14 lm codes
-    params.repaintingStart ?? 0.0,                                   // 15 repaint start
-    params.repaintingEnd ?? -1,                                      // 16 repaint end
-    params.instruction || 'Fill the audio semantic mask based on the given conditions:', // 17 instruction
-    params.audioCoverStrength ?? 1.0,                                // 18 cover strength
-    0.0,                                                             // 19 cover noise
-
-    // 20-25 — flags / cfg / shift / method (task_type is not a public API arg)
-    params.useAdg ?? false,                                          // 20 use ADG
-    false,                                                           // 21 reserved / extra flag
-    params.cfgIntervalStart ?? 0.0,                                  // 22 cfg start
-    params.cfgIntervalEnd ?? 1.0,                                    // 23 cfg end
-    params.shift ?? 3.0,                                             // 24 shift
-    params.inferMethod || 'ode',                                     // 25 ode|sde
-
-    // 26 — REQUIRED sampler (was missing → empty string error)
-    'euler',                                                         // 26 sampler euler|heun
-
-    // 27-33 — velocity / DCW defaults from current Gradio schema
-    0.0,                                                             // 27 velocity norm threshold
-    0.0,                                                             // 28 velocity ema factor
-    true,                                                            // 29 dcw enabled
-    'double',                                                        // 30 dcw mode
-    0.02,                                                            // 31 dcw scaler
-    0.06,                                                            // 32 dcw high scaler
-    'haar',                                                          // 33 dcw wavelet
-
-    // 34-37 — timesteps / audio format
-    params.customTimesteps || '',                                    // 34 custom timesteps
-    params.audioFormat || 'mp3',                                     // 35 format
-    '128k',                                                          // 36 mp3 bitrate
-    48000,                                                           // 37 sample rate
-
-    // 38-43 — LM sampling
-    params.lmTemperature ?? 0.85,                                    // 38 lm temp
-    isThinking,                                                      // 39 think
-    params.lmCfgScale ?? 2.0,                                        // 40 lm cfg
-    params.lmTopK ?? 0,                                              // 41 lm top-k
-    params.lmTopP ?? 0.9,                                            // 42 lm top-p
-    params.lmNegativePrompt || 'NO USER INPUT',                      // 43 lm negative
-
-    // 44-52 — CoT / scores / batch
-    useCot ? (params.useCotMetas ?? true) : false,                   // 44 cot metas
-    useCot ? (params.useCotCaption ?? false) : false,                // 45 caption rewrite
-    useCot ? (params.useCotLanguage ?? true) : false,                // 46 cot language
-    params.isFormatCaption ?? false,                                 // 47 format caption
-    true,                                                            // 48 (schema gap fill)
-    params.constrainedDecodingDebug ?? false,                        // 49 constrained debug
-    params.allowLmBatch ?? true,                                     // 50 parallel thinking
-    params.getScores ?? false,                                       // 51 auto score
-    params.getLrc ?? false,                                          // 52 auto lrc
-    params.scoreScale ?? 0.5,                                        // 53 score scale
-    params.lmBatchChunkSize ?? 8,                                    // 54 lm batch chunk
-
-    // 55-60 — track / normalization / latent
-    params.trackName || null,                                        // 55 track name
-    params.completeTrackClasses || [],                               // 56 track classes
-    true,                                                            // 57 enable normalization
-    -1.0,                                                            // 58 normalization db
-    0.0,                                                             // 59 latent shift a
-    0.0,                                                             // 60 latent shift b
-    0.0,                                                             // 61 reserved
-    1.0,                                                             // 62 latent rescale
-
-    // 61-71 in schema (extra quality / batch controls)
-    'balanced',                                                      // 63 quality mode
-    0.5,                                                             // 64 quality strength
-    0.0,                                                             // 65 reserved
-    '',                                                              // 66 reserved string
-    params.autogen ?? false,                                         // 67 autogen
-    null,                                                            // 68
-    null,                                                            // 69
-    0.0,                                                             // 70
-    1.0,                                                             // 71
-    1,                                                               // 72 batch index-ish
-    false,                                                           // 73 final flag
+    /*  0 */ prompt,
+    /*  1 */ lyrics,
+    /*  2 */ (params.bpm && params.bpm > 0) ? params.bpm : 0,
+    /*  3 */ params.keyScale || '',
+    /*  4 */ params.timeSignature || '',
+    /*  5 */ params.vocalLanguage || 'en',
+    /*  6 */ params.inferenceSteps ?? 8,
+    /*  7 */ params.guidanceScale ?? 7.0,
+    /*  8 */ params.randomSeed !== false,
+    /*  9 */ String(params.seed ?? -1),
+    /* 10 */ referenceAudio,
+    /* 11 */ (params.duration && params.duration > 0) ? params.duration : -1,
+    /* 12 */ Math.min(Math.max(params.batchSize ?? 1, 1), 16),
+    /* 13 */ sourceAudio,
+    /* 14 */ params.audioCodes || '',
+    /* 15 */ params.repaintingStart ?? 0.0,
+    /* 16 */ params.repaintingEnd ?? -1,
+    /* 17 */ params.instruction || 'Fill the audio semantic mask based on the given conditions:',
+    /* 18 */ params.audioCoverStrength ?? 1.0,
+    /* 19 */ 0.0,                                    // cover noise strength
+    /* 20 */ params.useAdg ?? false,                 // bool
+    /* 21 */ false,                                  // bool (schema default)
+    /* 22 */ params.cfgIntervalStart ?? 0.0,         // number
+    /* 23 */ params.cfgIntervalEnd ?? 1.0,           // number
+    /* 24 */ params.shift ?? 3.0,                    // number
+    /* 25 */ params.inferMethod || 'ode',            // 'ode' | 'sde'
+    /* 26 */ 'euler',                                // REQUIRED: 'euler' | 'heun'
+    /* 27 */ 0.0,                                    // velocity norm
+    /* 28 */ 0.0,                                    // velocity ema
+    /* 29 */ true,                                   // dcw enabled
+    /* 30 */ 'double',                               // dcw mode
+    /* 31 */ 0.02,                                   // dcw scaler
+    /* 32 */ 0.06,                                   // dcw high scaler
+    /* 33 */ 'haar',                                 // wavelet
+    /* 34 */ params.customTimesteps || '',           // custom timesteps string
+    /* 35 */ params.audioFormat || 'mp3',            // format
+    /* 36 */ '128k',                                 // mp3 bitrate
+    /* 37 */ 48000,                                  // sample rate
+    /* 38 */ params.lmTemperature ?? 0.85,           // lm temperature
+    /* 39 */ isThinking,                             // think (bool)
+    /* 40 */ params.lmCfgScale ?? 2.0,               // lm cfg
+    /* 41 */ params.lmTopK ?? 0,                     // lm top-k
+    /* 42 */ params.lmTopP ?? 0.9,                   // lm top-p
+    /* 43 */ params.lmNegativePrompt || 'NO USER INPUT',
+    /* 44 */ useCot ? (params.useCotMetas ?? true) : true,   // schema default true
+    /* 45 */ useCot ? (params.useCotCaption ?? false) : false,
+    /* 46 */ useCot ? (params.useCotLanguage ?? true) : true,
+    /* 47 */ params.isFormatCaption ?? false,        // bool
+    /* 48 */ true,                                   // schema default true
+    /* 49 */ params.constrainedDecodingDebug ?? false,
+    /* 50 */ params.allowLmBatch ?? false,           // schema default false
+    /* 51 */ Math.max(params.scoreScale ?? 0.5, 0.01), // NUMBER min 0.01 — never bool
+    /* 52 */ params.lmBatchChunkSize ?? 8,           // number
+    /* 53 */ params.trackName || null,               // track / instrument
+    /* 54 */ params.completeTrackClasses || [],      // list
+    /* 55 */ true,                                   // enable normalization
+    /* 56 */ -1.0,                                   // normalization db
+    /* 57 */ 0.0,
+    /* 58 */ 0.0,
+    /* 59 */ 0.0,
+    /* 60 */ 1.0,                                    // latent rescale
+    /* 61 */ 'balanced',                             // quality mode
+    /* 62 */ 0.5,                                    // quality strength
+    /* 63 */ 0.0,
+    /* 64 */ '',
+    /* 65 */ params.autogen ?? false,
+    /* 66 */ null,
+    /* 67 */ null,
+    /* 68 */ 0.0,
+    /* 69 */ 1.0,
+    /* 70 */ 1,
+    /* 71 */ false,
   ];
 }
 '''
 
-# Replace the existing buildGradioArgs function body
 pat = re.compile(
     r"async function buildGradioArgs\(params: GenerationParams\): Promise<unknown\[]> \{.*?\n\}",
     re.S,
 )
-m = pat.search(text)
-if not m:
+if not pat.search(text):
     raise SystemExit("Could not find buildGradioArgs function")
-text = pat.sub(new_fn.strip(), text, count=1)
-p.write_text(text)
-print("buildGradioArgs patched OK")
+p.write_text(pat.sub(new_fn.strip(), text, count=1))
+print("buildGradioArgs patched OK — 72 args, sampler=euler, scoreScale is number")
 PY
 
-# Install frontend + server dependencies
 RUN npm install \
     && cd server \
     && npm install \
