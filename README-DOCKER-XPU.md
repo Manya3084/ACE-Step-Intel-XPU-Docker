@@ -1,21 +1,21 @@
-# ACE-Step 1.5 — Intel Arc / XPU Docker + Mobile UI
+# ACE-Step-Intel-XPU-Docker
 
-**Branch:** `intel-xpu-docker`  
-**Fork:** [Manya3084/ACE-Step-1.5](https://github.com/Manya3084/ACE-Step-1.5)
+**Repo:** [Manya3084/ACE-Step-Intel-XPU-Docker](https://github.com/Manya3084/ACE-Step-Intel-XPU-Docker)  
+**Branch:** `intel-xpu-docker`
 
-This branch is a **practical deployment stack** for running [ACE-Step 1.5](https://github.com/ace-step/ACE-Step-1.5) on **Intel Arc GPUs** under **Linux Docker** (including OpenMediaVault / headless NAS), with a **mobile-friendly Spotify-style UI** instead of relying on Gradio alone in a phone browser.
+Run [ACE-Step 1.5](https://github.com/ace-step/ACE-Step-1.5) on **Intel Arc GPUs** under **Linux Docker** (including OpenMediaVault / headless NAS), with a **mobile-friendly Spotify-style UI** ([ace-step-ui](https://github.com/fspecii/ace-step-ui)) instead of relying on Gradio alone in a phone browser.
 
-Upstream ACE-Step supports Intel XPU in code and ships Windows `.bat` helpers. Official Docker is **NVIDIA/CUDA-only**. Community Docker images are also NVIDIA-focused. This fork fills that gap.
+Upstream ACE-Step supports Intel XPU in code and ships Windows `.bat` helpers. Official Docker is **NVIDIA/CUDA-only**. Community Docker images are also NVIDIA-focused. This project fills that gap.
 
 ---
 
 ## What this project is for
 
-| Goal | How this branch helps |
+| Goal | How this repo helps |
 |------|------------------------|
 | Run ACE-Step on **Intel Arc** (e.g. A770 16GB) | Custom `Dockerfile.xpu`, Level Zero / `/dev/dri`, PyTorch XPU nightly |
 | Run on a **home server / OMV** | `docker-compose.xpu.yml`, persistent volumes, LAN ports |
-| Use a **better UI on mobile** | [ace-step-ui](https://github.com/fspecii/ace-step-ui) as a Compose service (polling-friendly) |
+| Use a **better UI on mobile** | ace-step-ui as a Compose service (polling-friendly) |
 | Keep **full features** working | Gradio API for generation, REST Format endpoint fixes, CORS, ffmpeg/ffprobe, arg alignment |
 
 **Not** a reimplementation of the music model. It is packaging, device support, and UI integration so Arc + Docker users can actually use the same workflow NVIDIA users get out of the box.
@@ -63,8 +63,8 @@ Other Arc A/B series with working host Level Zero drivers should work with the s
 ## Quick start
 
 ```bash
-git clone https://github.com/Manya3084/ACE-Step-1.5.git
-cd ACE-Step-1.5
+git clone https://github.com/Manya3084/ACE-Step-Intel-XPU-Docker.git
+cd ACE-Step-Intel-XPU-Docker
 git checkout intel-xpu-docker
 
 cp .env.xpu.example .env
@@ -90,7 +90,7 @@ First boot downloads models and initializes DiT + LM (can take several minutes).
 | DiT | `acestep-v15-turbo` |
 | LM | `acestep-5Hz-lm-1.7B` |
 | LM backend | `pt` (PyTorch; recommended on XPU) |
-| CPU offload | enabled (VRAM < 20GB tier) |
+| CPU offload | enabled (VRAM under 20GB tier) |
 | Mode | `gradio-api` (Gradio UI endpoints + API for ace-step-ui) |
 
 See `.env.xpu.example` for the full list.
@@ -117,7 +117,7 @@ See `.env.xpu.example` for the full list.
 docker compose -f docker-compose.xpu.yml logs -f acestep-xpu
 docker compose -f docker-compose.xpu.yml logs -f acestep-ui
 
-# Rebuild after pulling this branch
+# Rebuild after pulling
 docker compose -f docker-compose.xpu.yml down
 git pull origin intel-xpu-docker
 docker compose -f docker-compose.xpu.yml up -d --build
@@ -131,7 +131,7 @@ curl -sS -m 300 -X POST http://127.0.0.1:8001/format_input \
 
 ---
 
-## Key files in this branch
+## Key files
 
 | File | Purpose |
 |------|---------|
@@ -140,6 +140,7 @@ curl -sS -m 300 -X POST http://127.0.0.1:8001/format_input \
 | `docker-compose.xpu.yml` | Both services, `/dev/dri`, ports 8001 / 3003 / 3004 |
 | `.env.xpu.example` | A770-oriented defaults |
 | `README-DOCKER-XPU.md` | This document |
+| `FORK.md` | Short “why this repo exists” |
 
 ---
 
@@ -169,6 +170,6 @@ curl -sS -m 300 -X POST http://127.0.0.1:8001/format_input \
 
 - Upstream project: [ace-step/ACE-Step-1.5](https://github.com/ace-step/ACE-Step-1.5)
 - Upstream XPU on Windows: see their `README-XPU.md` / `setup_xpu.bat`
-- This fork does **not** replace the model or training code; it adds a **Linux Docker + Arc + ace-step-ui** path that upstream does not ship
+- This repo does **not** replace the model or training code; it adds a **Linux Docker + Arc + ace-step-ui** path that upstream does not ship
 
-Contributions and issue reports for Arc/OMV Docker packaging are welcome on this fork.
+Contributions and issue reports for Arc/OMV Docker packaging are welcome.
