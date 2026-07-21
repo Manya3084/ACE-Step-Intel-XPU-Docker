@@ -156,6 +156,52 @@ p.write_text(pat.sub(new_fn.strip(), text, count=1))
 print("buildGradioArgs patched OK")
 PY
 
+# ---------------------------------------------------------------------------
+# Patch 3: Format buttons — Gradio --enable-api exposes /format_lyrics,
+# not pure-REST /format_input (which hangs). Also raise client timeout to 180s.
+# ---------------------------------------------------------------------------
+RUN python3 - <<'PY'
+from pathlib import Path
+import re
+
+replacements = 0
+for path in Path("server/src").rglob("*.ts"):
+    text = path.read_text()
+    orig = text
+    # Endpoint path
+    text = text.replace("/format_input", "/format_lyrics")
+    text = text.replace("'format_input'", "'format_lyrics'")
+    text = text.replace('"format_input"', '"format_lyrics"')
+    # Common short timeouts on format fetch
+    text = re.sub(
+        r"AbortSignal\.timeout\(\s*\d+\s*\)",
+        "AbortSignal.timeout(180000)",
+        text,
+    )
+    text = re.sub(
+        r"timeout:\s*\d{4,5}\b",  # 1000-99999 ms
+        "timeout: 180000",
+        text,
+    )
+    if text != orig:
+        path.write_text(text)
+        replacements += 1
+        print(f"Patched format endpoint/timeout in {path}")
+
+if replacements == 0:
+    # Fallback: search whole tree
+    for path in Path(".").rglob("*.ts"):
+        if "node_modules" in str(path):
+            continue
+        text = path.read_text()
+        if "format_input" in text:
+            path.write_text(text.replace("/format_input", "/format_lyrics").replace("format_input", "format_lyrics"))
+            replacements += 1
+            print(f"Fallback patched {path}")
+
+print(f"Format patch done, files touched: {replacements}")
+PY
+
 RUN npm install \
     && cd server \
     && npm install \
