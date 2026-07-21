@@ -1,11 +1,8 @@
 # =============================================================================
 # ACE-Step UI — Docker image (fspecii/ace-step-ui)
 # =============================================================================
-# Lightweight Node image that runs the Spotify-style frontend + Express backend.
-# Talks to the ACE-Step API container over the Docker network.
-#
-# Build:
-#   docker build -f Dockerfile.ui -t acestep-ui .
+# Frontend (Vite) on 3003, Express backend on 3001 (hardcoded in vite.config proxy).
+# Host maps: 3003->3003, 3004->3001
 # =============================================================================
 
 FROM node:20-bookworm-slim
@@ -21,7 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Clone ace-step-ui (pinned to main; rebuild image to update)
+# Clone ace-step-ui
 RUN git clone --depth 1 https://github.com/fspecii/ace-step-ui.git .
 
 # Install frontend + server dependencies
@@ -30,20 +27,21 @@ RUN npm install \
     && npm install \
     && cd ..
 
-# Default config (overridden by compose environment)
-ENV PORT=3004
+# Internal ports:
+#   Express must stay on 3001 because vite.config.ts proxies /api -> 127.0.0.1:3001
+#   Vite frontend on 3003
+ENV PORT=3001
 ENV FRONTEND_PORT=3003
 ENV ACESTEP_API_URL=http://acestep-xpu:8001
 ENV DATABASE_PATH=/app/data/acestep.db
 ENV JWT_SECRET=ace-step-ui-local-secret-change-me
 ENV FRONTEND_URL=http://localhost:3003
 
-# Persist SQLite DB + generated audio metadata
-RUN mkdir -p /app/data /app/server/data /app/server/public/audio /app/logs
+RUN mkdir -p /app/data /app/server/data /app/server/public/audio /app/logs \
+    && chmod -R 777 /app/data /app/server/data /app/server/public/audio
 
-EXPOSE 3003 3004
+EXPOSE 3003 3001
 
-# Simple launcher: Express backend + Vite frontend
 COPY <<'EOF' /app/docker-start-ui.sh
 #!/usr/bin/env bash
 set -e
@@ -52,43 +50,54 @@ echo "==========================================="
 echo "  ACE-Step UI"
 echo "==========================================="
 echo "ACE-Step API : ${ACESTEP_API_URL}"
-echo "Backend      : 0.0.0.0:${PORT}"
-echo "Frontend     : 0.0.0.0:${FRONTEND_PORT}"
+echo "Backend      : 0.0.0.0:${PORT:-3001}  (internal)"
+echo "Frontend     : 0.0.0.0:${FRONTEND_PORT:-3003}"
+echo "Database     : ${DATABASE_PATH}"
 echo "==========================================="
 
-# Write server .env so the Express app picks up settings
+# Ensure data dirs exist and are writable
+mkdir -p /app/data /app/server/data /app/server/public/audio
+
+# Write server .env
 cat > /app/server/.env <<ENVEOF
-PORT=${PORT}
-NODE_ENV=${NODE_ENV:-development}
-DATABASE_PATH=${DATABASE_PATH:-./data/acestep.db}
-ACESTEP_API_URL=${ACESTEP_API_URL}
+PORT=${PORT:-3001}
+NODE_ENV=development
+DATABASE_PATH=${DATABASE_PATH:-/app/data/acestep.db}
+ACESTEP_API_URL=${ACESTEP_API_URL:-http://acestep-xpu:8001}
 AUDIO_DIR=./public/audio
 FRONTEND_URL=${FRONTEND_URL:-http://localhost:3003}
-VITE_API_URL=${VITE_API_URL:-http://localhost:3004}
 JWT_SECRET=${JWT_SECRET:-ace-step-ui-local-secret}
 PEXELS_API_KEY=${PEXELS_API_KEY:-}
 ENVEOF
 
-# Also expose root .env for any scripts that read it
 cp /app/server/.env /app/.env
 
+# Start Express backend (must be on 3001 for Vite proxy)
 cd /app/server
-npm run dev -- --host 0.0.0.0 &
+npm run dev &
 BACKEND_PID=$!
 
+# Wait for backend to be ready
+for i in $(seq 1 30); do
+  if curl -sf http://127.0.0.1:${PORT:-3001}/ > /dev/null 2>&1; then
+    echo "Backend is up"
+    break
+  fi
+  sleep 1
+done
+
+# Start Vite frontend on 3003, proxying /api to 3001
 cd /app
-# Vite: bind to all interfaces for LAN/mobile access
-npx vite --host 0.0.0.0 --port "${FRONTEND_PORT}" &
+npx vite --host 0.0.0.0 --port "${FRONTEND_PORT:-3003}" &
 FRONTEND_PID=$!
 
 trap 'kill $BACKEND_PID $FRONTEND_PID 2>/dev/null; exit' INT TERM
-
 wait
 EOF
 
 RUN chmod +x /app/docker-start-ui.sh
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=5 \
-    CMD curl -sf http://localhost:3004/ > /dev/null 2>&1 || curl -sf http://localhost:3003/ > /dev/null 2>&1 || exit 1
+HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=5 \
+    CMD curl -sf http://localhost:3003/ > /dev/null 2>&1 || curl -sf http://localhost:3001/ > /dev/null 2>&1 || exit 1
 
 CMD ["/app/docker-start-ui.sh"]
