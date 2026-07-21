@@ -31,17 +31,17 @@ RUN npm install \
     && cd ..
 
 # Default config (overridden by compose environment)
-ENV PORT=3001
-ENV FRONTEND_PORT=3000
+ENV PORT=3004
+ENV FRONTEND_PORT=3003
 ENV ACESTEP_API_URL=http://acestep-xpu:8001
 ENV DATABASE_PATH=/app/data/acestep.db
 ENV JWT_SECRET=ace-step-ui-local-secret-change-me
-ENV FRONTEND_URL=http://localhost:3000
+ENV FRONTEND_URL=http://localhost:3003
 
 # Persist SQLite DB + generated audio metadata
 RUN mkdir -p /app/data /app/server/data /app/server/public/audio /app/logs
 
-EXPOSE 3000 3001
+EXPOSE 3003 3004
 
 # Simple launcher: Express backend + Vite frontend
 COPY <<'EOF' /app/docker-start-ui.sh
@@ -63,8 +63,8 @@ NODE_ENV=${NODE_ENV:-development}
 DATABASE_PATH=${DATABASE_PATH:-./data/acestep.db}
 ACESTEP_API_URL=${ACESTEP_API_URL}
 AUDIO_DIR=./public/audio
-FRONTEND_URL=${FRONTEND_URL:-http://localhost:3000}
-VITE_API_URL=${VITE_API_URL:-http://localhost:3001}
+FRONTEND_URL=${FRONTEND_URL:-http://localhost:3003}
+VITE_API_URL=${VITE_API_URL:-http://localhost:3004}
 JWT_SECRET=${JWT_SECRET:-ace-step-ui-local-secret}
 PEXELS_API_KEY=${PEXELS_API_KEY:-}
 ENVEOF
@@ -89,6 +89,6 @@ EOF
 RUN chmod +x /app/docker-start-ui.sh
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=5 \
-    CMD curl -sf http://localhost:3001/ > /dev/null 2>&1 || curl -sf http://localhost:3000/ > /dev/null 2>&1 || exit 1
+    CMD curl -sf http://localhost:3004/ > /dev/null 2>&1 || curl -sf http://localhost:3003/ > /dev/null 2>&1 || exit 1
 
 CMD ["/app/docker-start-ui.sh"]
