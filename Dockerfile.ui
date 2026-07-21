@@ -14,6 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         git \
         ca-certificates \
         curl \
+        python3 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -28,46 +29,19 @@ RUN git clone --depth 1 https://github.com/fspecii/ace-step-ui.git .
 # ---------------------------------------------------------------------------
 RUN python3 - <<'PY'
 from pathlib import Path
+import re
 p = Path("server/src/index.ts")
 text = p.read_text()
-old = """app.use(cors({
-  origin: (origin, callback) => {
-    // Allow requests with no origin (mobile apps, curl, etc.)
-    if (!origin) return callback(null, true);
-    // Allow localhost and 127.0.0.1 on any port in development
-    if (config.nodeEnv === 'development') {
-      if (origin.includes('localhost') || origin.includes('127.0.0.1')) {
-        return callback(null, true);
-      }
-      // Allow LAN IPs (192.168.x.x, 10.x.x.x, 172.16-31.x.x)
-      const lanPattern = /^https?:\\/\\/(192\\.168\\.|10\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.)/;
-      if (lanPattern.test(origin)) {
-        return callback(null, true);
-      }
-    }
-    // Allow configured frontend URL
-    if (origin === config.frontendUrl) {
-      return callback(null, true);
-    }
-    callback(new Error('Not allowed by CORS'));
-  },
-  credentials: true,
-}));"""
 new = """app.use(cors({
   // Self-hosted / Docker: allow any origin (LAN, Tailscale, hostname, mobile)
   origin: true,
   credentials: true,
 }));"""
-if old not in text:
-    # Fallback: looser match — replace the whole cors({...}) block starting at origin callback
-    import re
-    pat = re.compile(r"app\.use\(cors\(\{.*?\}\)\);", re.S)
-    m = pat.search(text)
-    if not m:
-        raise SystemExit("Could not find cors() block to patch")
-    text = pat.sub(new.strip(), text, count=1)
-else:
-    text = text.replace(old, new)
+pat = re.compile(r"app\.use\(cors\(\{.*?\}\)\);", re.S)
+m = pat.search(text)
+if not m:
+    raise SystemExit("Could not find cors() block to patch")
+text = pat.sub(new, text, count=1)
 p.write_text(text)
 print("CORS patched OK")
 PY
