@@ -1,0 +1,94 @@
+# =============================================================================
+# ACE-Step UI — Docker image (fspecii/ace-step-ui)
+# =============================================================================
+# Lightweight Node image that runs the Spotify-style frontend + Express backend.
+# Talks to the ACE-Step API container over the Docker network.
+#
+# Build:
+#   docker build -f Dockerfile.ui -t acestep-ui .
+# =============================================================================
+
+FROM node:20-bookworm-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV NODE_ENV=development
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git \
+        ca-certificates \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Clone ace-step-ui (pinned to main; rebuild image to update)
+RUN git clone --depth 1 https://github.com/fspecii/ace-step-ui.git .
+
+# Install frontend + server dependencies
+RUN npm install \
+    && cd server \
+    && npm install \
+    && cd ..
+
+# Default config (overridden by compose environment)
+ENV PORT=3001
+ENV FRONTEND_PORT=3000
+ENV ACESTEP_API_URL=http://acestep-xpu:8001
+ENV DATABASE_PATH=/app/data/acestep.db
+ENV JWT_SECRET=ace-step-ui-local-secret-change-me
+ENV FRONTEND_URL=http://localhost:3000
+
+# Persist SQLite DB + generated audio metadata
+RUN mkdir -p /app/data /app/server/data /app/server/public/audio /app/logs
+
+EXPOSE 3000 3001
+
+# Simple launcher: Express backend + Vite frontend
+COPY <<'EOF' /app/docker-start-ui.sh
+#!/usr/bin/env bash
+set -e
+
+echo "==========================================="
+echo "  ACE-Step UI"
+echo "==========================================="
+echo "ACE-Step API : ${ACESTEP_API_URL}"
+echo "Backend      : 0.0.0.0:${PORT}"
+echo "Frontend     : 0.0.0.0:${FRONTEND_PORT}"
+echo "==========================================="
+
+# Write server .env so the Express app picks up settings
+cat > /app/server/.env <<ENVEOF
+PORT=${PORT}
+NODE_ENV=${NODE_ENV:-development}
+DATABASE_PATH=${DATABASE_PATH:-./data/acestep.db}
+ACESTEP_API_URL=${ACESTEP_API_URL}
+AUDIO_DIR=./public/audio
+FRONTEND_URL=${FRONTEND_URL:-http://localhost:3000}
+VITE_API_URL=${VITE_API_URL:-http://localhost:3001}
+JWT_SECRET=${JWT_SECRET:-ace-step-ui-local-secret}
+PEXELS_API_KEY=${PEXELS_API_KEY:-}
+ENVEOF
+
+# Also expose root .env for any scripts that read it
+cp /app/server/.env /app/.env
+
+cd /app/server
+npm run dev -- --host 0.0.0.0 &
+BACKEND_PID=$!
+
+cd /app
+# Vite: bind to all interfaces for LAN/mobile access
+npx vite --host 0.0.0.0 --port "${FRONTEND_PORT}" &
+FRONTEND_PID=$!
+
+trap 'kill $BACKEND_PID $FRONTEND_PID 2>/dev/null; exit' INT TERM
+
+wait
+EOF
+
+RUN chmod +x /app/docker-start-ui.sh
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=5 \
+    CMD curl -sf http://localhost:3001/ > /dev/null 2>&1 || curl -sf http://localhost:3000/ > /dev/null 2>&1 || exit 1
+
+CMD ["/app/docker-start-ui.sh"]
