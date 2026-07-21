@@ -1,10 +1,7 @@
 # =============================================================================
 # ACE-Step UI — Docker image (fspecii/ace-step-ui)
 # =============================================================================
-# Frontend (Vite) on 3003, Express backend on 3001 (vite proxy).
-# Host maps: 3003->3003, 3004->3001
-# User settings: SQLite @ DATABASE_PATH (volume ui_data)
-# XPU restart: POST /api/system/restart-xpu (needs docker.sock + docker CLI)
+# Frontend 3003, Express 3001. Training uses shared /app/datasets + docker exec XPU.
 # =============================================================================
 
 FROM node:20-bookworm-slim
@@ -25,9 +22,7 @@ WORKDIR /app
 
 RUN git clone --depth 1 https://github.com/fspecii/ace-step-ui.git .
 
-# ---------------------------------------------------------------------------
 # Patch 1: CORS
-# ---------------------------------------------------------------------------
 RUN python3 - <<'PY'
 from pathlib import Path
 import re
@@ -44,16 +39,12 @@ p.write_text(pat.sub(new, text, count=1))
 print("CORS patched OK")
 PY
 
-# ---------------------------------------------------------------------------
-# Patch 2: buildGradioArgs (72-param map)
-# ---------------------------------------------------------------------------
+# Patch 2: buildGradioArgs (72 params) — kept minimal reference; full map in prior releases
 RUN python3 - <<'PY'
 from pathlib import Path
 import re
-
 p = Path("server/src/services/acestep.ts")
 text = p.read_text()
-
 new_fn = r'''
 async function buildGradioArgs(params: GenerationParams): Promise<unknown[]> {
   const caption = params.style || 'pop music';
@@ -62,498 +53,211 @@ async function buildGradioArgs(params: GenerationParams): Promise<unknown[]> {
   const isThinking = params.thinking ?? false;
   const isEnhance = params.enhance ?? false;
   const useCot = isEnhance || isThinking;
-
   const referenceAudio = await prepareAudioFile(params.referenceAudioUrl);
   const sourceAudio = await prepareAudioFile(params.sourceAudioUrl);
-
   const needsSource = params.taskType === 'cover' || params.taskType === 'audio2audio' || params.taskType === 'repaint';
   if (needsSource && params.sourceAudioUrl && sourceAudio === null) {
     throw new Error(`Source audio file could not be loaded from: ${params.sourceAudioUrl}.`);
   }
-
   return [
-    /*  0 */ prompt,
-    /*  1 */ lyrics,
-    /*  2 */ (params.bpm && params.bpm > 0) ? params.bpm : 0,
-    /*  3 */ params.keyScale || '',
-    /*  4 */ params.timeSignature || '',
-    /*  5 */ params.vocalLanguage || 'en',
-    /*  6 */ params.inferenceSteps ?? 8,
-    /*  7 */ params.guidanceScale ?? 7.0,
-    /*  8 */ params.randomSeed !== false,
-    /*  9 */ String(params.seed ?? -1),
-    /* 10 */ referenceAudio,
-    /* 11 */ (params.duration && params.duration > 0) ? params.duration : -1,
-    /* 12 */ Math.min(Math.max(params.batchSize ?? 1, 1), 16),
-    /* 13 */ sourceAudio,
-    /* 14 */ params.audioCodes || '',
-    /* 15 */ params.repaintingStart ?? 0.0,
-    /* 16 */ params.repaintingEnd ?? -1,
-    /* 17 */ params.instruction || 'Fill the audio semantic mask based on the given conditions:',
-    /* 18 */ params.audioCoverStrength ?? 1.0,
-    /* 19 */ 0.0,
-    /* 20 */ params.useAdg ?? false,
-    /* 21 */ false,
-    /* 22 */ params.cfgIntervalStart ?? 0.0,
-    /* 23 */ params.cfgIntervalEnd ?? 1.0,
-    /* 24 */ params.shift ?? 3.0,
-    /* 25 */ params.inferMethod || 'ode',
-    /* 26 */ 'euler',
-    /* 27 */ 0.0,
-    /* 28 */ 0.0,
-    /* 29 */ true,
-    /* 30 */ 'double',
-    /* 31 */ 0.02,
-    /* 32 */ 0.06,
-    /* 33 */ 'haar',
-    /* 34 */ params.customTimesteps || '',
-    /* 35 */ params.audioFormat || 'mp3',
-    /* 36 */ '128k',
-    /* 37 */ 48000,
-    /* 38 */ params.lmTemperature ?? 0.85,
-    /* 39 */ isThinking,
-    /* 40 */ params.lmCfgScale ?? 2.0,
-    /* 41 */ params.lmTopK ?? 0,
-    /* 42 */ params.lmTopP ?? 0.9,
-    /* 43 */ params.lmNegativePrompt || 'NO USER INPUT',
-    /* 44 */ useCot ? (params.useCotMetas ?? true) : true,
-    /* 45 */ useCot ? (params.useCotCaption ?? false) : false,
-    /* 46 */ useCot ? (params.useCotLanguage ?? true) : true,
-    /* 47 */ params.isFormatCaption ?? false,
-    /* 48 */ true,
-    /* 49 */ params.constrainedDecodingDebug ?? false,
-    /* 50 */ params.allowLmBatch ?? false,
-    /* 51 */ Math.max(params.scoreScale ?? 0.5, 0.01),
-    /* 52 */ params.lmBatchChunkSize ?? 8,
-    /* 53 */ params.trackName || null,
-    /* 54 */ params.completeTrackClasses || [],
-    /* 55 */ true,
-    /* 56 */ -1.0,
-    /* 57 */ 0.0,
-    /* 58 */ 0.0,
-    /* 59 */ 0.0,
-    /* 60 */ 1.0,
-    /* 61 */ 'balanced',
-    /* 62 */ 0.5,
-    /* 63 */ 0.0,
-    /* 64 */ '',
-    /* 65 */ params.autogen ?? false,
-    /* 66 */ null,
-    /* 67 */ null,
-    /* 68 */ 0.0,
-    /* 69 */ 1.0,
-    /* 70 */ 1,
-    /* 71 */ false,
+    prompt, lyrics,
+    (params.bpm && params.bpm > 0) ? params.bpm : 0,
+    params.keyScale || '', params.timeSignature || '', params.vocalLanguage || 'en',
+    params.inferenceSteps ?? 8, params.guidanceScale ?? 7.0,
+    params.randomSeed !== false, String(params.seed ?? -1),
+    referenceAudio,
+    (params.duration && params.duration > 0) ? params.duration : -1,
+    Math.min(Math.max(params.batchSize ?? 1, 1), 16),
+    sourceAudio, params.audioCodes || '',
+    params.repaintingStart ?? 0.0, params.repaintingEnd ?? -1,
+    params.instruction || 'Fill the audio semantic mask based on the given conditions:',
+    params.audioCoverStrength ?? 1.0, 0.0, params.useAdg ?? false, false,
+    params.cfgIntervalStart ?? 0.0, params.cfgIntervalEnd ?? 1.0, params.shift ?? 3.0,
+    params.inferMethod || 'ode', 'euler', 0.0, 0.0, true, 'double', 0.02, 0.06, 'haar',
+    params.customTimesteps || '', params.audioFormat || 'mp3', '128k', 48000,
+    params.lmTemperature ?? 0.85, isThinking, params.lmCfgScale ?? 2.0,
+    params.lmTopK ?? 0, params.lmTopP ?? 0.9, params.lmNegativePrompt || 'NO USER INPUT',
+    useCot ? (params.useCotMetas ?? true) : true,
+    useCot ? (params.useCotCaption ?? false) : false,
+    useCot ? (params.useCotLanguage ?? true) : true,
+    params.isFormatCaption ?? false, true, params.constrainedDecodingDebug ?? false,
+    params.allowLmBatch ?? false, Math.max(params.scoreScale ?? 0.5, 0.01),
+    params.lmBatchChunkSize ?? 8, params.trackName || null, params.completeTrackClasses || [],
+    true, -1.0, 0.0, 0.0, 0.0, 1.0, 'balanced', 0.5, 0.0, '',
+    params.autogen ?? false, null, null, 0.0, 1.0, 1, false,
   ];
 }
 '''
-
-pat = re.compile(
-    r"async function buildGradioArgs\(params: GenerationParams\): Promise<unknown\[]> \{.*?\n\}",
-    re.S,
-)
+pat = re.compile(r"async function buildGradioArgs\(params: GenerationParams\): Promise<unknown\[]> \{.*?\n\}", re.S)
 if not pat.search(text):
     raise SystemExit("Could not find buildGradioArgs function")
 p.write_text(pat.sub(new_fn.strip(), text, count=1))
 print("buildGradioArgs patched OK")
 PY
 
-# ---------------------------------------------------------------------------
-# Patch 3: Format timeout + endpoint compatibility
-# ---------------------------------------------------------------------------
+# Patch 3: format timeout
 RUN python3 - <<'PY'
 from pathlib import Path
 import re
-replacements = 0
+n = 0
 for path in Path("server/src").rglob("*.ts"):
     text = path.read_text()
     orig = text
-    text = text.replace("/format_input", "/format_lyrics")
-    text = text.replace("'format_input'", "'format_lyrics'")
-    text = text.replace('"format_input"', '"format_lyrics"')
+    text = text.replace("/format_input", "/format_lyrics").replace("'format_input'", "'format_lyrics'").replace('"format_input"', '"format_lyrics"')
     text = re.sub(r"AbortSignal\.timeout\(\s*\d+\s*\)", "AbortSignal.timeout(180000)", text)
     text = re.sub(r"timeout:\s*\d{4,5}\b", "timeout: 180000", text)
     if text != orig:
         path.write_text(text)
-        replacements += 1
-print(f"Format patch done, files touched: {replacements}")
+        n += 1
+print("Format patch files", n)
 PY
 
-# ---------------------------------------------------------------------------
-# Patch 4: Per-user settings (SQLite)
-# ---------------------------------------------------------------------------
+# Patch 4: settings + system routes (compact)
+COPY docker/ui-patches/training-docker.py /tmp/training-docker.py
+
 RUN python3 - <<'PY'
 from pathlib import Path
 import re
 
+# settings table
 mig = Path("server/src/db/migrate.ts")
 mt = mig.read_text()
 if "user_settings" not in mt:
-    extra = """
-
--- Per-user UI / generation settings (JSON blob; portable with DATABASE_PATH volume)
+    extra = '''
 CREATE TABLE IF NOT EXISTS user_settings (
   user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
   settings TEXT NOT NULL DEFAULT '{}',
   updated_at TEXT DEFAULT (datetime('now'))
 );
-CREATE INDEX IF NOT EXISTS idx_user_settings_updated ON user_settings(updated_at);
-"""
-    if "-- Indexes for performance" in mt:
-        mt = mt.replace("-- Indexes for performance", extra + "\n-- Indexes for performance")
-    else:
-        mt = mt.replace(
-            "CREATE INDEX IF NOT EXISTS idx_reference_tracks_created_at ON reference_tracks(created_at);",
-            "CREATE INDEX IF NOT EXISTS idx_reference_tracks_created_at ON reference_tracks(created_at);" + extra,
-            1,
-        )
+'''
+    mt = mt.replace("-- Indexes for performance", extra + "\n-- Indexes for performance") if "-- Indexes for performance" in mt else mt + extra
     mig.write_text(mt)
-    print("Migration: user_settings table added")
-else:
-    print("Migration: user_settings already present")
 
-settings_lines = [
-    "import { Router, Response } from 'express';",
-    "import { pool } from '../db/pool.js';",
-    "import { authMiddleware, AuthenticatedRequest } from '../middleware/auth.js';",
-    "",
-    "const router = Router();",
-    "",
-    "const DEFAULT_SETTINGS: Record<string, unknown> = {",
-    "  batchSize: 1,",
-    "  inferenceSteps: 8,",
-    "  guidanceScale: 7.0,",
-    "  audioFormat: 'mp3',",
-    "  vocalLanguage: 'en',",
-    "  thinking: false,",
-    "  enhance: false,",
-    "  instrumental: false,",
-    "  customMode: true,",
-    "  randomSeed: true,",
-    "  theme: 'dark',",
-    "  locale: 'en',",
-    "  lastStyle: '',",
-    "  lastPrompt: '',",
-    "};",
-    "",
-    "function parseSettings(raw: unknown): Record<string, unknown> {",
-    "  if (raw == null) return { ...DEFAULT_SETTINGS };",
-    "  if (typeof raw === 'object') return { ...DEFAULT_SETTINGS, ...(raw as object) };",
-    "  try {",
-    "    const o = JSON.parse(String(raw));",
-    "    return { ...DEFAULT_SETTINGS, ...(o && typeof o === 'object' ? o : {}) };",
-    "  } catch {",
-    "    return { ...DEFAULT_SETTINGS };",
-    "  }",
-    "}",
-    "",
-    "router.get('/', authMiddleware, async (req: AuthenticatedRequest, res: Response) => {",
-    "  try {",
-    "    const userId = req.user!.id;",
-    "    const result = await pool.query(",
-    "      'SELECT settings, updated_at FROM user_settings WHERE user_id = ?',",
-    "      [userId]",
-    "    );",
-    "    if (result.rows.length === 0) {",
-    "      res.json({ settings: { ...DEFAULT_SETTINGS }, updatedAt: null, isDefault: true });",
-    "      return;",
-    "    }",
-    "    const row = result.rows[0];",
-    "    res.json({",
-    "      settings: parseSettings(row.settings),",
-    "      updatedAt: row.updated_at,",
-    "      isDefault: false,",
-    "    });",
-    "  } catch (err) {",
-    "    console.error('[settings] GET error', err);",
-    "    res.status(500).json({ error: 'Failed to load settings' });",
-    "  }",
-    "});",
-    "",
-    "router.put('/', authMiddleware, async (req: AuthenticatedRequest, res: Response) => {",
-    "  try {",
-    "    const userId = req.user!.id;",
-    "    const body = req.body || {};",
-    "    const incoming = body.settings && typeof body.settings === 'object' ? body.settings : body;",
-    "    const merge = body.merge !== false;",
-    "    const existing = await pool.query(",
-    "      'SELECT settings FROM user_settings WHERE user_id = ?',",
-    "      [userId]",
-    "    );",
-    "    let next: Record<string, unknown>;",
-    "    if (merge && existing.rows.length > 0) {",
-    "      next = { ...parseSettings(existing.rows[0].settings), ...incoming };",
-    "    } else {",
-    "      next = { ...DEFAULT_SETTINGS, ...incoming };",
-    "    }",
-    "    for (const k of Object.keys(next)) {",
-    "      if (next[k] === undefined) delete next[k];",
-    "    }",
-    "    const json = JSON.stringify(next);",
-    "    await pool.query(",
-    "      `INSERT INTO user_settings (user_id, settings, updated_at) VALUES (?, ?, datetime('now')) ON CONFLICT(user_id) DO UPDATE SET settings = excluded.settings, updated_at = datetime('now')`,",
-    "      [userId, json]",
-    "    );",
-    "    res.json({ settings: next, updatedAt: new Date().toISOString() });",
-    "  } catch (err) {",
-    "    console.error('[settings] PUT error', err);",
-    "    res.status(500).json({ error: 'Failed to save settings' });",
-    "  }",
-    "});",
-    "",
-    "router.delete('/', authMiddleware, async (req: AuthenticatedRequest, res: Response) => {",
-    "  try {",
-    "    const userId = req.user!.id;",
-    "    await pool.query('DELETE FROM user_settings WHERE user_id = ?', [userId]);",
-    "    res.json({ settings: { ...DEFAULT_SETTINGS }, reset: true });",
-    "  } catch (err) {",
-    "    console.error('[settings] DELETE error', err);",
-    "    res.status(500).json({ error: 'Failed to reset settings' });",
-    "  }",
-    "});",
-    "",
-    "export default router;",
-]
-Path("server/src/routes/settings.ts").write_text("\n".join(settings_lines) + "\n")
-print("Wrote settings.ts")
+# minimal settings route
+Path("server/src/routes/settings.ts").write_text('''
+import { Router, Response } from \'express\';
+import { pool } from \'../db/pool.js\';
+import { authMiddleware, AuthenticatedRequest } from \'../middleware/auth.js\';
+const router = Router();
+const DEFAULT_SETTINGS: Record<string, unknown> = { batchSize: 1, inferenceSteps: 8, guidanceScale: 7.0, audioFormat: \'mp3\', vocalLanguage: \'en\', theme: \'dark\', locale: \'en\' };
+function parseSettings(raw: unknown): Record<string, unknown> {
+  if (raw == null) return { ...DEFAULT_SETTINGS };
+  if (typeof raw === \'object\') return { ...DEFAULT_SETTINGS, ...(raw as object) };
+  try { return { ...DEFAULT_SETTINGS, ...JSON.parse(String(raw)) }; } catch { return { ...DEFAULT_SETTINGS }; }
+}
+router.get(\'/\', authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const r = await pool.query(\'SELECT settings, updated_at FROM user_settings WHERE user_id = ?\', [req.user!.id]);
+    if (!r.rows.length) return res.json({ settings: { ...DEFAULT_SETTINGS }, isDefault: true });
+    res.json({ settings: parseSettings(r.rows[0].settings), updatedAt: r.rows[0].updated_at, isDefault: false });
+  } catch (e) { res.status(500).json({ error: \'Failed to load settings\' }); }
+});
+router.put(\'/\', authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const body = req.body || {};
+    const incoming = body.settings && typeof body.settings === \'object\' ? body.settings : body;
+    const ex = await pool.query(\'SELECT settings FROM user_settings WHERE user_id = ?\', [req.user!.id]);
+    const next = { ...(ex.rows.length ? parseSettings(ex.rows[0].settings) : DEFAULT_SETTINGS), ...incoming };
+    await pool.query(`INSERT INTO user_settings (user_id, settings, updated_at) VALUES (?, ?, datetime(\'now\')) ON CONFLICT(user_id) DO UPDATE SET settings = excluded.settings, updated_at = datetime(\'now\')`, [req.user!.id, JSON.stringify(next)]);
+    res.json({ settings: next });
+  } catch (e) { res.status(500).json({ error: \'Failed to save settings\' }); }
+});
+router.delete(\'/\', authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    await pool.query(\'DELETE FROM user_settings WHERE user_id = ?\', [req.user!.id]);
+    res.json({ settings: { ...DEFAULT_SETTINGS }, reset: true });
+  } catch (e) { res.status(500).json({ error: \'Failed to reset settings\' }); }
+});
+export default router;
+'''.replace("\\'", "'"))
+
+# system restart route
+Path("server/src/routes/system.ts").write_text('''
+import { Router, Response } from \'express\';
+import { execFile } from \'child_process\';
+import { promisify } from \'util\';
+import { authMiddleware, AuthenticatedRequest } from \'../middleware/auth.js\';
+const execFileAsync = promisify(execFile);
+const router = Router();
+router.post(\'/restart-xpu\', authMiddleware, async (_req: AuthenticatedRequest, res: Response) => {
+  if ((process.env.ENABLE_DOCKER_RESTART || \'true\').toLowerCase() === \'false\') {
+    return res.status(403).json({ error: \'Docker restart disabled\' });
+  }
+  const name = process.env.XPU_CONTAINER_NAME || \'acestep-xpu\';
+  try {
+    await execFileAsync(\'docker\', [\'restart\', name], { timeout: 120000 });
+    res.json({ ok: true, container: name, message: \'Restart issued. Wait 1-3 minutes for models to reload.\' });
+  } catch (err: any) {
+    res.status(500).json({ error: \'Failed to restart container\', detail: String(err?.stderr || err?.message || err) });
+  }
+});
+export default router;
+'''.replace("\\'", "'"))
 
 idx = Path("server/src/index.ts")
 it = idx.read_text()
 if "/api/settings" not in it:
-    if "import trainingRoutes" in it:
-        it = it.replace(
-            "import trainingRoutes from './routes/training.js';",
-            "import trainingRoutes from './routes/training.js';\nimport settingsRoutes from './routes/settings.js';",
-        )
-    else:
-        it = re.sub(
-            r"(import \w+Routes from '\./routes/[^']+';)",
-            r"\1\nimport settingsRoutes from './routes/settings.js';",
-            it,
-            count=1,
-        )
-    if "app.use('/api/training'" in it:
-        it = it.replace(
-            "app.use('/api/training', trainingRoutes);",
-            "app.use('/api/training', trainingRoutes);\napp.use('/api/settings', settingsRoutes);",
-        )
-    elif "app.use('/api/lora'" in it:
-        it = it.replace(
-            "app.use('/api/lora', loraRoutes);",
-            "app.use('/api/lora', loraRoutes);\napp.use('/api/settings', settingsRoutes);",
-        )
-    else:
-        it = it.replace(
-            "app.use('/api/auth', authRoutes);",
-            "app.use('/api/auth', authRoutes);\napp.use('/api/settings', settingsRoutes);",
-        )
+    it = it.replace("import trainingRoutes from './routes/training.js';", "import trainingRoutes from './routes/training.js';\nimport settingsRoutes from './routes/settings.js';\nimport systemRoutes from './routes/system.js';")
+    if "import settingsRoutes" not in it:
+        it = "import settingsRoutes from './routes/settings.js';\nimport systemRoutes from './routes/system.js';\n" + it
+    it = it.replace("app.use('/api/training', trainingRoutes);", "app.use('/api/training', trainingRoutes);\napp.use('/api/settings', settingsRoutes);\napp.use('/api/system', systemRoutes);")
+    if "app.use('/api/settings'" not in it:
+        it = it.replace("app.use('/api/auth', authRoutes);", "app.use('/api/auth', authRoutes);\napp.use('/api/settings', settingsRoutes);\napp.use('/api/system', systemRoutes);")
     idx.write_text(it)
-    print("Registered /api/settings")
-print("Patch 4 complete")
+print("settings/system routes wired")
 PY
 
-# ---------------------------------------------------------------------------
-# Patch 5: Restart acestep-xpu from UI (docker CLI + floating button)
-# ---------------------------------------------------------------------------
+# Patch 5: training docker (preprocess on XPU, soft init, paths)
+RUN python3 /tmp/training-docker.py
+
+# Patch 6: process-level safety so training errors never kill Express
 RUN python3 - <<'PY'
 from pathlib import Path
-import re
-
-lines = [
-    "import { Router, Response } from 'express';",
-    "import { execFile } from 'child_process';",
-    "import { promisify } from 'util';",
-    "import { authMiddleware, AuthenticatedRequest } from '../middleware/auth.js';",
-    "",
-    "const execFileAsync = promisify(execFile);",
-    "const router = Router();",
-    "",
-    "function restartEnabled(): boolean {",
-    "  return (process.env.ENABLE_DOCKER_RESTART || 'true').toLowerCase() !== 'false';",
-    "}",
-    "",
-    "function containerName(): string {",
-    "  return process.env.XPU_CONTAINER_NAME || 'acestep-xpu';",
-    "}",
-    "",
-    "router.get('/restart-xpu/status', authMiddleware, async (_req: AuthenticatedRequest, res: Response) => {",
-    "  const enabled = restartEnabled();",
-    "  const name = containerName();",
-    "  if (!enabled) {",
-    "    res.json({ enabled: false, container: name, reason: 'ENABLE_DOCKER_RESTART=false' });",
-    "    return;",
-    "  }",
-    "  try {",
-    "    const { stdout } = await execFileAsync('docker', ['inspect', '-f', '{{.State.Status}}', name], { timeout: 10000 });",
-    "    res.json({ enabled: true, container: name, status: stdout.trim() });",
-    "  } catch (err: any) {",
-    "    res.json({ enabled: true, container: name, status: 'unknown', error: String(err?.message || err) });",
-    "  }",
-    "});",
-    "",
-    "router.post('/restart-xpu', authMiddleware, async (_req: AuthenticatedRequest, res: Response) => {",
-    "  if (!restartEnabled()) {",
-    "    res.status(403).json({ error: 'Docker restart disabled (ENABLE_DOCKER_RESTART=false)' });",
-    "    return;",
-    "  }",
-    "  const name = containerName();",
-    "  try {",
-    "    console.log('[system] Restarting container', name);",
-    "    await execFileAsync('docker', ['restart', name], { timeout: 120000 });",
-    "    res.json({",
-    "      ok: true,",
-    "      container: name,",
-    "      message: 'Restart issued. Wait 1-3 minutes for models to reload before generating.',",
-    "    });",
-    "  } catch (err: any) {",
-    "    console.error('[system] restart failed', err);",
-    "    res.status(500).json({",
-    "      error: 'Failed to restart container. Is /var/run/docker.sock mounted?',",
-    "      detail: String(err?.stderr || err?.message || err),",
-    "    });",
-    "  }",
-    "});",
-    "",
-    "export default router;",
-]
-Path("server/src/routes/system.ts").write_text("\n".join(lines) + "\n")
-print("Wrote system.ts")
-
-idx = Path("server/src/index.ts")
-it = idx.read_text()
-if "/api/system" not in it:
-    if "import settingsRoutes" in it:
-        it = it.replace(
-            "import settingsRoutes from './routes/settings.js';",
-            "import settingsRoutes from './routes/settings.js';\nimport systemRoutes from './routes/system.js';",
-        )
-    elif "import trainingRoutes" in it:
-        it = it.replace(
-            "import trainingRoutes from './routes/training.js';",
-            "import trainingRoutes from './routes/training.js';\nimport systemRoutes from './routes/system.js';",
-        )
-    else:
-        it = "import systemRoutes from './routes/system.js';\n" + it
-
-    if "app.use('/api/settings'" in it:
-        it = it.replace(
-            "app.use('/api/settings', settingsRoutes);",
-            "app.use('/api/settings', settingsRoutes);\napp.use('/api/system', systemRoutes);",
-        )
-    else:
-        it = it.replace(
-            "app.use('/api/auth', authRoutes);",
-            "app.use('/api/auth', authRoutes);\napp.use('/api/system', systemRoutes);",
-        )
-    idx.write_text(it)
-    print("Registered /api/system")
-
-btn_js = r"""
-(function () {
-  function token() {
-    try {
-      for (const k of ['token', 'authToken', 'access_token', 'ace-step-token', 'jwt']) {
-        const v = localStorage.getItem(k);
-        if (v && v.length > 20) return v.replace(/^Bearer\s+/i, '');
-      }
-      for (const k of ['auth', 'user', 'ace-step-auth']) {
-        const raw = localStorage.getItem(k);
-        if (!raw) continue;
-        try {
-          const o = JSON.parse(raw);
-          if (o && o.token) return String(o.token);
-        } catch (e) {}
-      }
-    } catch (e) {}
-    return null;
-  }
-  function ensureBtn() {
-    if (document.getElementById('ace-xpu-restart-btn')) return;
-    const wrap = document.createElement('div');
-    wrap.id = 'ace-xpu-restart-wrap';
-    wrap.style.cssText = 'position:fixed;bottom:16px;right:16px;z-index:99999;display:flex;flex-direction:column;align-items:flex-end;gap:6px;font-family:system-ui,sans-serif;';
-    const btn = document.createElement('button');
-    btn.id = 'ace-xpu-restart-btn';
-    btn.type = 'button';
-    btn.textContent = 'Restart acestep-xpu';
-    btn.style.cssText = 'background:#1db954;color:#000;border:none;border-radius:999px;padding:10px 16px;font-weight:700;cursor:pointer;box-shadow:0 4px 16px rgba(0,0,0,.35);';
-    const status = document.createElement('div');
-    status.id = 'ace-xpu-restart-status';
-    status.style.cssText = 'max-width:260px;font-size:12px;color:#ddd;background:rgba(0,0,0,.75);padding:6px 10px;border-radius:8px;display:none;';
-    btn.onclick = async function () {
-      const t = token();
-      if (!t) {
-        status.style.display = 'block';
-        status.textContent = 'Log in first, then try again.';
-        return;
-      }
-      if (!confirm('Restart acestep-xpu? Generation unavailable 1-3 min while models reload.')) return;
-      btn.disabled = true;
-      btn.textContent = 'Restarting...';
-      status.style.display = 'block';
-      status.textContent = 'Sending restart...';
-      try {
-        const res = await fetch('/api/system/restart-xpu', {
-          method: 'POST',
-          headers: { Authorization: 'Bearer ' + t, 'Content-Type': 'application/json' },
-        });
-        const data = await res.json().catch(function () { return {}; });
-        if (!res.ok) throw new Error(data.error || data.detail || ('HTTP ' + res.status));
-        status.textContent = data.message || 'Restart issued. Wait for models to load.';
-      } catch (e) {
-        status.textContent = String(e.message || e);
-      } finally {
-        btn.disabled = false;
-        btn.textContent = 'Restart acestep-xpu';
-      }
-    };
-    wrap.appendChild(status);
-    wrap.appendChild(btn);
-    document.body.appendChild(wrap);
-  }
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', function () { setTimeout(ensureBtn, 1500); });
-  } else {
-    setTimeout(ensureBtn, 1500);
-  }
-})();
-"""
-Path("public").mkdir(parents=True, exist_ok=True)
-Path("public/ace-xpu-restart.js").write_text(btn_js)
-
-for html_path in ["index.html", "public/index.html"]:
-    p = Path(html_path)
-    if not p.exists():
-        continue
-    h = p.read_text()
-    if "ace-xpu-restart.js" in h:
-        break
-    if "</body>" in h:
-        h = h.replace("</body>", '  <script src="/ace-xpu-restart.js"></script>\n</body>', 1)
-    else:
-        h += '\n<script src="/ace-xpu-restart.js"></script>\n'
-    p.write_text(h)
-    print("Injected restart script into", html_path)
-    break
-
-print("Patch 5 complete: XPU restart")
+p = Path("server/src/index.ts")
+t = p.read_text()
+if "unhandledRejection" not in t:
+    t += '''
+process.on('unhandledRejection', (reason) => {
+  console.error('[fatal-guard] unhandledRejection', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[fatal-guard] uncaughtException', err);
+});
+'''
+    p.write_text(t)
+    print("Added process fatal guards")
+else:
+    print("fatal guards already present")
 PY
 
-RUN npm install \
-    && cd server \
-    && npm install \
-    && cd ..
+# Floating restart button
+RUN python3 - <<'PY'
+from pathlib import Path
+js = r'''(function(){function token(){try{for(const k of["token","authToken","access_token"]){const v=localStorage.getItem(k);if(v&&v.length>20)return v.replace(/^Bearer\s+/i,"");}}catch(e){}return null}function ensure(){if(document.getElementById("ace-xpu-restart-btn"))return;const w=document.createElement("div");w.style.cssText="position:fixed;bottom:16px;right:16px;z-index:99999";const b=document.createElement("button");b.id="ace-xpu-restart-btn";b.textContent="Restart acestep-xpu";b.style.cssText="background:#1db954;color:#000;border:none;border-radius:999px;padding:10px 16px;font-weight:700;cursor:pointer";b.onclick=async()=>{const t=token();if(!t)return alert("Log in first");if(!confirm("Restart acestep-xpu?"))return;b.disabled=true;try{const r=await fetch("/api/system/restart-xpu",{method:"POST",headers:{Authorization:"Bearer "+t}});const d=await r.json();alert(d.message||d.error||"done")}catch(e){alert(String(e))}b.disabled=false};w.appendChild(b);document.body.appendChild(w)}setTimeout(ensure,1500)})();'''
+Path("public").mkdir(exist_ok=True)
+Path("public/ace-xpu-restart.js").write_text(js)
+for hp in ["index.html", "public/index.html"]:
+    p = Path(hp)
+    if p.exists() and "ace-xpu-restart" not in p.read_text():
+        h = p.read_text()
+        p.write_text(h.replace("</body>", '<script src="/ace-xpu-restart.js"></script></body>') if "</body>" in h else h + '<script src="/ace-xpu-restart.js"></script>')
+print("restart button ok")
+PY
+
+RUN npm install && cd server && npm install && cd ..
 
 ENV PORT=3001
 ENV FRONTEND_PORT=3003
 ENV ACESTEP_API_URL=http://acestep-xpu:8001
 ENV DATABASE_PATH=/app/data/acestep.db
-ENV JWT_SECRET=ace-step-ui-local-secret-change-me
-ENV FRONTEND_URL=http://localhost:3003
+ENV DATASETS_DIR=/app/datasets
+ENV DATASETS_UPLOADS_DIR=/app/datasets/uploads
+ENV ACESTEP_PATH=/app
+ENV LORA_OUTPUT_DIR=/app/lora_output
 ENV ENABLE_DOCKER_RESTART=true
 ENV XPU_CONTAINER_NAME=acestep-xpu
 
-RUN mkdir -p /app/data /app/server/data /app/server/public/audio /app/logs \
+RUN mkdir -p /app/data /app/server/data /app/server/public/audio /app/logs /app/datasets/uploads \
     && chmod -R 777 /app/data /app/server/data /app/server/public/audio
 
 EXPOSE 3003 3001
@@ -561,22 +265,30 @@ EXPOSE 3003 3001
 COPY <<'EOF' /app/docker-start-ui.sh
 #!/usr/bin/env bash
 set -e
-
 echo "==========================================="
 echo "  ACE-Step UI"
 echo "==========================================="
 echo "ACE-Step API : ${ACESTEP_API_URL}"
-echo "Backend      : 0.0.0.0:${PORT:-3001}  (internal)"
-echo "Frontend     : 0.0.0.0:${FRONTEND_PORT:-3003}"
-echo "Database     : ${DATABASE_PATH}"
-echo "XPU restart  : ${ENABLE_DOCKER_RESTART:-true} -> ${XPU_CONTAINER_NAME:-acestep-xpu}"
+echo "Datasets     : ${DATASETS_DIR:-/app/datasets}"
+echo "LoRA output  : ${LORA_OUTPUT_DIR:-/app/lora_output}"
 echo "==========================================="
 
-mkdir -p /app/data /app/server/data /app/server/public/audio /app/public
-# Serve floating restart script from Vite public dir
+mkdir -p /app/data /app/server/data /app/server/public/audio \
+  /app/datasets/uploads /app/datasets/preprocessed_tensors /app/datasets/_tools \
+  /app/lora_output/checkpoints /app/lora_output/final /app/ACE-Step-1.5
+
+# Compat symlinks for any leftover hardcoded paths
+ln -sfn /app/datasets /app/ACE-Step-1.5/datasets || true
+ln -sfn /app/checkpoints /app/ACE-Step-1.5/checkpoints || true
+ln -sfn /app/lora_output /app/server/lora_output || true
+
 if [ -f /app/public/ace-xpu-restart.js ]; then
   mkdir -p /app/server/public
-  cp -f /app/public/ace-xpu-restart.js /app/server/public/ace-xpu-restart.js 2>/dev/null || true
+  cp -f /app/public/ace-xpu-restart.js /app/server/public/ 2>/dev/null || true
+fi
+# Stage preprocess script onto shared volume for XPU docker exec
+if [ -f /app/server/scripts/preprocess_dataset.py ]; then
+  cp -f /app/server/scripts/preprocess_dataset.py /app/datasets/_tools/preprocess_dataset.py || true
 fi
 
 cat > /app/server/.env <<ENVEOF
@@ -587,29 +299,25 @@ ACESTEP_API_URL=${ACESTEP_API_URL:-http://acestep-xpu:8001}
 AUDIO_DIR=./public/audio
 FRONTEND_URL=${FRONTEND_URL:-http://localhost:3003}
 JWT_SECRET=${JWT_SECRET:-ace-step-ui-local-secret}
-PEXELS_API_KEY=${PEXELS_API_KEY:-}
+DATASETS_DIR=${DATASETS_DIR:-/app/datasets}
+DATASETS_UPLOADS_DIR=${DATASETS_UPLOADS_DIR:-/app/datasets/uploads}
+ACESTEP_PATH=${ACESTEP_PATH:-/app}
+LORA_OUTPUT_DIR=${LORA_OUTPUT_DIR:-/app/lora_output}
 ENABLE_DOCKER_RESTART=${ENABLE_DOCKER_RESTART:-true}
 XPU_CONTAINER_NAME=${XPU_CONTAINER_NAME:-acestep-xpu}
 ENVEOF
-
 cp /app/server/.env /app/.env
 
 cd /app/server
 npm run dev &
 BACKEND_PID=$!
-
 for i in $(seq 1 30); do
-  if curl -sf http://127.0.0.1:${PORT:-3001}/ > /dev/null 2>&1; then
-    echo "Backend is up"
-    break
-  fi
+  curl -sf http://127.0.0.1:${PORT:-3001}/ >/dev/null 2>&1 && break
   sleep 1
 done
-
 cd /app
 npx vite --host 0.0.0.0 --port "${FRONTEND_PORT:-3003}" &
 FRONTEND_PID=$!
-
 trap 'kill $BACKEND_PID $FRONTEND_PID 2>/dev/null; exit' INT TERM
 wait
 EOF
@@ -617,6 +325,6 @@ EOF
 RUN chmod +x /app/docker-start-ui.sh
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=5 \
-    CMD curl -sf http://localhost:3003/ > /dev/null 2>&1 || curl -sf http://localhost:3001/ > /dev/null 2>&1 || exit 1
+    CMD curl -sf http://localhost:3003/ >/dev/null || curl -sf http://localhost:3001/ >/dev/null || exit 1
 
 CMD ["/app/docker-start-ui.sh"]
