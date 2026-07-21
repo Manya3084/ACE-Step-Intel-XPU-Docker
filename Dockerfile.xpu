@@ -1,32 +1,8 @@
 # =============================================================================
 # ACE-Step 1.5 — Intel XPU / Arc GPU Dockerfile
 # =============================================================================
-#
-# Optimized for Intel Arc discrete GPUs (A770 16GB, A750, A580, A380)
-# and modern Intel integrated graphics with XPU support.
-#
-# Tested target: Intel Arc A770 16GB on Linux (including OMV / Debian-based)
-#
-# Build:
-#   docker build -f Dockerfile.xpu -t acestep-xpu .
-#
-# Run (Gradio UI):
-#   docker run --rm -it \
-#     --device=/dev/dri \
-#     -p 7860:7860 \
-#     -v $(pwd)/checkpoints:/app/checkpoints \
-#     -v $(pwd)/gradio_outputs:/app/gradio_outputs \
-#     -e ACESTEP_MODE=gradio \
-#     acestep-xpu
-#
-# Notes:
-#   - Requires Intel GPU drivers + Level Zero on the host
-#   - Pass /dev/dri (and sometimes render nodes) for GPU access
-#   - For best results on A770 16GB: use turbo DiT + 1.7B or 4B LM with offload
+# Optimized for Intel Arc A770 16GB on Linux / OMV
 # =============================================================================
-
-ARG PYTHON_VERSION=3.11
-ARG UV_VERSION=0.7
 
 FROM ubuntu:22.04
 
@@ -34,7 +10,6 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV LANG=C.UTF-8
 ENV LC_ALL=C.UTF-8
 
-# ==================== System packages + Intel GPU repository ====================
 RUN apt-get update && apt-get install -y --no-install-recommends \
         software-properties-common \
         build-essential \
@@ -44,35 +19,29 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         gnupg \
         gpg-agent \
-        # Audio
         libsndfile1 \
         libsndfile1-dev \
         ffmpeg \
-        # Python build deps
         libffi-dev \
         libssl-dev \
-        # Useful utilities
         pciutils \
     && rm -rf /var/lib/apt/lists/*
 
-# Add Intel GPU compute repository (required for Level Zero on Ubuntu 22.04)
+# Intel GPU compute repository (Level Zero)
 RUN wget -qO - https://repositories.intel.com/gpu/intel-graphics.key | \
         gpg --yes --dearmor --output /usr/share/keyrings/intel-graphics.gpg \
     && echo "deb [arch=amd64,i386 signed-by=/usr/share/keyrings/intel-graphics.gpg] https://repositories.intel.com/gpu/ubuntu jammy unified" | \
         tee /etc/apt/sources.list.d/intel-gpu-jammy.list \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
-        # Level Zero + OpenCL (correct package names from Intel repo)
         libze1 \
         libze-intel-gpu1 \
         intel-opencl-icd \
         clinfo \
-        # Optional but useful for PyTorch XPU
         libze-dev \
         intel-ocloc \
     && rm -rf /var/lib/apt/lists/*
 
-# Python 3.11 from deadsnakes
 RUN add-apt-repository ppa:deadsnakes/ppa \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -82,52 +51,40 @@ RUN add-apt-repository ppa:deadsnakes/ppa \
         python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
-# ==================== uv ====================
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
-# ==================== Project source ====================
 WORKDIR /app
 COPY . /app/
 
-# ==================== Python environment & XPU PyTorch ====================
-# Critical: pyproject.toml pins CUDA torch for Linux x86_64.
-# We must install the project without its torch dependency, then force the XPU build.
-
+# Install project without CUDA torch, then force XPU torch
 RUN uv venv /app/.venv --python python3.11 \
     && . /app/.venv/bin/activate \
     && uv pip install --upgrade pip \
-    # 1. Install project without dependencies (avoids CUDA torch from pyproject.toml)
     && uv pip install -e . --no-deps \
-    # 2. Install the rest of the XPU requirements (does not pull torch on Linux)
     && uv pip install -r requirements-xpu.txt \
-    # 3. Force the correct XPU version of PyTorch (must be last)
     && uv pip install --pre --force-reinstall \
          torch torchaudio torchvision \
          --index-url https://download.pytorch.org/whl/nightly/xpu
 
-# Make sure the venv is used by default
 ENV PATH="/app/.venv/bin:$PATH"
 ENV VIRTUAL_ENV=/app/.venv
 
-# ==================== Runtime directories ====================
 RUN mkdir -p /app/checkpoints /app/gradio_outputs /app/output
 
-# ==================== XPU / SYCL environment ====================
 ENV PYTORCH_DEVICE=xpu
 ENV TORCH_COMPILE_BACKEND=eager
 ENV SYCL_CACHE_PERSISTENT=1
 ENV SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS=1
 ENV ZE_FLAT_DEVICE_HIERARCHY=COMPOSITE
 
-# Bind to all interfaces for Docker port-mapping
 ENV GRADIO_SERVER_NAME=0.0.0.0
 ENV ACESTEP_API_HOST=0.0.0.0
 
-# Default mode
-ENV ACESTEP_MODE=gradio
+# Default: Gradio + API endpoints (required by ace-step-ui)
+# Modes: gradio-api (default) | gradio | api
+ENV ACESTEP_MODE=gradio-api
 ENV ACESTEP_INIT_SERVICE=true
 
-# Recommended defaults for A770 16GB
 ENV ACESTEP_CONFIG_PATH=acestep-v15-turbo
 ENV ACESTEP_LM_MODEL_PATH=acestep-5Hz-lm-1.7B
 ENV ACESTEP_LLM_BACKEND=pt
@@ -135,16 +92,13 @@ ENV ACESTEP_OFFLOAD_TO_CPU=true
 
 ENV TOKENIZERS_PARALLELISM=false
 
-# ==================== Ports ====================
 EXPOSE 7860 8001
 
-# ==================== Health check ====================
-HEALTHCHECK --interval=60s --timeout=15s --start-period=180s --retries=3 \
-    CMD curl -sf http://localhost:${GRADIO_PORT:-7860}/ > /dev/null 2>&1 \
-     || curl -sf http://localhost:${ACESTEP_API_PORT:-8001}/health > /dev/null 2>&1 \
+HEALTHCHECK --interval=60s --timeout=15s --start-period=300s --retries=5 \
+    CMD curl -sf http://localhost:8001/ > /dev/null 2>&1 \
+     || curl -sf http://localhost:7860/ > /dev/null 2>&1 \
      || exit 1
 
-# ==================== Entrypoint ====================
 COPY <<'ENTRYPOINT_EOF' /app/docker-entrypoint-xpu.sh
 #!/usr/bin/env bash
 set -e
@@ -166,8 +120,7 @@ for i in range(torch.xpu.device_count()):
 ' 2>/dev/null || true
 else
     echo "XPU       : NOT DETECTED"
-    echo "           Make sure /dev/dri is passed and Intel drivers + Level Zero are installed on the host"
-    echo "           Also verify that the XPU build of PyTorch was installed (should contain +xpu in version)"
+    echo "           Make sure /dev/dri is passed and Intel drivers + Level Zero are on the host"
 fi
 echo "==========================================="
 
@@ -179,19 +132,44 @@ if [ "${ACESTEP_INIT_SERVICE:-true}" = "true" ]; then
     echo "Auto-init    : DiT=${ACESTEP_CONFIG_PATH:-auto}  LM=${ACESTEP_LM_MODEL_PATH:-none}"
 fi
 
+# Offload flag
+OFFLOAD_ARGS=""
+if [ "${ACESTEP_OFFLOAD_TO_CPU:-true}" = "true" ]; then
+    OFFLOAD_ARGS="--offload_to_cpu true"
+fi
+
 if [ "${ACESTEP_MODE}" = "api" ]; then
-    echo "Starting REST API server on 0.0.0.0:${ACESTEP_API_PORT:-8001} ..."
+    # Pure FastAPI REST server (no Gradio client compatibility)
+    echo "Starting pure REST API on 0.0.0.0:${ACESTEP_API_PORT:-8001} ..."
     exec python -m acestep.api_server \
         --host "${ACESTEP_API_HOST:-0.0.0.0}" \
         --port "${ACESTEP_API_PORT:-8001}" \
         ${ACESTEP_EXTRA_ARGS:-}
-else
+
+elif [ "${ACESTEP_MODE}" = "gradio" ]; then
+    # Gradio UI only (no API endpoints for ace-step-ui)
     echo "Starting Gradio UI on 0.0.0.0:${GRADIO_PORT:-7860} ..."
     exec python -m acestep.acestep_v15_pipeline \
         --server-name "${GRADIO_SERVER_NAME:-0.0.0.0}" \
         --port "${GRADIO_PORT:-7860}" \
         --backend "${ACESTEP_LLM_BACKEND:-pt}" \
         ${INIT_ARGS} \
+        ${OFFLOAD_ARGS} \
+        ${ACESTEP_EXTRA_ARGS:-}
+
+else
+    # Default: gradio-api — Gradio + --enable-api (what ace-step-ui needs)
+    # Listens on 8001 so ACESTEP_API_URL=http://acestep-xpu:8001 works
+    PORT="${ACESTEP_API_PORT:-8001}"
+    echo "Starting Gradio + API endpoints on 0.0.0.0:${PORT} ..."
+    echo "(ace-step-ui connects via Gradio client to this port)"
+    exec python -m acestep.acestep_v15_pipeline \
+        --server-name "${GRADIO_SERVER_NAME:-0.0.0.0}" \
+        --port "${PORT}" \
+        --backend "${ACESTEP_LLM_BACKEND:-pt}" \
+        --enable-api \
+        ${INIT_ARGS} \
+        ${OFFLOAD_ARGS} \
         ${ACESTEP_EXTRA_ARGS:-}
 fi
 ENTRYPOINT_EOF
