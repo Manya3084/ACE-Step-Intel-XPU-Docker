@@ -21,6 +21,57 @@ WORKDIR /app
 # Clone ace-step-ui
 RUN git clone --depth 1 https://github.com/fspecii/ace-step-ui.git .
 
+# ---------------------------------------------------------------------------
+# Patch CORS: original only allows localhost + a few LAN ranges.
+# Self-hosted users often access via hostname, Tailscale, or other IPs.
+# For local Docker use, allow any origin.
+# ---------------------------------------------------------------------------
+RUN python3 - <<'PY'
+from pathlib import Path
+p = Path("server/src/index.ts")
+text = p.read_text()
+old = """app.use(cors({
+  origin: (origin, callback) => {
+    // Allow requests with no origin (mobile apps, curl, etc.)
+    if (!origin) return callback(null, true);
+    // Allow localhost and 127.0.0.1 on any port in development
+    if (config.nodeEnv === 'development') {
+      if (origin.includes('localhost') || origin.includes('127.0.0.1')) {
+        return callback(null, true);
+      }
+      // Allow LAN IPs (192.168.x.x, 10.x.x.x, 172.16-31.x.x)
+      const lanPattern = /^https?:\\/\\/(192\\.168\\.|10\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.)/;
+      if (lanPattern.test(origin)) {
+        return callback(null, true);
+      }
+    }
+    // Allow configured frontend URL
+    if (origin === config.frontendUrl) {
+      return callback(null, true);
+    }
+    callback(new Error('Not allowed by CORS'));
+  },
+  credentials: true,
+}));"""
+new = """app.use(cors({
+  // Self-hosted / Docker: allow any origin (LAN, Tailscale, hostname, mobile)
+  origin: true,
+  credentials: true,
+}));"""
+if old not in text:
+    # Fallback: looser match — replace the whole cors({...}) block starting at origin callback
+    import re
+    pat = re.compile(r"app\.use\(cors\(\{.*?\}\)\);", re.S)
+    m = pat.search(text)
+    if not m:
+        raise SystemExit("Could not find cors() block to patch")
+    text = pat.sub(new.strip(), text, count=1)
+else:
+    text = text.replace(old, new)
+p.write_text(text)
+print("CORS patched OK")
+PY
+
 # Install frontend + server dependencies
 RUN npm install \
     && cd server \
@@ -55,10 +106,8 @@ echo "Frontend     : 0.0.0.0:${FRONTEND_PORT:-3003}"
 echo "Database     : ${DATABASE_PATH}"
 echo "==========================================="
 
-# Ensure data dirs exist and are writable
 mkdir -p /app/data /app/server/data /app/server/public/audio
 
-# Write server .env
 cat > /app/server/.env <<ENVEOF
 PORT=${PORT:-3001}
 NODE_ENV=development
@@ -72,12 +121,10 @@ ENVEOF
 
 cp /app/server/.env /app/.env
 
-# Start Express backend (must be on 3001 for Vite proxy)
 cd /app/server
 npm run dev &
 BACKEND_PID=$!
 
-# Wait for backend to be ready
 for i in $(seq 1 30); do
   if curl -sf http://127.0.0.1:${PORT:-3001}/ > /dev/null 2>&1; then
     echo "Backend is up"
@@ -86,7 +133,6 @@ for i in $(seq 1 30); do
   sleep 1
 done
 
-# Start Vite frontend on 3003, proxying /api to 3001
 cd /app
 npx vite --host 0.0.0.0 --port "${FRONTEND_PORT:-3003}" &
 FRONTEND_PID=$!
