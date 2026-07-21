@@ -2,25 +2,19 @@
 # ACE-Step 1.5 + ace-step-ui — Full stack for Intel XPU / Arc GPUs
 # =============================================================================
 #
-# Target: Intel Arc A770 16GB on Linux / OpenMediaVault
-#
 # Services:
 #   acestep-xpu  — ACE-Step API (port 8001) on Intel XPU
-#   acestep-ui   — Spotify-style web UI (ports 3003 + 3004)
+#   acestep-ui   — Spotify-style web UI
+#                   host 3003 = frontend
+#                   host 3004 = UI backend (maps to container 3001)
 #
 # Usage:
 #   docker compose -f docker-compose.xpu.yml up -d --build
-#   docker compose -f docker-compose.xpu.yml logs -f
-#
-# Then open on phone/desktop:
-#   http://YOUR_OMV_IP:3003
+#   open http://YOUR_OMV_IP:3003
 #
 # =============================================================================
 
 services:
-  # --------------------------------------------------------------------------
-  # ACE-Step backend (Intel XPU)
-  # --------------------------------------------------------------------------
   acestep-xpu:
     build:
       context: .
@@ -51,7 +45,6 @@ services:
 
     ports:
       - "${API_PORT:-8001}:8001"
-      # Gradio kept optional if you ever need it
       - "${GRADIO_PORT:-7860}:7860"
 
     volumes:
@@ -73,9 +66,6 @@ services:
       start_period: 300s
       retries: 5
 
-  # --------------------------------------------------------------------------
-  # ace-step-ui frontend (mobile-friendly)
-  # --------------------------------------------------------------------------
   acestep-ui:
     build:
       context: .
@@ -88,21 +78,20 @@ services:
         condition: service_started
 
     environment:
-      # Reach the API container by Docker service name
       - ACESTEP_API_URL=http://acestep-xpu:8001
-      - PORT=3004
+      # Express MUST stay on 3001 — vite.config.ts proxies /api to 127.0.0.1:3001
+      - PORT=3001
       - FRONTEND_PORT=3003
       - DATABASE_PATH=/app/data/acestep.db
       - JWT_SECRET=${JWT_SECRET:-ace-step-ui-local-secret-change-me}
-      # Set this to your OMV LAN IP so mobile links work correctly
-      # e.g. http://192.168.1.50:3003
       - FRONTEND_URL=${FRONTEND_URL:-http://localhost:3003}
-      - VITE_API_URL=${VITE_API_URL:-http://localhost:3004}
       - PEXELS_API_KEY=${PEXELS_API_KEY:-}
 
     ports:
+      # UI in browser
       - "${UI_PORT:-3003}:3003"
-      - "${UI_API_PORT:-3004}:3004"
+      # UI backend (host 3004 -> container Express 3001)
+      - "${UI_API_PORT:-3004}:3001"
 
     volumes:
       - ui_data:/app/data
@@ -113,7 +102,7 @@ services:
     healthcheck:
       test: >-
         curl -sf http://localhost:3003/ > /dev/null 2>&1 ||
-        curl -sf http://localhost:3004/ > /dev/null 2>&1 ||
+        curl -sf http://localhost:3001/ > /dev/null 2>&1 ||
         exit 1
       interval: 30s
       timeout: 10s
