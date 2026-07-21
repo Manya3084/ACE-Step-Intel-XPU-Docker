@@ -6,7 +6,7 @@ p = Path("server/src/routes/training.ts")
 text = p.read_text()
 
 
-def find_router_post(src: str, path: str) -> tuple[int, int] | None:
+def find_router_post(src: str, path: str):
     """Return [start, end) of router.post('/path', ...) { ... }); with balanced braces."""
     for quote in ("'", '"'):
         needle = f"router.post({quote}{path}{quote}"
@@ -14,9 +14,18 @@ def find_router_post(src: str, path: str) -> tuple[int, int] | None:
         if start >= 0:
             break
     else:
-        return None
+        # also try path without leading slash variants
+        for alt in (path.lstrip("/"), path):
+            for quote in ("'", '"'):
+                needle = f"router.post({quote}/{alt}{quote}" if not alt.startswith("/") else f"router.post({quote}{alt}{quote}"
+                start = src.find(needle)
+                if start >= 0:
+                    break
+            if start >= 0:
+                break
+        else:
+            return None
 
-    # Find opening brace of the async handler
     i = src.find("{", start)
     if i < 0:
         return None
@@ -59,7 +68,6 @@ def find_router_post(src: str, path: str) -> tuple[int, int] | None:
             elif c == "}":
                 depth -= 1
                 if depth == 0:
-                    # include trailing ); if present
                     end = j + 1
                     if end < len(src) and src[end] == ")":
                         end += 1
@@ -70,15 +78,20 @@ def find_router_post(src: str, path: str) -> tuple[int, int] | None:
     return None
 
 
-def replace_route(src: str, path: str, new_body: str) -> str:
+def replace_route(src: str, path: str, new_body: str):
     span = find_router_post(src, path)
     if not span:
-        raise SystemExit(f"Could not find balanced router.post for {path}")
+        return src, False
     a, b = span
-    return src[:a] + new_body.strip() + src[b:]
+    return src[:a] + new_body.strip() + src[b:], True
 
 
-# --- helpers ---
+def list_training_posts(src: str):
+    """Debug: list router.post paths in file."""
+    import re
+    return re.findall(r"router\.post\(\s*['\"]([^'\"]+)['\"]", src)
+
+
 HELPER = r'''
 /** Docker / XPU path helpers (ACE-Step-Intel-XPU-Docker) */
 function xpuContainer(): string {
@@ -108,7 +121,6 @@ function normalizeTrainingPath(input: string | undefined | null, fallback: strin
 if "function normalizeTrainingPath" not in text:
     marker = "function getAceStepDir"
     if marker in text:
-        # insert after getAceStepDir block
         span_start = text.find(marker)
         i = text.find("{", span_start)
         depth = 0
@@ -222,32 +234,20 @@ INIT = r'''
 router.post("/init-model", authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const body = req.body || {};
-    const checkpoint = body.checkpoint;
-    const configPath = body.configPath;
-    const device = body.device ?? "xpu";
-    const initLlm = body.initLlm ?? false;
-    const lmModelPath = body.lmModelPath ?? "";
-    const backend = body.backend ?? "pt";
-    const useFlashAttention = body.useFlashAttention ?? false;
-    const offloadToCpu = body.offloadToCpu ?? true;
-    const offloadDitToCpu = body.offloadDitToCpu ?? false;
-    const compileModel = body.compileModel ?? false;
-    const quantization = body.quantization ?? false;
-
     try {
       const client = await getGradioClient();
       const result = await client.predict("/init_service_wrapper", [
-        checkpoint ?? "",
-        configPath ?? process.env.ACESTEP_CONFIG_PATH ?? "acestep-v15-turbo",
-        device,
-        initLlm,
-        lmModelPath,
-        backend,
-        useFlashAttention,
-        offloadToCpu,
-        offloadDitToCpu,
-        compileModel,
-        quantization,
+        body.checkpoint ?? "",
+        body.configPath ?? process.env.ACESTEP_CONFIG_PATH ?? "acestep-v15-turbo",
+        body.device ?? "xpu",
+        body.initLlm ?? false,
+        body.lmModelPath ?? "",
+        body.backend ?? "pt",
+        body.useFlashAttention ?? false,
+        body.offloadToCpu ?? true,
+        body.offloadDitToCpu ?? false,
+        body.compileModel ?? false,
+        body.quantization ?? false,
       ]);
       const data = (result.data as unknown[]) || [];
       res.json({
@@ -277,12 +277,34 @@ router.post("/init-model", authMiddleware, async (req: AuthenticatedRequest, res
 });
 '''
 
-text = replace_route(text, "/preprocess", PREPROCESS)
-print("Replaced /preprocess (brace-balanced)")
-text = replace_route(text, "/init-model", INIT)
-print("Replaced /init-model (brace-balanced)")
+posts = list_training_posts(text)
+print("Found router.post paths:", posts)
 
-# Default path strings
+text, ok = replace_route(text, "/preprocess", PREPROCESS)
+if not ok:
+    raise SystemExit("Could not find /preprocess route")
+print("Replaced /preprocess")
+
+text, ok = replace_route(text, "/init-model", INIT)
+if not ok:
+    # try alternate names used by some UI versions
+    for alt in ("/init_model", "/initModel", "/model-init", "/init"):
+        text, ok = replace_route(text, alt, INIT.replace('"/init-model"', f'"{alt}"'))
+        if ok:
+            print(f"Replaced {alt} as init-model")
+            break
+    if not ok:
+        print("WARN: no init-model route found; appending soft handler")
+        # Append before export default
+        if "export default router" in text:
+            text = text.replace(
+                "export default router",
+                INIT.strip() + "\n\nexport default router",
+                1,
+            )
+        else:
+            text = text + "\n" + INIT + "\n"
+
 for old, new in [
     ("tensorDir ?? './datasets/preprocessed_tensors'",
      'normalizeTrainingPath(tensorDir, "/app/datasets/preprocessed_tensors")'),
