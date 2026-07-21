@@ -3,10 +3,10 @@
 # =============================================================================
 #
 # Services:
-#   acestep-xpu  — ACE-Step API (port 8001) on Intel XPU
+#   acestep-xpu  — Gradio + API on port 8001 (Intel XPU)
 #   acestep-ui   — Spotify-style web UI
 #                   host 3003 = frontend
-#                   host 3004 = UI backend (maps to container 3001)
+#                   host 3004 = UI backend
 #
 # Usage:
 #   docker compose -f docker-compose.xpu.yml up -d --build
@@ -29,7 +29,8 @@ services:
       - path: .env
         required: false
     environment:
-      - ACESTEP_MODE=${ACESTEP_MODE:-api}
+      # gradio-api = Gradio + --enable-api on 8001 (required by ace-step-ui)
+      - ACESTEP_MODE=${ACESTEP_MODE:-gradio-api}
       - ACESTEP_LLM_BACKEND=${ACESTEP_LLM_BACKEND:-pt}
       - ACESTEP_INIT_SERVICE=${ACESTEP_INIT_SERVICE:-true}
       - ACESTEP_CONFIG_PATH=${ACESTEP_CONFIG_PATH:-acestep-v15-turbo}
@@ -58,7 +59,7 @@ services:
 
     healthcheck:
       test: >-
-        curl -sf http://localhost:8001/health > /dev/null 2>&1 ||
+        curl -sf http://localhost:8001/ > /dev/null 2>&1 ||
         curl -sf http://localhost:7860/ > /dev/null 2>&1 ||
         exit 1
       interval: 30s
@@ -79,7 +80,6 @@ services:
 
     environment:
       - ACESTEP_API_URL=http://acestep-xpu:8001
-      # Express MUST stay on 3001 — vite.config.ts proxies /api to 127.0.0.1:3001
       - PORT=3001
       - FRONTEND_PORT=3003
       - DATABASE_PATH=/app/data/acestep.db
@@ -88,9 +88,7 @@ services:
       - PEXELS_API_KEY=${PEXELS_API_KEY:-}
 
     ports:
-      # UI in browser
       - "${UI_PORT:-3003}:3003"
-      # UI backend (host 3004 -> container Express 3001)
       - "${UI_API_PORT:-3004}:3001"
 
     volumes:
