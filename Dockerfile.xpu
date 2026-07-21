@@ -90,14 +90,20 @@ WORKDIR /app
 COPY . /app/
 
 # ==================== Python environment & XPU PyTorch ====================
-# Create venv and install XPU-enabled PyTorch + project deps
+# Critical: pyproject.toml pins CUDA torch for Linux x86_64.
+# We must install the project without its torch dependency, then force the XPU build.
+
 RUN uv venv /app/.venv --python python3.11 \
     && . /app/.venv/bin/activate \
     && uv pip install --upgrade pip \
-    && uv pip install --pre torch torchaudio torchvision \
-         --index-url https://download.pytorch.org/whl/nightly/xpu \
+    # 1. Install project without dependencies (avoids CUDA torch from pyproject.toml)
+    && uv pip install -e . --no-deps \
+    # 2. Install the rest of the XPU requirements (does not pull torch on Linux)
     && uv pip install -r requirements-xpu.txt \
-    && uv pip install -e .
+    # 3. Force the correct XPU version of PyTorch (must be last)
+    && uv pip install --pre --force-reinstall \
+         torch torchaudio torchvision \
+         --index-url https://download.pytorch.org/whl/nightly/xpu
 
 # Make sure the venv is used by default
 ENV PATH="/app/.venv/bin:$PATH"
@@ -150,7 +156,7 @@ echo "Mode      : ${ACESTEP_MODE}"
 echo "Python    : $(python --version 2>&1)"
 echo "PyTorch   : $(python -c 'import torch; print(torch.__version__)' 2>/dev/null || echo 'N/A')"
 
-if python -c 'import torch; assert torch.xpu.is_available()' 2>/dev/null; then
+if python -c 'import torch; assert hasattr(torch, "xpu") and torch.xpu.is_available()' 2>/dev/null; then
     echo "XPU       : AVAILABLE"
     python -c '
 import torch
@@ -161,6 +167,7 @@ for i in range(torch.xpu.device_count()):
 else
     echo "XPU       : NOT DETECTED"
     echo "           Make sure /dev/dri is passed and Intel drivers + Level Zero are installed on the host"
+    echo "           Also verify that the XPU build of PyTorch was installed (should contain +xpu in version)"
 fi
 echo "==========================================="
 
