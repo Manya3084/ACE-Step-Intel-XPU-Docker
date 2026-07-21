@@ -1,14 +1,84 @@
 #!/usr/bin/env python3
-"""Patch ace-step-ui training.ts for Intel XPU Docker (no broken string literals)."""
+"""Patch training.ts for XPU Docker — brace-balanced replacements only."""
 from pathlib import Path
-import re
 
 p = Path("server/src/routes/training.ts")
 text = p.read_text()
 
-# ---------------------------------------------------------------------------
-# Helpers (double-quoted JS strings only)
-# ---------------------------------------------------------------------------
+
+def find_router_post(src: str, path: str) -> tuple[int, int] | None:
+    """Return [start, end) of router.post('/path', ...) { ... }); with balanced braces."""
+    for quote in ("'", '"'):
+        needle = f"router.post({quote}{path}{quote}"
+        start = src.find(needle)
+        if start >= 0:
+            break
+    else:
+        return None
+
+    # Find opening brace of the async handler
+    i = src.find("{", start)
+    if i < 0:
+        return None
+    depth = 0
+    in_s = in_d = in_t = False
+    esc = False
+    j = i
+    while j < len(src):
+        c = src[j]
+        if in_s:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == "'":
+                in_s = False
+        elif in_d:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_d = False
+        elif in_t:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == "`":
+                in_t = False
+        else:
+            if c == "'":
+                in_s = True
+            elif c == '"':
+                in_d = True
+            elif c == "`":
+                in_t = True
+            elif c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    # include trailing ); if present
+                    end = j + 1
+                    if end < len(src) and src[end] == ")":
+                        end += 1
+                    if end < len(src) and src[end] == ";":
+                        end += 1
+                    return start, end
+        j += 1
+    return None
+
+
+def replace_route(src: str, path: str, new_body: str) -> str:
+    span = find_router_post(src, path)
+    if not span:
+        raise SystemExit(f"Could not find balanced router.post for {path}")
+    a, b = span
+    return src[:a] + new_body.strip() + src[b:]
+
+
+# --- helpers ---
 HELPER = r'''
 /** Docker / XPU path helpers (ACE-Step-Intel-XPU-Docker) */
 function xpuContainer(): string {
@@ -36,13 +106,23 @@ function normalizeTrainingPath(input: string | undefined | null, fallback: strin
 '''
 
 if "function normalizeTrainingPath" not in text:
-    if "function getAceStepDir" in text:
-        text = re.sub(
-            r"(function getAceStepDir\(\): string \{[\s\S]*?\n\})",
-            r"\1\n" + HELPER,
-            text,
-            count=1,
-        )
+    marker = "function getAceStepDir"
+    if marker in text:
+        # insert after getAceStepDir block
+        span_start = text.find(marker)
+        i = text.find("{", span_start)
+        depth = 0
+        j = i
+        while j < len(text):
+            if text[j] == "{":
+                depth += 1
+            elif text[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    j += 1
+                    break
+            j += 1
+        text = text[:j] + "\n" + HELPER + text[j:]
     else:
         text = HELPER + text
 
@@ -51,10 +131,7 @@ text = text.replace(
     'return process.env.ACESTEP_PATH || path.resolve(config.datasets.dir, "..") || "/app";',
 )
 
-# ---------------------------------------------------------------------------
-# Replace /preprocess — docker exec into XPU
-# ---------------------------------------------------------------------------
-PREPROCESS_NEW = r'''
+PREPROCESS = r'''
 router.post("/preprocess", authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const body = req.body || {};
@@ -90,7 +167,7 @@ router.post("/preprocess", authMiddleware, async (req: AuthenticatedRequest, res
     const { promisify } = await import("util");
     const execFileAsync = promisify(execFile);
 
-    console.log("[Training] Preprocess via docker exec", container, resolvedDataset, "->", resolvedOutput);
+    console.log("[Training] Preprocess via docker exec", container, resolvedDataset, resolvedOutput);
 
     try {
       const { stdout, stderr } = await execFileAsync(
@@ -141,21 +218,7 @@ router.post("/preprocess", authMiddleware, async (req: AuthenticatedRequest, res
 });
 '''
 
-text2, n = re.subn(
-    r"router\.post\(['\"]/preprocess['\"],\s*authMiddleware,\s*async \(req: AuthenticatedRequest, res: Response\) => \{[\s\S]*?\n\}\);",
-    PREPROCESS_NEW.strip(),
-    text,
-    count=1,
-)
-if n == 0:
-    raise SystemExit("Could not find /preprocess route to replace")
-text = text2
-print("Patched /preprocess")
-
-# ---------------------------------------------------------------------------
-# Soft-fail /init-model
-# ---------------------------------------------------------------------------
-INIT_NEW = r'''
+INIT = r'''
 router.post("/init-model", authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const body = req.body || {};
@@ -193,7 +256,7 @@ router.post("/init-model", authMiddleware, async (req: AuthenticatedRequest, res
         note: "init_service_wrapper completed",
       });
     } catch (gradioError: any) {
-      console.warn("[Training] init-model Gradio call failed (non-fatal):", gradioError?.message || gradioError);
+      console.warn("[Training] init-model Gradio failed (non-fatal)", gradioError?.message || gradioError);
       res.status(200).json({
         status: "Model service assumed ready (container auto-init)",
         modelReady: true,
@@ -214,49 +277,27 @@ router.post("/init-model", authMiddleware, async (req: AuthenticatedRequest, res
 });
 '''
 
-text3, n2 = re.subn(
-    r"router\.post\(['\"]/init-model['\"],\s*authMiddleware,\s*async \(req: AuthenticatedRequest, res: Response\) => \{[\s\S]*?\n\}\);",
-    INIT_NEW.strip(),
-    text,
-    count=1,
-)
-if n2 == 0:
-    print("WARN: init-model route not replaced")
-else:
-    text = text3
-    print("Patched /init-model")
+text = replace_route(text, "/preprocess", PREPROCESS)
+print("Replaced /preprocess (brace-balanced)")
+text = replace_route(text, "/init-model", INIT)
+print("Replaced /init-model (brace-balanced)")
 
-# ---------------------------------------------------------------------------
-# Default paths for train / tensors / lora
-# ---------------------------------------------------------------------------
-text = text.replace(
-    "tensorDir ?? './datasets/preprocessed_tensors'",
-    'normalizeTrainingPath(tensorDir, "/app/datasets/preprocessed_tensors")',
-)
-text = text.replace(
-    'tensorDir ?? "./datasets/preprocessed_tensors"',
-    'normalizeTrainingPath(tensorDir, "/app/datasets/preprocessed_tensors")',
-)
-text = text.replace(
-    "outputDir ?? './lora_output'",
-    'normalizeTrainingPath(outputDir, "/app/lora_output")',
-)
-text = text.replace(
-    'outputDir ?? "./lora_output"',
-    'normalizeTrainingPath(outputDir, "/app/lora_output")',
-)
-text = text.replace(
-    "(req.query.dir as string) || './lora_output'",
-    'normalizeTrainingPath((req.query.dir as string) || "", "/app/lora_output")',
-)
-text = text.replace(
-    '(req.query.dir as string) || "./lora_output"',
-    'normalizeTrainingPath((req.query.dir as string) || "", "/app/lora_output")',
-)
+# Default path strings
+for old, new in [
+    ("tensorDir ?? './datasets/preprocessed_tensors'",
+     'normalizeTrainingPath(tensorDir, "/app/datasets/preprocessed_tensors")'),
+    ('tensorDir ?? "./datasets/preprocessed_tensors"',
+     'normalizeTrainingPath(tensorDir, "/app/datasets/preprocessed_tensors")'),
+    ("outputDir ?? './lora_output'",
+     'normalizeTrainingPath(outputDir, "/app/lora_output")'),
+    ('outputDir ?? "./lora_output"',
+     'normalizeTrainingPath(outputDir, "/app/lora_output")'),
+    ("(req.query.dir as string) || './lora_output'",
+     'normalizeTrainingPath((req.query.dir as string) || "", "/app/lora_output")'),
+    ('(req.query.dir as string) || "./lora_output"',
+     'normalizeTrainingPath((req.query.dir as string) || "", "/app/lora_output")'),
+]:
+    text = text.replace(old, new)
 
 p.write_text(text)
-
-# Sanity: no obvious broken quotes from our helpers
-if "function normalizeTrainingPath" not in text:
-    raise SystemExit("helper missing after patch")
-print("training.ts Docker training patch complete (clean strings)")
+print("training.ts patch OK")
