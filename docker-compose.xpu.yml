@@ -1,25 +1,26 @@
 # =============================================================================
-# ACE-Step 1.5 — Docker Compose for Intel XPU / Arc GPUs
+# ACE-Step 1.5 + ace-step-ui — Full stack for Intel XPU / Arc GPUs
 # =============================================================================
 #
-# Target: Intel Arc A770 16GB (and other Arc / XPU devices)
-# Host OS: Linux (Debian / Ubuntu / OpenMediaVault)
+# Target: Intel Arc A770 16GB on Linux / OpenMediaVault
 #
-# Default mode is now API (port 8001) so you can use a proper frontend
-# like ace-step-ui instead of Gradio.
-#
-# Prerequisites on the host:
-#   1. Latest Intel Arc / GPU drivers
-#   2. Level Zero + intel-opencl-icd packages
-#   3. /dev/dri accessible
+# Services:
+#   acestep-xpu  — ACE-Step API (port 8001) on Intel XPU
+#   acestep-ui   — Spotify-style web UI (ports 3000 + 3001)
 #
 # Usage:
 #   docker compose -f docker-compose.xpu.yml up -d --build
 #   docker compose -f docker-compose.xpu.yml logs -f
 #
+# Then open on phone/desktop:
+#   http://YOUR_OMV_IP:3000
+#
 # =============================================================================
 
 services:
+  # --------------------------------------------------------------------------
+  # ACE-Step backend (Intel XPU)
+  # --------------------------------------------------------------------------
   acestep-xpu:
     build:
       context: .
@@ -27,40 +28,32 @@ services:
     image: acestep-xpu:latest
     container_name: acestep-xpu
 
-    # ---- Intel GPU device access ----
     devices:
       - /dev/dri:/dev/dri
 
-    # ---- Environment ----
     env_file:
       - path: .env
         required: false
     environment:
-      # API mode by default (use ace-step-ui or any other frontend)
       - ACESTEP_MODE=${ACESTEP_MODE:-api}
       - ACESTEP_LLM_BACKEND=${ACESTEP_LLM_BACKEND:-pt}
       - ACESTEP_INIT_SERVICE=${ACESTEP_INIT_SERVICE:-true}
-      # Recommended for A770 16GB
       - ACESTEP_CONFIG_PATH=${ACESTEP_CONFIG_PATH:-acestep-v15-turbo}
       - ACESTEP_LM_MODEL_PATH=${ACESTEP_LM_MODEL_PATH:-acestep-5Hz-lm-1.7B}
       - ACESTEP_OFFLOAD_TO_CPU=${ACESTEP_OFFLOAD_TO_CPU:-true}
       - ACESTEP_EXTRA_ARGS=${ACESTEP_EXTRA_ARGS:-}
       - TOKENIZERS_PARALLELISM=false
-      # XPU / SYCL tuning
       - PYTORCH_DEVICE=xpu
       - TORCH_COMPILE_BACKEND=eager
       - SYCL_CACHE_PERSISTENT=1
       - SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS=1
       - ZE_FLAT_DEVICE_HIERARCHY=COMPOSITE
 
-    # ---- Ports ----
-    # 8001 = REST API (primary)
-    # 7860 kept in case you ever want Gradio again
     ports:
       - "${API_PORT:-8001}:8001"
+      # Gradio kept optional if you ever need it
       - "${GRADIO_PORT:-7860}:7860"
 
-    # ---- Persistent volumes ----
     volumes:
       - ./checkpoints:/app/checkpoints
       - hf_cache:/root/.cache/huggingface
@@ -78,7 +71,56 @@ services:
       interval: 30s
       timeout: 15s
       start_period: 300s
-      retries: 3
+      retries: 5
+
+  # --------------------------------------------------------------------------
+  # ace-step-ui frontend (mobile-friendly)
+  # --------------------------------------------------------------------------
+  acestep-ui:
+    build:
+      context: .
+      dockerfile: Dockerfile.ui
+    image: acestep-ui:latest
+    container_name: acestep-ui
+
+    depends_on:
+      acestep-xpu:
+        condition: service_started
+
+    environment:
+      # Reach the API container by Docker service name
+      - ACESTEP_API_URL=http://acestep-xpu:8001
+      - PORT=3001
+      - FRONTEND_PORT=3000
+      - DATABASE_PATH=/app/data/acestep.db
+      - JWT_SECRET=${JWT_SECRET:-ace-step-ui-local-secret-change-me}
+      # Set this to your OMV LAN IP so mobile links work correctly
+      # e.g. http://192.168.1.50:3000
+      - FRONTEND_URL=${FRONTEND_URL:-http://localhost:3000}
+      - VITE_API_URL=${VITE_API_URL:-http://localhost:3001}
+      - PEXELS_API_KEY=${PEXELS_API_KEY:-}
+
+    ports:
+      - "${UI_PORT:-3000}:3000"
+      - "${UI_API_PORT:-3001}:3001"
+
+    volumes:
+      - ui_data:/app/data
+      - ui_audio:/app/server/public/audio
+
+    restart: unless-stopped
+
+    healthcheck:
+      test: >-
+        curl -sf http://localhost:3000/ > /dev/null 2>&1 ||
+        curl -sf http://localhost:3001/ > /dev/null 2>&1 ||
+        exit 1
+      interval: 30s
+      timeout: 10s
+      start_period: 90s
+      retries: 5
 
 volumes:
   hf_cache:
+  ui_data:
+  ui_audio:
