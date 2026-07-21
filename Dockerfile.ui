@@ -1,0 +1,275 @@
+# =============================================================================
+# ACE-Step UI — Docker image (fspecii/ace-step-ui)
+# =============================================================================
+# Frontend (Vite) on 3003, Express backend on 3001 (vite proxy).
+# Host maps: 3003->3003, 3004->3001
+# =============================================================================
+
+FROM node:20-bookworm-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV NODE_ENV=development
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git \
+        ca-certificates \
+        curl \
+        python3 \
+        ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+RUN git clone --depth 1 https://github.com/fspecii/ace-step-ui.git .
+
+# ---------------------------------------------------------------------------
+# Patch 1: CORS — allow any origin for self-hosted LAN / mobile / Tailscale
+# ---------------------------------------------------------------------------
+RUN python3 - <<'PY'
+from pathlib import Path
+import re
+p = Path("server/src/index.ts")
+text = p.read_text()
+new = """app.use(cors({
+  origin: true,
+  credentials: true,
+}));"""
+pat = re.compile(r"app\.use\(cors\(\{.*?\}\)\);", re.S)
+if not pat.search(text):
+    raise SystemExit("Could not find cors() block to patch")
+p.write_text(pat.sub(new, text, count=1))
+print("CORS patched OK")
+PY
+
+# ---------------------------------------------------------------------------
+# Patch 2: buildGradioArgs aligned to live /generation_wrapper schema (72 args)
+# ---------------------------------------------------------------------------
+RUN python3 - <<'PY'
+from pathlib import Path
+import re
+
+p = Path("server/src/services/acestep.ts")
+text = p.read_text()
+
+new_fn = r'''
+async function buildGradioArgs(params: GenerationParams): Promise<unknown[]> {
+  // Exact positional map for ACE-Step 1.5 Gradio /generation_wrapper (72 public params).
+  const caption = params.style || 'pop music';
+  const prompt = params.customMode ? caption : (params.songDescription || caption);
+  const lyrics = params.instrumental ? '' : (params.lyrics || '');
+  const isThinking = params.thinking ?? false;
+  const isEnhance = params.enhance ?? false;
+  const useCot = isEnhance || isThinking;
+
+  const referenceAudio = await prepareAudioFile(params.referenceAudioUrl);
+  const sourceAudio = await prepareAudioFile(params.sourceAudioUrl);
+
+  const needsSource = params.taskType === 'cover' || params.taskType === 'audio2audio' || params.taskType === 'repaint';
+  if (needsSource && params.sourceAudioUrl && sourceAudio === null) {
+    throw new Error(`Source audio file could not be loaded from: ${params.sourceAudioUrl}.`);
+  }
+
+  return [
+    /*  0 */ prompt,
+    /*  1 */ lyrics,
+    /*  2 */ (params.bpm && params.bpm > 0) ? params.bpm : 0,
+    /*  3 */ params.keyScale || '',
+    /*  4 */ params.timeSignature || '',
+    /*  5 */ params.vocalLanguage || 'en',
+    /*  6 */ params.inferenceSteps ?? 8,
+    /*  7 */ params.guidanceScale ?? 7.0,
+    /*  8 */ params.randomSeed !== false,
+    /*  9 */ String(params.seed ?? -1),
+    /* 10 */ referenceAudio,
+    /* 11 */ (params.duration && params.duration > 0) ? params.duration : -1,
+    /* 12 */ Math.min(Math.max(params.batchSize ?? 1, 1), 16),
+    /* 13 */ sourceAudio,
+    /* 14 */ params.audioCodes || '',
+    /* 15 */ params.repaintingStart ?? 0.0,
+    /* 16 */ params.repaintingEnd ?? -1,
+    /* 17 */ params.instruction || 'Fill the audio semantic mask based on the given conditions:',
+    /* 18 */ params.audioCoverStrength ?? 1.0,
+    /* 19 */ 0.0,
+    /* 20 */ params.useAdg ?? false,
+    /* 21 */ false,
+    /* 22 */ params.cfgIntervalStart ?? 0.0,
+    /* 23 */ params.cfgIntervalEnd ?? 1.0,
+    /* 24 */ params.shift ?? 3.0,
+    /* 25 */ params.inferMethod || 'ode',
+    /* 26 */ 'euler',
+    /* 27 */ 0.0,
+    /* 28 */ 0.0,
+    /* 29 */ true,
+    /* 30 */ 'double',
+    /* 31 */ 0.02,
+    /* 32 */ 0.06,
+    /* 33 */ 'haar',
+    /* 34 */ params.customTimesteps || '',
+    /* 35 */ params.audioFormat || 'mp3',
+    /* 36 */ '128k',
+    /* 37 */ 48000,
+    /* 38 */ params.lmTemperature ?? 0.85,
+    /* 39 */ isThinking,
+    /* 40 */ params.lmCfgScale ?? 2.0,
+    /* 41 */ params.lmTopK ?? 0,
+    /* 42 */ params.lmTopP ?? 0.9,
+    /* 43 */ params.lmNegativePrompt || 'NO USER INPUT',
+    /* 44 */ useCot ? (params.useCotMetas ?? true) : true,
+    /* 45 */ useCot ? (params.useCotCaption ?? false) : false,
+    /* 46 */ useCot ? (params.useCotLanguage ?? true) : true,
+    /* 47 */ params.isFormatCaption ?? false,
+    /* 48 */ true,
+    /* 49 */ params.constrainedDecodingDebug ?? false,
+    /* 50 */ params.allowLmBatch ?? false,
+    /* 51 */ Math.max(params.scoreScale ?? 0.5, 0.01),
+    /* 52 */ params.lmBatchChunkSize ?? 8,
+    /* 53 */ params.trackName || null,
+    /* 54 */ params.completeTrackClasses || [],
+    /* 55 */ true,
+    /* 56 */ -1.0,
+    /* 57 */ 0.0,
+    /* 58 */ 0.0,
+    /* 59 */ 0.0,
+    /* 60 */ 1.0,
+    /* 61 */ 'balanced',
+    /* 62 */ 0.5,
+    /* 63 */ 0.0,
+    /* 64 */ '',
+    /* 65 */ params.autogen ?? false,
+    /* 66 */ null,
+    /* 67 */ null,
+    /* 68 */ 0.0,
+    /* 69 */ 1.0,
+    /* 70 */ 1,
+    /* 71 */ false,
+  ];
+}
+'''
+
+pat = re.compile(
+    r"async function buildGradioArgs\(params: GenerationParams\): Promise<unknown\[]> \{.*?\n\}",
+    re.S,
+)
+if not pat.search(text):
+    raise SystemExit("Could not find buildGradioArgs function")
+p.write_text(pat.sub(new_fn.strip(), text, count=1))
+print("buildGradioArgs patched OK")
+PY
+
+# ---------------------------------------------------------------------------
+# Patch 3: Format buttons — Gradio --enable-api exposes /format_lyrics,
+# not pure-REST /format_input (which hangs). Also raise client timeout to 180s.
+# ---------------------------------------------------------------------------
+RUN python3 - <<'PY'
+from pathlib import Path
+import re
+
+replacements = 0
+for path in Path("server/src").rglob("*.ts"):
+    text = path.read_text()
+    orig = text
+    # Endpoint path
+    text = text.replace("/format_input", "/format_lyrics")
+    text = text.replace("'format_input'", "'format_lyrics'")
+    text = text.replace('"format_input"', '"format_lyrics"')
+    # Common short timeouts on format fetch
+    text = re.sub(
+        r"AbortSignal\.timeout\(\s*\d+\s*\)",
+        "AbortSignal.timeout(180000)",
+        text,
+    )
+    text = re.sub(
+        r"timeout:\s*\d{4,5}\b",  # 1000-99999 ms
+        "timeout: 180000",
+        text,
+    )
+    if text != orig:
+        path.write_text(text)
+        replacements += 1
+        print(f"Patched format endpoint/timeout in {path}")
+
+if replacements == 0:
+    # Fallback: search whole tree
+    for path in Path(".").rglob("*.ts"):
+        if "node_modules" in str(path):
+            continue
+        text = path.read_text()
+        if "format_input" in text:
+            path.write_text(text.replace("/format_input", "/format_lyrics").replace("format_input", "format_lyrics"))
+            replacements += 1
+            print(f"Fallback patched {path}")
+
+print(f"Format patch done, files touched: {replacements}")
+PY
+
+RUN npm install \
+    && cd server \
+    && npm install \
+    && cd ..
+
+ENV PORT=3001
+ENV FRONTEND_PORT=3003
+ENV ACESTEP_API_URL=http://acestep-xpu:8001
+ENV DATABASE_PATH=/app/data/acestep.db
+ENV JWT_SECRET=ace-step-ui-local-secret-change-me
+ENV FRONTEND_URL=http://localhost:3003
+
+RUN mkdir -p /app/data /app/server/data /app/server/public/audio /app/logs \
+    && chmod -R 777 /app/data /app/server/data /app/server/public/audio
+
+EXPOSE 3003 3001
+
+COPY <<'EOF' /app/docker-start-ui.sh
+#!/usr/bin/env bash
+set -e
+
+echo "==========================================="
+echo "  ACE-Step UI"
+echo "==========================================="
+echo "ACE-Step API : ${ACESTEP_API_URL}"
+echo "Backend      : 0.0.0.0:${PORT:-3001}  (internal)"
+echo "Frontend     : 0.0.0.0:${FRONTEND_PORT:-3003}"
+echo "Database     : ${DATABASE_PATH}"
+echo "==========================================="
+
+mkdir -p /app/data /app/server/data /app/server/public/audio
+
+cat > /app/server/.env <<ENVEOF
+PORT=${PORT:-3001}
+NODE_ENV=development
+DATABASE_PATH=${DATABASE_PATH:-/app/data/acestep.db}
+ACESTEP_API_URL=${ACESTEP_API_URL:-http://acestep-xpu:8001}
+AUDIO_DIR=./public/audio
+FRONTEND_URL=${FRONTEND_URL:-http://localhost:3003}
+JWT_SECRET=${JWT_SECRET:-ace-step-ui-local-secret}
+PEXELS_API_KEY=${PEXELS_API_KEY:-}
+ENVEOF
+
+cp /app/server/.env /app/.env
+
+cd /app/server
+npm run dev &
+BACKEND_PID=$!
+
+for i in $(seq 1 30); do
+  if curl -sf http://127.0.0.1:${PORT:-3001}/ > /dev/null 2>&1; then
+    echo "Backend is up"
+    break
+  fi
+  sleep 1
+done
+
+cd /app
+npx vite --host 0.0.0.0 --port "${FRONTEND_PORT:-3003}" &
+FRONTEND_PID=$!
+
+trap 'kill $BACKEND_PID $FRONTEND_PID 2>/dev/null; exit' INT TERM
+wait
+EOF
+
+RUN chmod +x /app/docker-start-ui.sh
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=5 \
+    CMD curl -sf http://localhost:3003/ > /dev/null 2>&1 || curl -sf http://localhost:3001/ > /dev/null 2>&1 || exit 1
+
+CMD ["/app/docker-start-ui.sh"]

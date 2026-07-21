@@ -1,0 +1,342 @@
+# =============================================================================
+# ACE-Step 1.5 — Intel XPU / Arc GPU Dockerfile
+# =============================================================================
+# Optimized for Intel Arc A770 16GB on Linux / OMV
+# =============================================================================
+
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        software-properties-common \
+        build-essential \
+        git \
+        curl \
+        wget \
+        ca-certificates \
+        gnupg \
+        gpg-agent \
+        libsndfile1 \
+        libsndfile1-dev \
+        ffmpeg \
+        libffi-dev \
+        libssl-dev \
+        pciutils \
+    && rm -rf /var/lib/apt/lists/*
+
+# Intel GPU compute repository (Level Zero)
+RUN wget -qO - https://repositories.intel.com/gpu/intel-graphics.key | \
+        gpg --yes --dearmor --output /usr/share/keyrings/intel-graphics.gpg \
+    && echo "deb [arch=amd64,i386 signed-by=/usr/share/keyrings/intel-graphics.gpg] https://repositories.intel.com/gpu/ubuntu jammy unified" | \
+        tee /etc/apt/sources.list.d/intel-gpu-jammy.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        libze1 \
+        libze-intel-gpu1 \
+        intel-opencl-icd \
+        clinfo \
+        libze-dev \
+        intel-ocloc \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN add-apt-repository ppa:deadsnakes/ppa \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        python3.11 \
+        python3.11-dev \
+        python3.11-venv \
+        python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+WORKDIR /app
+COPY . /app/
+
+# ---------------------------------------------------------------------------
+# Patch: Gradio --enable-api format endpoint
+# Problem: /format_input either missing or runs blocking LM on the asyncio loop
+# and never returns (UI spinner forever / curl hang).
+# Fix: after setup_api_routes, force-register a working /format_input that runs
+# format_sample in a worker thread and returns the standard wrap_response shape.
+# ---------------------------------------------------------------------------
+RUN python3 - <<'PY'
+from pathlib import Path
+import re
+
+# Locate pipeline module that calls setup_api_routes
+candidates = list(Path("/app").rglob("acestep_v15_pipeline.py"))
+if not candidates:
+    raise SystemExit("acestep_v15_pipeline.py not found")
+pipeline = candidates[0]
+text = pipeline.read_text()
+
+if "_xpu_register_format_input" in text:
+    print("Format patch already present")
+else:
+    # Inject helper + call right after setup_api_routes(...)
+    helper = '''
+
+def _xpu_register_format_input(demo, llm_handler):
+    """Ensure POST /format_input works under Gradio --enable-api (Intel fork)."""
+    import asyncio
+    import json
+    import time
+    from fastapi import Request
+
+    try:
+        app = demo.app  # Gradio Blocks FastAPI app
+    except Exception as exc:
+        print(f"[XPU] format_input: no demo.app ({exc})")
+        return
+
+    async def format_input_endpoint(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+
+        prompt = body.get("prompt") or body.get("caption") or ""
+        lyrics = body.get("lyrics") or ""
+        temperature = body.get("temperature", 0.85)
+        try:
+            temperature = float(temperature)
+        except Exception:
+            temperature = 0.85
+
+        param_obj = body.get("param_obj", {})
+        if isinstance(param_obj, str):
+            try:
+                param_obj = json.loads(param_obj) if param_obj else {}
+            except Exception:
+                param_obj = {}
+        if not isinstance(param_obj, dict):
+            param_obj = {}
+
+        user_metadata = {}
+        bpm = param_obj.get("bpm")
+        duration = param_obj.get("duration")
+        key_scale = param_obj.get("key") or param_obj.get("key_scale") or ""
+        time_signature = param_obj.get("time_signature") or ""
+        language = param_obj.get("language") or ""
+        if bpm not in (None, "", 0, "0"):
+            try:
+                user_metadata["bpm"] = int(bpm)
+            except Exception:
+                pass
+        if duration not in (None, "", 0, "0", -1, "-1"):
+            try:
+                user_metadata["duration"] = int(float(duration))
+            except Exception:
+                pass
+        if key_scale:
+            user_metadata["keyscale"] = str(key_scale)
+        if time_signature:
+            user_metadata["timesignature"] = str(time_signature)
+        if language and language != "unknown":
+            user_metadata["language"] = str(language)
+
+        def _run():
+            from acestep.inference import format_sample
+            return format_sample(
+                llm_handler=llm_handler,
+                caption=prompt,
+                lyrics=lyrics,
+                user_metadata=user_metadata or None,
+                temperature=temperature,
+                use_constrained_decoding=True,
+            )
+
+        try:
+            result = await asyncio.to_thread(_run)
+        except Exception as exc:
+            return {
+                "data": None,
+                "code": 500,
+                "error": f"format_sample error: {exc}",
+                "timestamp": int(time.time() * 1000),
+                "extra": None,
+            }
+
+        if not getattr(result, "success", False):
+            err = getattr(result, "error", None) or getattr(result, "status_message", None) or "format failed"
+            return {
+                "data": None,
+                "code": 500,
+                "error": f"format_sample failed: {err}",
+                "timestamp": int(time.time() * 1000),
+                "extra": None,
+            }
+
+        data = {
+            "caption": getattr(result, "caption", None) or prompt,
+            "lyrics": getattr(result, "lyrics", None) or lyrics,
+            "bpm": getattr(result, "bpm", None) or bpm,
+            "key_scale": getattr(result, "keyscale", None) or key_scale,
+            "time_signature": getattr(result, "timesignature", None) or time_signature,
+            "duration": getattr(result, "duration", None) or duration,
+            "vocal_language": getattr(result, "language", None) or language or "unknown",
+        }
+        return {
+            "data": data,
+            "code": 200,
+            "error": None,
+            "timestamp": int(time.time() * 1000),
+            "extra": None,
+        }
+
+    # Remove any prior route on /format_input then add ours
+    try:
+        app.router.routes = [
+            r for r in app.router.routes
+            if not (getattr(r, "path", None) == "/format_input")
+        ]
+    except Exception:
+        pass
+
+    app.add_api_route("/format_input", format_input_endpoint, methods=["POST"])
+    # Compatibility alias used by some UI builds
+    app.add_api_route("/format_lyrics", format_input_endpoint, methods=["POST"])
+    print("[XPU] Registered working /format_input and /format_lyrics (threaded)")
+'''
+
+    if "setup_api_routes(demo" not in text and "setup_api_routes(" not in text:
+        raise SystemExit("Could not find setup_api_routes call to hook")
+
+    # Insert helper before main if missing
+    text = helper + "\n" + text
+
+    # After setup_api_routes(...), call our registrar
+    # Match a typical call line and append our hook on the next line
+    pat = re.compile(
+        r"(setup_api_routes\([^\n]*\))",
+    )
+    m = pat.search(text)
+    if not m:
+        raise SystemExit("setup_api_routes call pattern not found")
+
+    # Prefer handlers named demo + llm_handler from surrounding scope
+    injection = m.group(1) + "\n            _xpu_register_format_input(demo, llm_handler)"
+    text = pat.sub(injection, text, count=1)
+    pipeline.write_text(text)
+    print(f"Patched {pipeline}")
+PY
+
+# Install project without CUDA torch, then force XPU torch
+RUN uv venv /app/.venv --python python3.11 \
+    && . /app/.venv/bin/activate \
+    && uv pip install --upgrade pip \
+    && uv pip install -e . --no-deps \
+    && uv pip install -r requirements-xpu.txt \
+    && uv pip install --pre --force-reinstall \
+         torch torchaudio torchvision \
+         --index-url https://download.pytorch.org/whl/nightly/xpu
+
+ENV PATH="/app/.venv/bin:$PATH"
+ENV VIRTUAL_ENV=/app/.venv
+
+RUN mkdir -p /app/checkpoints /app/gradio_outputs /app/output
+
+ENV PYTORCH_DEVICE=xpu
+ENV TORCH_COMPILE_BACKEND=eager
+ENV SYCL_CACHE_PERSISTENT=1
+ENV SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS=1
+ENV ZE_FLAT_DEVICE_HIERARCHY=COMPOSITE
+
+ENV GRADIO_SERVER_NAME=0.0.0.0
+ENV ACESTEP_API_HOST=0.0.0.0
+
+# Default: Gradio + API endpoints (required by ace-step-ui)
+ENV ACESTEP_MODE=gradio-api
+ENV ACESTEP_INIT_SERVICE=true
+
+ENV ACESTEP_CONFIG_PATH=acestep-v15-turbo
+ENV ACESTEP_LM_MODEL_PATH=acestep-5Hz-lm-1.7B
+ENV ACESTEP_LLM_BACKEND=pt
+ENV ACESTEP_OFFLOAD_TO_CPU=true
+
+ENV TOKENIZERS_PARALLELISM=false
+
+EXPOSE 7860 8001
+
+HEALTHCHECK --interval=60s --timeout=15s --start-period=300s --retries=5 \
+    CMD curl -sf http://localhost:8001/ > /dev/null 2>&1 \
+     || curl -sf http://localhost:7860/ > /dev/null 2>&1 \
+     || exit 1
+
+COPY <<'ENTRYPOINT_EOF' /app/docker-entrypoint-xpu.sh
+#!/usr/bin/env bash
+set -e
+
+echo "==========================================="
+echo "  ACE-Step 1.5  —  Intel XPU"
+echo "==========================================="
+echo "Mode      : ${ACESTEP_MODE}"
+echo "Python    : $(python --version 2>&1)"
+echo "PyTorch   : $(python -c 'import torch; print(torch.__version__)' 2>/dev/null || echo 'N/A')"
+
+if python -c 'import torch; assert hasattr(torch, "xpu") and torch.xpu.is_available()' 2>/dev/null; then
+    echo "XPU       : AVAILABLE"
+    python -c '
+import torch
+print(f"Device count: {torch.xpu.device_count()}")
+for i in range(torch.xpu.device_count()):
+    print(f"  [{i}] {torch.xpu.get_device_name(i)}")
+' 2>/dev/null || true
+else
+    echo "XPU       : NOT DETECTED"
+    echo "           Make sure /dev/dri is passed and Intel drivers + Level Zero are on the host"
+fi
+echo "==========================================="
+
+INIT_ARGS=""
+if [ "${ACESTEP_INIT_SERVICE:-true}" = "true" ]; then
+    INIT_ARGS="--init_service true"
+    [ -n "${ACESTEP_CONFIG_PATH:-}" ]   && INIT_ARGS="${INIT_ARGS} --config_path ${ACESTEP_CONFIG_PATH}"
+    [ -n "${ACESTEP_LM_MODEL_PATH:-}" ] && INIT_ARGS="${INIT_ARGS} --init_llm true --lm_model_path ${ACESTEP_LM_MODEL_PATH}"
+    echo "Auto-init    : DiT=${ACESTEP_CONFIG_PATH:-auto}  LM=${ACESTEP_LM_MODEL_PATH:-none}"
+fi
+
+OFFLOAD_ARGS=""
+if [ "${ACESTEP_OFFLOAD_TO_CPU:-true}" = "true" ]; then
+    OFFLOAD_ARGS="--offload_to_cpu true"
+fi
+
+if [ "${ACESTEP_MODE}" = "api" ]; then
+    echo "Starting pure REST API on 0.0.0.0:${ACESTEP_API_PORT:-8001} ..."
+    exec python -m acestep.api_server \
+        --host "${ACESTEP_API_HOST:-0.0.0.0}" \
+        --port "${ACESTEP_API_PORT:-8001}" \
+        ${ACESTEP_EXTRA_ARGS:-}
+
+elif [ "${ACESTEP_MODE}" = "gradio" ]; then
+    echo "Starting Gradio UI on 0.0.0.0:${GRADIO_PORT:-7860} ..."
+    exec python -m acestep.acestep_v15_pipeline \
+        --server-name "${GRADIO_SERVER_NAME:-0.0.0.0}" \
+        --port "${GRADIO_PORT:-7860}" \
+        --backend "${ACESTEP_LLM_BACKEND:-pt}" \
+        ${INIT_ARGS} \
+        ${OFFLOAD_ARGS} \
+        ${ACESTEP_EXTRA_ARGS:-}
+
+else
+    PORT="${ACESTEP_API_PORT:-8001}"
+    echo "Starting Gradio + API endpoints on 0.0.0.0:${PORT} ..."
+    echo "(ace-step-ui connects via Gradio client to this port)"
+    exec python -m acestep.acestep_v15_pipeline \
+        --server-name "${GRADIO_SERVER_NAME:-0.0.0.0}" \
+        --port "${PORT}" \
+        --backend "${ACESTEP_LLM_BACKEND:-pt}" \
+        --enable-api \
+        ${INIT_ARGS} \
+        ${OFFLOAD_ARGS} \
+        ${ACESTEP_EXTRA_ARGS:-}
+fi
+ENTRYPOINT_EOF
+
+RUN chmod +x /app/docker-entrypoint-xpu.sh
+
+ENTRYPOINT ["/app/docker-entrypoint-xpu.sh"]

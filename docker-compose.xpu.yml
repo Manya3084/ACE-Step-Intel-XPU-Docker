@@ -1,0 +1,113 @@
+# =============================================================================
+# ACE-Step 1.5 + ace-step-ui — Full stack for Intel XPU / Arc GPUs
+# =============================================================================
+#
+# Services:
+#   acestep-xpu  — Gradio + API on port 8001 (Intel XPU)
+#   acestep-ui   — Spotify-style web UI
+#                   host 3003 = frontend
+#                   host 3004 = UI backend
+#
+# Usage:
+#   docker compose -f docker-compose.xpu.yml up -d --build
+#   open http://YOUR_OMV_IP:3003
+#
+# =============================================================================
+
+services:
+  acestep-xpu:
+    build:
+      context: .
+      dockerfile: Dockerfile.xpu
+    image: acestep-xpu:latest
+    container_name: acestep-xpu
+
+    devices:
+      - /dev/dri:/dev/dri
+
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # gradio-api = Gradio + --enable-api on 8001 (required by ace-step-ui)
+      - ACESTEP_MODE=${ACESTEP_MODE:-gradio-api}
+      - ACESTEP_LLM_BACKEND=${ACESTEP_LLM_BACKEND:-pt}
+      - ACESTEP_INIT_SERVICE=${ACESTEP_INIT_SERVICE:-true}
+      - ACESTEP_CONFIG_PATH=${ACESTEP_CONFIG_PATH:-acestep-v15-turbo}
+      - ACESTEP_LM_MODEL_PATH=${ACESTEP_LM_MODEL_PATH:-acestep-5Hz-lm-1.7B}
+      - ACESTEP_OFFLOAD_TO_CPU=${ACESTEP_OFFLOAD_TO_CPU:-true}
+      - ACESTEP_EXTRA_ARGS=${ACESTEP_EXTRA_ARGS:-}
+      - TOKENIZERS_PARALLELISM=false
+      - PYTORCH_DEVICE=xpu
+      - TORCH_COMPILE_BACKEND=eager
+      - SYCL_CACHE_PERSISTENT=1
+      - SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS=1
+      - ZE_FLAT_DEVICE_HIERARCHY=COMPOSITE
+
+    ports:
+      - "${API_PORT:-8001}:8001"
+      - "${GRADIO_PORT:-7860}:7860"
+
+    volumes:
+      - ./checkpoints:/app/checkpoints
+      - hf_cache:/root/.cache/huggingface
+      - ./gradio_outputs:/app/gradio_outputs
+      - ./output:/app/output
+
+    shm_size: "2gb"
+    restart: unless-stopped
+
+    healthcheck:
+      test: >-
+        curl -sf http://localhost:8001/ > /dev/null 2>&1 ||
+        curl -sf http://localhost:7860/ > /dev/null 2>&1 ||
+        exit 1
+      interval: 30s
+      timeout: 15s
+      start_period: 300s
+      retries: 5
+
+  acestep-ui:
+    build:
+      context: .
+      dockerfile: Dockerfile.ui
+    image: acestep-ui:latest
+    container_name: acestep-ui
+
+    depends_on:
+      acestep-xpu:
+        condition: service_started
+
+    environment:
+      - ACESTEP_API_URL=http://acestep-xpu:8001
+      - PORT=3001
+      - FRONTEND_PORT=3003
+      - DATABASE_PATH=/app/data/acestep.db
+      - JWT_SECRET=${JWT_SECRET:-ace-step-ui-local-secret-change-me}
+      - FRONTEND_URL=${FRONTEND_URL:-http://localhost:3003}
+      - PEXELS_API_KEY=${PEXELS_API_KEY:-}
+
+    ports:
+      - "${UI_PORT:-3003}:3003"
+      - "${UI_API_PORT:-3004}:3001"
+
+    volumes:
+      - ui_data:/app/data
+      - ui_audio:/app/server/public/audio
+
+    restart: unless-stopped
+
+    healthcheck:
+      test: >-
+        curl -sf http://localhost:3003/ > /dev/null 2>&1 ||
+        curl -sf http://localhost:3001/ > /dev/null 2>&1 ||
+        exit 1
+      interval: 30s
+      timeout: 10s
+      start_period: 90s
+      retries: 5
+
+volumes:
+  hf_cache:
+  ui_data:
+  ui_audio:
