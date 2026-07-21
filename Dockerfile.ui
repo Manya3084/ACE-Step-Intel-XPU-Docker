@@ -1,7 +1,7 @@
 # =============================================================================
 # ACE-Step UI — Docker image (fspecii/ace-step-ui)
 # =============================================================================
-# Frontend (Vite) on 3003, Express backend on 3001 (hardcoded in vite.config proxy).
+# Frontend (Vite) on 3003, Express backend on 3001 (vite proxy).
 # Host maps: 3003->3003, 3004->3001
 # =============================================================================
 
@@ -23,9 +23,7 @@ WORKDIR /app
 RUN git clone --depth 1 https://github.com/fspecii/ace-step-ui.git .
 
 # ---------------------------------------------------------------------------
-# Patch CORS: original only allows localhost + a few LAN ranges.
-# Self-hosted users often access via hostname, Tailscale, or other IPs.
-# For local Docker use, allow any origin.
+# Patch 1: CORS — allow any origin for self-hosted LAN / mobile / Tailscale
 # ---------------------------------------------------------------------------
 RUN python3 - <<'PY'
 from pathlib import Path
@@ -38,12 +36,151 @@ new = """app.use(cors({
   credentials: true,
 }));"""
 pat = re.compile(r"app\.use\(cors\(\{.*?\}\)\);", re.S)
+if not pat.search(text):
+    raise SystemExit("Could not find cors() block to patch")
+p.write_text(pat.sub(new, text, count=1))
+print("CORS patched OK")
+PY
+
+# ---------------------------------------------------------------------------
+# Patch 2: buildGradioArgs — align with current ACE-Step 1.5 /generation_wrapper
+# Upstream UI sends 51 args; current Gradio expects ~72 and includes sampler
+# at index 26 (euler|heun). Misalignment caused:
+#   Value:  is not in the list of choices: ['euler', 'heun']
+# ---------------------------------------------------------------------------
+RUN python3 - <<'PY'
+from pathlib import Path
+import re
+
+p = Path("server/src/services/acestep.ts")
+text = p.read_text()
+
+new_fn = r'''
+async function buildGradioArgs(params: GenerationParams): Promise<unknown[]> {
+  // Aligned to ACE-Step 1.5 Gradio /generation_wrapper public API (~72 params).
+  // Sampler MUST be "euler" or "heun" (index 26).
+  const caption = params.style || 'pop music';
+  const prompt = params.customMode ? caption : (params.songDescription || caption);
+  const lyrics = params.instrumental ? '' : (params.lyrics || '');
+  const isThinking = params.thinking ?? false;
+  const isEnhance = params.enhance ?? false;
+  const useCot = isEnhance || isThinking;
+
+  const referenceAudio = await prepareAudioFile(params.referenceAudioUrl);
+  const sourceAudio = await prepareAudioFile(params.sourceAudioUrl);
+
+  const needsSource = params.taskType === 'cover' || params.taskType === 'audio2audio' || params.taskType === 'repaint';
+  if (needsSource && params.sourceAudioUrl && sourceAudio === null) {
+    throw new Error(`Source audio file could not be loaded from: ${params.sourceAudioUrl}.`);
+  }
+
+  return [
+    // 0-19 — core generation inputs (same as older UI)
+    prompt,                                                          // 0 caption
+    lyrics,                                                          // 1 lyrics
+    params.bpm && params.bpm > 0 ? params.bpm : 0,                    // 2 bpm
+    params.keyScale || '',                                           // 3 key
+    params.timeSignature || '',                                      // 4 time signature
+    params.vocalLanguage || 'en',                                    // 5 language
+    params.inferenceSteps ?? 8,                                      // 6 dit steps
+    params.guidanceScale ?? 7.0,                                     // 7 guidance
+    params.randomSeed !== false,                                     // 8 random seed
+    String(params.seed ?? -1),                                       // 9 seed
+    referenceAudio,                                                  // 10 ref audio
+    params.duration && params.duration > 0 ? params.duration : -1,   // 11 duration
+    Math.min(Math.max(params.batchSize ?? 1, 1), 16),               // 12 batch size
+    sourceAudio,                                                     // 13 source audio
+    params.audioCodes || '',                                         // 14 lm codes
+    params.repaintingStart ?? 0.0,                                   // 15 repaint start
+    params.repaintingEnd ?? -1,                                      // 16 repaint end
+    params.instruction || 'Fill the audio semantic mask based on the given conditions:', // 17 instruction
+    params.audioCoverStrength ?? 1.0,                                // 18 cover strength
+    0.0,                                                             // 19 cover noise
+
+    // 20-25 — flags / cfg / shift / method (task_type is not a public API arg)
+    params.useAdg ?? false,                                          // 20 use ADG
+    false,                                                           // 21 reserved / extra flag
+    params.cfgIntervalStart ?? 0.0,                                  // 22 cfg start
+    params.cfgIntervalEnd ?? 1.0,                                    // 23 cfg end
+    params.shift ?? 3.0,                                             // 24 shift
+    params.inferMethod || 'ode',                                     // 25 ode|sde
+
+    // 26 — REQUIRED sampler (was missing → empty string error)
+    'euler',                                                         // 26 sampler euler|heun
+
+    // 27-33 — velocity / DCW defaults from current Gradio schema
+    0.0,                                                             // 27 velocity norm threshold
+    0.0,                                                             // 28 velocity ema factor
+    true,                                                            // 29 dcw enabled
+    'double',                                                        // 30 dcw mode
+    0.02,                                                            // 31 dcw scaler
+    0.06,                                                            // 32 dcw high scaler
+    'haar',                                                          // 33 dcw wavelet
+
+    // 34-37 — timesteps / audio format
+    params.customTimesteps || '',                                    // 34 custom timesteps
+    params.audioFormat || 'mp3',                                     // 35 format
+    '128k',                                                          // 36 mp3 bitrate
+    48000,                                                           // 37 sample rate
+
+    // 38-43 — LM sampling
+    params.lmTemperature ?? 0.85,                                    // 38 lm temp
+    isThinking,                                                      // 39 think
+    params.lmCfgScale ?? 2.0,                                        // 40 lm cfg
+    params.lmTopK ?? 0,                                              // 41 lm top-k
+    params.lmTopP ?? 0.9,                                            // 42 lm top-p
+    params.lmNegativePrompt || 'NO USER INPUT',                      // 43 lm negative
+
+    // 44-52 — CoT / scores / batch
+    useCot ? (params.useCotMetas ?? true) : false,                   // 44 cot metas
+    useCot ? (params.useCotCaption ?? false) : false,                // 45 caption rewrite
+    useCot ? (params.useCotLanguage ?? true) : false,                // 46 cot language
+    params.isFormatCaption ?? false,                                 // 47 format caption
+    true,                                                            // 48 (schema gap fill)
+    params.constrainedDecodingDebug ?? false,                        // 49 constrained debug
+    params.allowLmBatch ?? true,                                     // 50 parallel thinking
+    params.getScores ?? false,                                       // 51 auto score
+    params.getLrc ?? false,                                          // 52 auto lrc
+    params.scoreScale ?? 0.5,                                        // 53 score scale
+    params.lmBatchChunkSize ?? 8,                                    // 54 lm batch chunk
+
+    // 55-60 — track / normalization / latent
+    params.trackName || null,                                        // 55 track name
+    params.completeTrackClasses || [],                               // 56 track classes
+    true,                                                            // 57 enable normalization
+    -1.0,                                                            // 58 normalization db
+    0.0,                                                             // 59 latent shift a
+    0.0,                                                             // 60 latent shift b
+    0.0,                                                             // 61 reserved
+    1.0,                                                             // 62 latent rescale
+
+    // 61-71 in schema (extra quality / batch controls)
+    'balanced',                                                      // 63 quality mode
+    0.5,                                                             // 64 quality strength
+    0.0,                                                             // 65 reserved
+    '',                                                              // 66 reserved string
+    params.autogen ?? false,                                         // 67 autogen
+    null,                                                            // 68
+    null,                                                            // 69
+    0.0,                                                             // 70
+    1.0,                                                             // 71
+    1,                                                               // 72 batch index-ish
+    false,                                                           // 73 final flag
+  ];
+}
+'''
+
+# Replace the existing buildGradioArgs function body
+pat = re.compile(
+    r"async function buildGradioArgs\(params: GenerationParams\): Promise<unknown\[]> \{.*?\n\}",
+    re.S,
+)
 m = pat.search(text)
 if not m:
-    raise SystemExit("Could not find cors() block to patch")
-text = pat.sub(new, text, count=1)
+    raise SystemExit("Could not find buildGradioArgs function")
+text = pat.sub(new_fn.strip(), text, count=1)
 p.write_text(text)
-print("CORS patched OK")
+print("buildGradioArgs patched OK")
 PY
 
 # Install frontend + server dependencies
@@ -52,9 +189,6 @@ RUN npm install \
     && npm install \
     && cd ..
 
-# Internal ports:
-#   Express must stay on 3001 because vite.config.ts proxies /api -> 127.0.0.1:3001
-#   Vite frontend on 3003
 ENV PORT=3001
 ENV FRONTEND_PORT=3003
 ENV ACESTEP_API_URL=http://acestep-xpu:8001
