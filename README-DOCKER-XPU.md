@@ -8,6 +8,7 @@ This branch adds first-class Docker support for **Intel Arc GPUs** (tested focus
 |------|---------|
 | `Dockerfile.xpu` | Builds the image with XPU-enabled PyTorch + Level Zero bits |
 | `docker-compose.xpu.yml` | Ready-to-use Compose file for Linux / OMV |
+| `.env.xpu.example` | Sample environment file optimized for Arc A770 16GB |
 | `README-DOCKER-XPU.md` | This guide |
 
 ## Host prerequisites (OpenMediaVault / Debian / Ubuntu)
@@ -32,6 +33,9 @@ git clone https://github.com/Manya3084/ACE-Step-1.5.git
 cd ACE-Step-1.5
 git checkout intel-xpu-docker
 
+# Copy the optimized environment file
+cp .env.xpu.example .env
+
 # Build and start (Gradio UI on port 7860)
 docker compose -f docker-compose.xpu.yml up --build
 
@@ -49,19 +53,27 @@ ACESTEP_MODE=api docker compose -f docker-compose.xpu.yml up -d
 
 ## Recommended settings for Arc A770 16GB
 
-The compose file defaults to:
+The included `.env.xpu.example` is already tuned for the A770 16GB:
 
 - DiT: `acestep-v15-turbo` (fast)
-- LM: `acestep-5Hz-lm-1.7B` (good balance)
+- LM: `acestep-5Hz-lm-1.7B` (best balance of quality and VRAM)
 - CPU offload enabled
+- Batch size = 1
+- XPU-specific environment variables set
 
-You can override in a `.env` file or environment variables:
+Just copy it:
+
+```bash
+cp .env.xpu.example .env
+```
+
+If you want higher quality and are willing to go slower, you can change:
 
 ```env
-ACESTEP_CONFIG_PATH=acestep-v15-turbo
-ACESTEP_LM_MODEL_PATH=acestep-5Hz-lm-1.7B   # or 4B if you want higher quality + more offload
-ACESTEP_OFFLOAD_TO_CPU=true
+ACESTEP_LM_MODEL_PATH=acestep-5Hz-lm-4B
 ```
+
+Keep `ACESTEP_OFFLOAD_TO_CPU=true` when using the 4B model.
 
 ## Device passthrough notes
 
