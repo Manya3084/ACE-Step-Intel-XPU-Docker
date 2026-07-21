@@ -5,18 +5,17 @@
 # Target: Intel Arc A770 16GB (and other Arc / XPU devices)
 # Host OS: Linux (Debian / Ubuntu / OpenMediaVault)
 #
+# Default mode is now API (port 8001) so you can use a proper frontend
+# like ace-step-ui instead of Gradio.
+#
 # Prerequisites on the host:
 #   1. Latest Intel Arc / GPU drivers
 #   2. Level Zero + intel-opencl-icd packages
 #   3. /dev/dri accessible
 #
 # Usage:
-#   docker compose -f docker-compose.xpu.yml up --build
-#   docker compose -f docker-compose.xpu.yml up -d
+#   docker compose -f docker-compose.xpu.yml up -d --build
 #   docker compose -f docker-compose.xpu.yml logs -f
-#
-#   # API mode:
-#   ACESTEP_MODE=api docker compose -f docker-compose.xpu.yml up
 #
 # =============================================================================
 
@@ -29,21 +28,16 @@ services:
     container_name: acestep-xpu
 
     # ---- Intel GPU device access ----
-    # Pass the DRI devices. On most systems this is enough for Arc + Level Zero.
     devices:
       - /dev/dri:/dev/dri
-
-    # Some setups also benefit from these (uncomment if needed):
-    # group_add:
-    #   - video
-    #   - render
 
     # ---- Environment ----
     env_file:
       - path: .env
         required: false
     environment:
-      - ACESTEP_MODE=${ACESTEP_MODE:-gradio}
+      # API mode by default (use ace-step-ui or any other frontend)
+      - ACESTEP_MODE=${ACESTEP_MODE:-api}
       - ACESTEP_LLM_BACKEND=${ACESTEP_LLM_BACKEND:-pt}
       - ACESTEP_INIT_SERVICE=${ACESTEP_INIT_SERVICE:-true}
       # Recommended for A770 16GB
@@ -60,9 +54,11 @@ services:
       - ZE_FLAT_DEVICE_HIERARCHY=COMPOSITE
 
     # ---- Ports ----
+    # 8001 = REST API (primary)
+    # 7860 kept in case you ever want Gradio again
     ports:
-      - "${GRADIO_PORT:-7860}:7860"
       - "${API_PORT:-8001}:8001"
+      - "${GRADIO_PORT:-7860}:7860"
 
     # ---- Persistent volumes ----
     volumes:
@@ -71,15 +67,13 @@ services:
       - ./gradio_outputs:/app/gradio_outputs
       - ./output:/app/output
 
-    # Shared memory helps with some PyTorch operations
     shm_size: "2gb"
-
     restart: unless-stopped
 
     healthcheck:
       test: >-
-        curl -sf http://localhost:7860/ > /dev/null 2>&1 ||
         curl -sf http://localhost:8001/health > /dev/null 2>&1 ||
+        curl -sf http://localhost:7860/ > /dev/null 2>&1 ||
         exit 1
       interval: 30s
       timeout: 15s
