@@ -5,7 +5,8 @@ Full stack for **Intel Arc A770 16GB** on Linux / OpenMediaVault:
 | Service | Role | Port |
 |---------|------|------|
 | `acestep-xpu` | ACE-Step API (Intel XPU) | 8001 |
-| `acestep-ui` | Spotify-style web UI (mobile-friendly) | 3000 |
+| `acestep-ui` | Spotify-style web UI (mobile-friendly) | **3003** |
+| `acestep-ui` backend | Express API for the UI | **3004** |
 
 Gradio is no longer the primary UI.
 
@@ -35,8 +36,8 @@ git checkout intel-xpu-docker
 cp .env.xpu.example .env
 
 # Optional but recommended: set your LAN URL for mobile
-# echo 'FRONTEND_URL=http://192.168.x.x:3000' >> .env
-# echo 'VITE_API_URL=http://192.168.x.x:3001' >> .env
+# echo 'FRONTEND_URL=http://192.168.x.x:3003' >> .env
+# echo 'VITE_API_URL=http://192.168.x.x:3004' >> .env
 
 docker compose -f docker-compose.xpu.yml up -d --build
 ```
@@ -44,7 +45,7 @@ docker compose -f docker-compose.xpu.yml up -d --build
 Then open on phone or desktop:
 
 ```
-http://YOUR_OMV_IP:3000
+http://YOUR_OMV_IP:3003
 ```
 
 API (if you need it directly):
@@ -75,7 +76,7 @@ docker compose -f docker-compose.xpu.yml down
 
 ## Mobile tips
 
-- Use `http://YOUR_OMV_IP:3000` (not localhost)
+- Use `http://YOUR_OMV_IP:3003` (not localhost)
 - Progress survives switching apps (API polling, not Gradio WebSockets)
 - First start of `acestep-xpu` is slow while models download
 
