@@ -56,6 +56,175 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 WORKDIR /app
 COPY . /app/
 
+# ---------------------------------------------------------------------------
+# Patch: Gradio --enable-api format endpoint
+# Problem: /format_input either missing or runs blocking LM on the asyncio loop
+# and never returns (UI spinner forever / curl hang).
+# Fix: after setup_api_routes, force-register a working /format_input that runs
+# format_sample in a worker thread and returns the standard wrap_response shape.
+# ---------------------------------------------------------------------------
+RUN python3 - <<'PY'
+from pathlib import Path
+import re
+
+# Locate pipeline module that calls setup_api_routes
+candidates = list(Path("/app").rglob("acestep_v15_pipeline.py"))
+if not candidates:
+    raise SystemExit("acestep_v15_pipeline.py not found")
+pipeline = candidates[0]
+text = pipeline.read_text()
+
+if "_xpu_register_format_input" in text:
+    print("Format patch already present")
+else:
+    # Inject helper + call right after setup_api_routes(...)
+    helper = '''
+
+def _xpu_register_format_input(demo, llm_handler):
+    """Ensure POST /format_input works under Gradio --enable-api (Intel fork)."""
+    import asyncio
+    import json
+    import time
+    from fastapi import Request
+
+    try:
+        app = demo.app  # Gradio Blocks FastAPI app
+    except Exception as exc:
+        print(f"[XPU] format_input: no demo.app ({exc})")
+        return
+
+    async def format_input_endpoint(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+
+        prompt = body.get("prompt") or body.get("caption") or ""
+        lyrics = body.get("lyrics") or ""
+        temperature = body.get("temperature", 0.85)
+        try:
+            temperature = float(temperature)
+        except Exception:
+            temperature = 0.85
+
+        param_obj = body.get("param_obj", {})
+        if isinstance(param_obj, str):
+            try:
+                param_obj = json.loads(param_obj) if param_obj else {}
+            except Exception:
+                param_obj = {}
+        if not isinstance(param_obj, dict):
+            param_obj = {}
+
+        user_metadata = {}
+        bpm = param_obj.get("bpm")
+        duration = param_obj.get("duration")
+        key_scale = param_obj.get("key") or param_obj.get("key_scale") or ""
+        time_signature = param_obj.get("time_signature") or ""
+        language = param_obj.get("language") or ""
+        if bpm not in (None, "", 0, "0"):
+            try:
+                user_metadata["bpm"] = int(bpm)
+            except Exception:
+                pass
+        if duration not in (None, "", 0, "0", -1, "-1"):
+            try:
+                user_metadata["duration"] = int(float(duration))
+            except Exception:
+                pass
+        if key_scale:
+            user_metadata["keyscale"] = str(key_scale)
+        if time_signature:
+            user_metadata["timesignature"] = str(time_signature)
+        if language and language != "unknown":
+            user_metadata["language"] = str(language)
+
+        def _run():
+            from acestep.inference import format_sample
+            return format_sample(
+                llm_handler=llm_handler,
+                caption=prompt,
+                lyrics=lyrics,
+                user_metadata=user_metadata or None,
+                temperature=temperature,
+                use_constrained_decoding=True,
+            )
+
+        try:
+            result = await asyncio.to_thread(_run)
+        except Exception as exc:
+            return {
+                "data": None,
+                "code": 500,
+                "error": f"format_sample error: {exc}",
+                "timestamp": int(time.time() * 1000),
+                "extra": None,
+            }
+
+        if not getattr(result, "success", False):
+            err = getattr(result, "error", None) or getattr(result, "status_message", None) or "format failed"
+            return {
+                "data": None,
+                "code": 500,
+                "error": f"format_sample failed: {err}",
+                "timestamp": int(time.time() * 1000),
+                "extra": None,
+            }
+
+        data = {
+            "caption": getattr(result, "caption", None) or prompt,
+            "lyrics": getattr(result, "lyrics", None) or lyrics,
+            "bpm": getattr(result, "bpm", None) or bpm,
+            "key_scale": getattr(result, "keyscale", None) or key_scale,
+            "time_signature": getattr(result, "timesignature", None) or time_signature,
+            "duration": getattr(result, "duration", None) or duration,
+            "vocal_language": getattr(result, "language", None) or language or "unknown",
+        }
+        return {
+            "data": data,
+            "code": 200,
+            "error": None,
+            "timestamp": int(time.time() * 1000),
+            "extra": None,
+        }
+
+    # Remove any prior route on /format_input then add ours
+    try:
+        app.router.routes = [
+            r for r in app.router.routes
+            if not (getattr(r, "path", None) == "/format_input")
+        ]
+    except Exception:
+        pass
+
+    app.add_api_route("/format_input", format_input_endpoint, methods=["POST"])
+    # Compatibility alias used by some UI builds
+    app.add_api_route("/format_lyrics", format_input_endpoint, methods=["POST"])
+    print("[XPU] Registered working /format_input and /format_lyrics (threaded)")
+'''
+
+    if "setup_api_routes(demo" not in text and "setup_api_routes(" not in text:
+        raise SystemExit("Could not find setup_api_routes call to hook")
+
+    # Insert helper before main if missing
+    text = helper + "\n" + text
+
+    # After setup_api_routes(...), call our registrar
+    # Match a typical call line and append our hook on the next line
+    pat = re.compile(
+        r"(setup_api_routes\([^\n]*\))",
+    )
+    m = pat.search(text)
+    if not m:
+        raise SystemExit("setup_api_routes call pattern not found")
+
+    # Prefer handlers named demo + llm_handler from surrounding scope
+    injection = m.group(1) + "\n            _xpu_register_format_input(demo, llm_handler)"
+    text = pat.sub(injection, text, count=1)
+    pipeline.write_text(text)
+    print(f"Patched {pipeline}")
+PY
+
 # Install project without CUDA torch, then force XPU torch
 RUN uv venv /app/.venv --python python3.11 \
     && . /app/.venv/bin/activate \
@@ -81,7 +250,6 @@ ENV GRADIO_SERVER_NAME=0.0.0.0
 ENV ACESTEP_API_HOST=0.0.0.0
 
 # Default: Gradio + API endpoints (required by ace-step-ui)
-# Modes: gradio-api (default) | gradio | api
 ENV ACESTEP_MODE=gradio-api
 ENV ACESTEP_INIT_SERVICE=true
 
@@ -132,14 +300,12 @@ if [ "${ACESTEP_INIT_SERVICE:-true}" = "true" ]; then
     echo "Auto-init    : DiT=${ACESTEP_CONFIG_PATH:-auto}  LM=${ACESTEP_LM_MODEL_PATH:-none}"
 fi
 
-# Offload flag
 OFFLOAD_ARGS=""
 if [ "${ACESTEP_OFFLOAD_TO_CPU:-true}" = "true" ]; then
     OFFLOAD_ARGS="--offload_to_cpu true"
 fi
 
 if [ "${ACESTEP_MODE}" = "api" ]; then
-    # Pure FastAPI REST server (no Gradio client compatibility)
     echo "Starting pure REST API on 0.0.0.0:${ACESTEP_API_PORT:-8001} ..."
     exec python -m acestep.api_server \
         --host "${ACESTEP_API_HOST:-0.0.0.0}" \
@@ -147,7 +313,6 @@ if [ "${ACESTEP_MODE}" = "api" ]; then
         ${ACESTEP_EXTRA_ARGS:-}
 
 elif [ "${ACESTEP_MODE}" = "gradio" ]; then
-    # Gradio UI only (no API endpoints for ace-step-ui)
     echo "Starting Gradio UI on 0.0.0.0:${GRADIO_PORT:-7860} ..."
     exec python -m acestep.acestep_v15_pipeline \
         --server-name "${GRADIO_SERVER_NAME:-0.0.0.0}" \
@@ -158,8 +323,6 @@ elif [ "${ACESTEP_MODE}" = "gradio" ]; then
         ${ACESTEP_EXTRA_ARGS:-}
 
 else
-    # Default: gradio-api — Gradio + --enable-api (what ace-step-ui needs)
-    # Listens on 8001 so ACESTEP_API_URL=http://acestep-xpu:8001 works
     PORT="${ACESTEP_API_PORT:-8001}"
     echo "Starting Gradio + API endpoints on 0.0.0.0:${PORT} ..."
     echo "(ace-step-ui connects via Gradio client to this port)"
