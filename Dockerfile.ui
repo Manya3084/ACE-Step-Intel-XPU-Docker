@@ -15,6 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
         python3 \
+        ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -42,9 +43,6 @@ PY
 
 # ---------------------------------------------------------------------------
 # Patch 2: buildGradioArgs aligned to live /generation_wrapper schema (72 args)
-# Index map taken from: curl http://acestep:8001/gradio_api/info
-# Critical: index 26 = sampler ('euler'|'heun')
-#           index 51 = score scale (number, min 0.01) — must NOT be a boolean
 # ---------------------------------------------------------------------------
 RUN python3 - <<'PY'
 from pathlib import Path
@@ -71,7 +69,6 @@ async function buildGradioArgs(params: GenerationParams): Promise<unknown[]> {
     throw new Error(`Source audio file could not be loaded from: ${params.sourceAudioUrl}.`);
   }
 
-  // 72 entries, indices 0..71 — types must match Gradio schema defaults
   return [
     /*  0 */ prompt,
     /*  1 */ lyrics,
@@ -92,50 +89,50 @@ async function buildGradioArgs(params: GenerationParams): Promise<unknown[]> {
     /* 16 */ params.repaintingEnd ?? -1,
     /* 17 */ params.instruction || 'Fill the audio semantic mask based on the given conditions:',
     /* 18 */ params.audioCoverStrength ?? 1.0,
-    /* 19 */ 0.0,                                    // cover noise strength
-    /* 20 */ params.useAdg ?? false,                 // bool
-    /* 21 */ false,                                  // bool (schema default)
-    /* 22 */ params.cfgIntervalStart ?? 0.0,         // number
-    /* 23 */ params.cfgIntervalEnd ?? 1.0,           // number
-    /* 24 */ params.shift ?? 3.0,                    // number
-    /* 25 */ params.inferMethod || 'ode',            // 'ode' | 'sde'
-    /* 26 */ 'euler',                                // REQUIRED: 'euler' | 'heun'
-    /* 27 */ 0.0,                                    // velocity norm
-    /* 28 */ 0.0,                                    // velocity ema
-    /* 29 */ true,                                   // dcw enabled
-    /* 30 */ 'double',                               // dcw mode
-    /* 31 */ 0.02,                                   // dcw scaler
-    /* 32 */ 0.06,                                   // dcw high scaler
-    /* 33 */ 'haar',                                 // wavelet
-    /* 34 */ params.customTimesteps || '',           // custom timesteps string
-    /* 35 */ params.audioFormat || 'mp3',            // format
-    /* 36 */ '128k',                                 // mp3 bitrate
-    /* 37 */ 48000,                                  // sample rate
-    /* 38 */ params.lmTemperature ?? 0.85,           // lm temperature
-    /* 39 */ isThinking,                             // think (bool)
-    /* 40 */ params.lmCfgScale ?? 2.0,               // lm cfg
-    /* 41 */ params.lmTopK ?? 0,                     // lm top-k
-    /* 42 */ params.lmTopP ?? 0.9,                   // lm top-p
+    /* 19 */ 0.0,
+    /* 20 */ params.useAdg ?? false,
+    /* 21 */ false,
+    /* 22 */ params.cfgIntervalStart ?? 0.0,
+    /* 23 */ params.cfgIntervalEnd ?? 1.0,
+    /* 24 */ params.shift ?? 3.0,
+    /* 25 */ params.inferMethod || 'ode',
+    /* 26 */ 'euler',
+    /* 27 */ 0.0,
+    /* 28 */ 0.0,
+    /* 29 */ true,
+    /* 30 */ 'double',
+    /* 31 */ 0.02,
+    /* 32 */ 0.06,
+    /* 33 */ 'haar',
+    /* 34 */ params.customTimesteps || '',
+    /* 35 */ params.audioFormat || 'mp3',
+    /* 36 */ '128k',
+    /* 37 */ 48000,
+    /* 38 */ params.lmTemperature ?? 0.85,
+    /* 39 */ isThinking,
+    /* 40 */ params.lmCfgScale ?? 2.0,
+    /* 41 */ params.lmTopK ?? 0,
+    /* 42 */ params.lmTopP ?? 0.9,
     /* 43 */ params.lmNegativePrompt || 'NO USER INPUT',
-    /* 44 */ useCot ? (params.useCotMetas ?? true) : true,   // schema default true
+    /* 44 */ useCot ? (params.useCotMetas ?? true) : true,
     /* 45 */ useCot ? (params.useCotCaption ?? false) : false,
     /* 46 */ useCot ? (params.useCotLanguage ?? true) : true,
-    /* 47 */ params.isFormatCaption ?? false,        // bool
-    /* 48 */ true,                                   // schema default true
+    /* 47 */ params.isFormatCaption ?? false,
+    /* 48 */ true,
     /* 49 */ params.constrainedDecodingDebug ?? false,
-    /* 50 */ params.allowLmBatch ?? false,           // schema default false
-    /* 51 */ Math.max(params.scoreScale ?? 0.5, 0.01), // NUMBER min 0.01 — never bool
-    /* 52 */ params.lmBatchChunkSize ?? 8,           // number
-    /* 53 */ params.trackName || null,               // track / instrument
-    /* 54 */ params.completeTrackClasses || [],      // list
-    /* 55 */ true,                                   // enable normalization
-    /* 56 */ -1.0,                                   // normalization db
+    /* 50 */ params.allowLmBatch ?? false,
+    /* 51 */ Math.max(params.scoreScale ?? 0.5, 0.01),
+    /* 52 */ params.lmBatchChunkSize ?? 8,
+    /* 53 */ params.trackName || null,
+    /* 54 */ params.completeTrackClasses || [],
+    /* 55 */ true,
+    /* 56 */ -1.0,
     /* 57 */ 0.0,
     /* 58 */ 0.0,
     /* 59 */ 0.0,
-    /* 60 */ 1.0,                                    // latent rescale
-    /* 61 */ 'balanced',                             // quality mode
-    /* 62 */ 0.5,                                    // quality strength
+    /* 60 */ 1.0,
+    /* 61 */ 'balanced',
+    /* 62 */ 0.5,
     /* 63 */ 0.0,
     /* 64 */ '',
     /* 65 */ params.autogen ?? false,
@@ -156,7 +153,7 @@ pat = re.compile(
 if not pat.search(text):
     raise SystemExit("Could not find buildGradioArgs function")
 p.write_text(pat.sub(new_fn.strip(), text, count=1))
-print("buildGradioArgs patched OK — 72 args, sampler=euler, scoreScale is number")
+print("buildGradioArgs patched OK")
 PY
 
 RUN npm install \
