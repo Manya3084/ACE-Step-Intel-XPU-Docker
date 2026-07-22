@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Standalone dataset preprocessor for ACE-Step LoRA training (XPU Docker).
 
-Converts labeled samples from dataset JSON into .pt tensors.
-Uses DatasetBuilder.load_dataset() — NOT load_from_dict (removed upstream).
+Uses DatasetBuilder.load_dataset() + AceStepHandler.initialize_service().
 """
 from __future__ import annotations
 
@@ -36,44 +35,44 @@ def _ensure_labeled(dataset_path: Path) -> dict:
 
 
 def _init_dit_handler():
-    """Best-effort AceStepHandler init across ACE-Step versions."""
-    last_err = None
-    # Pattern 1: core handler class
-    try:
-        from acestep.core.generation.handler import AceStepHandler  # type: ignore
+    """Create AceStepHandler and call initialize_service with Docker paths."""
+    from acestep.handler import AceStepHandler
 
-        h = AceStepHandler()
-        for meth in ("initialize_service", "initialize", "init_service", "setup"):
-            fn = getattr(h, meth, None)
-            if callable(fn):
-                try:
-                    fn()
-                    break
-                except TypeError:
-                    try:
-                        fn(None)
-                        break
-                    except Exception as e:
-                        last_err = e
-                except Exception as e:
-                    last_err = e
-        if getattr(h, "model", None) is not None:
-            return h
-    except Exception as e:
-        last_err = e
+    project_root = os.environ.get("ACESTEP_PATH", "/app")
+    checkpoints = os.environ.get("ACESTEP_CHECKPOINTS", "/app/checkpoints")
+    # initialize_service accepts project_root that may be checkpoints dir
+    root = checkpoints if Path(checkpoints).is_dir() else project_root
 
-    # Pattern 2: service from generation package
-    try:
-        from acestep.core.generation import service as gen_service  # type: ignore
+    config_path = (
+        os.environ.get("ACESTEP_CONFIG_PATH")
+        or os.environ.get("ACESTEP_DIT_MODEL")
+        or "acestep-v15-turbo"
+    )
+    # strip path if full path given
+    config_path = Path(config_path).name
 
-        if hasattr(gen_service, "get_handler"):
-            h = gen_service.get_handler()
-            if h is not None:
-                return h
-    except Exception as e:
-        last_err = e
+    device = os.environ.get("PYTORCH_DEVICE") or os.environ.get("ACESTEP_DEVICE") or "xpu"
+    offload = (os.environ.get("ACESTEP_OFFLOAD_TO_CPU", "true") or "true").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
-    raise RuntimeError(f"Could not initialize DiT handler: {last_err}")
+    h = AceStepHandler()
+    status, ok = h.initialize_service(
+        project_root=str(root),
+        config_path=config_path,
+        device=device,
+        use_flash_attention=False,
+        compile_model=False,
+        offload_to_cpu=offload,
+        offload_dit_to_cpu=False,
+    )
+    print(f"[preprocess] initialize_service: ok={ok} status={status}", file=sys.stderr)
+    if not ok and getattr(h, "model", None) is None and getattr(h, "vae", None) is None:
+        raise RuntimeError(f"initialize_service failed: {status}")
+    return h
 
 
 def main() -> int:
@@ -90,7 +89,7 @@ def main() -> int:
 
     if not dataset_path.is_file():
         err = {"ok": False, "error": f"Dataset file not found: {dataset_path}"}
-        print(json.dumps(err) if args.json else err["error"], file=sys.stderr if not args.json else sys.stdout)
+        print(json.dumps(err) if args.json else err["error"])
         return 1
 
     try:
@@ -125,7 +124,6 @@ def main() -> int:
         print(json.dumps(err) if args.json else err["error"])
         return 1
 
-    # Force labeled on builder samples
     for s in builder.samples:
         if hasattr(s, "labeled"):
             s.labeled = True
@@ -137,7 +135,7 @@ def main() -> int:
         err = {
             "ok": False,
             "error": str(e),
-            "hint": "Need AceStepHandler with model loaded; check checkpoints and VRAM",
+            "hint": "AceStepHandler.initialize_service failed; check /app/checkpoints and VRAM",
             "samples_loaded": len(builder.samples),
         }
         print(json.dumps(err) if args.json else str(e))
