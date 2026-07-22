@@ -4,6 +4,7 @@
 # Optimized for Intel Arc A770 16GB on Linux / OMV
 # Bakes: PyTorch XPU nightly, torchao>=0.16 (+xpu), bitsandbytes, lycoris-lora
 #         soundfile + ffmpeg (TorchCodec is CUDA-only — do not use on pure XPU)
+#         trainer.py XPU path: basic loop (Lightning Fabric has no accelerator=xpu)
 # =============================================================================
 
 FROM ubuntu:22.04
@@ -57,6 +58,12 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
 WORKDIR /app
 COPY . /app/
+
+# ---------------------------------------------------------------------------
+# Patch: LoRA/LoKR trainer — XPU uses basic loop (Fabric has no accelerator=xpu)
+# Verified on Arc A770: epochs + loss advance on device=xpu
+# ---------------------------------------------------------------------------
+RUN python3 /app/docker/ui-patches/trainer_xpu_fabric.py
 
 # ---------------------------------------------------------------------------
 # Patch: Gradio --enable-api format endpoint
@@ -282,7 +289,7 @@ echo "Python    : $(python --version 2>&1)"
 echo "PyTorch   : $(python -c 'import torch; print(torch.__version__)' 2>/dev/null || echo 'N/A')"
 echo "torchao   : $(python -c 'import torchao; print(torchao.__version__)' 2>/dev/null || echo 'N/A')"
 echo "bnb       : $(python -c 'import bitsandbytes as b; print(b.__version__)' 2>/dev/null || echo 'N/A')"
-echo "lycoris   : $(python -c 'import lycoris; print("ok")' 2>/dev/null || echo 'N/A')"
+echo "lycoris   : $(python -c 'import lycoris; print(\"ok\")' 2>/dev/null || echo 'N/A')"
 echo "soundfile : $(python -c 'import soundfile as s; print(s.__version__)' 2>/dev/null || echo 'N/A')"
 
 if python -c 'import torch; assert hasattr(torch, "xpu") and torch.xpu.is_available()' 2>/dev/null; then
