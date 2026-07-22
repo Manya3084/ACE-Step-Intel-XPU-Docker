@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Patch training.ts — blacklist missing Gradio names; no bare predict throws."""
+"""Patch training.ts — blacklist missing Gradio names; never call them."""
 from pathlib import Path
 import re
 
@@ -9,7 +9,7 @@ text = training.read_text()
 if "fileURLToPath" not in text:
     text = "import { fileURLToPath } from 'url';\n" + text
 
-# Remove any previous helper copies to avoid duplicates, then inject once
+# Drop prior helper injections
 text = re.sub(
     r"/\*\* ACE-Step-Intel-XPU-Docker training helpers \*/[\s\S]*?async function safeGradioPredict[\s\S]*?\n\}\n",
     "",
@@ -25,7 +25,6 @@ HELPER = r'''
 /** ACE-Step-Intel-XPU-Docker training helpers */
 const __aceDirname = path.dirname(fileURLToPath(import.meta.url));
 
-/** Endpoints that do NOT exist as named Gradio API on ACE-Step 1.5 (your /gradio_api/info). */
 const GRADIO_ENDPOINT_BLACKLIST = new Set([
   "/init_service_wrapper",
   "init_service_wrapper",
@@ -33,6 +32,7 @@ const GRADIO_ENDPOINT_BLACKLIST = new Set([
   "auto_label_all",
   "/auto_label",
   "auto_label",
+  "/__blacklisted_init_service_wrapper",
 ]);
 
 function xpuContainer(): string {
@@ -82,7 +82,6 @@ async function safeGradioPredict(
   for (const ep of variants) {
     try {
       console.log("[Training] Gradio predict", ep);
-      // Explicit .then/.catch so Gradio client cannot surface unhandledRejection
       const result: any = await Promise.resolve(client.predict(ep, args)).catch((err: any) => {
         throw err;
       });
@@ -124,7 +123,6 @@ text = text.replace(
 )
 text = text.replace("path.resolve(__dirname,", "path.resolve(__aceDirname,")
 
-# Rewrite remaining client.predict to safeGradioPredict
 text2, n = re.subn(
     r"await\s+client\.predict\(\s*['\"]([^'\"]+)['\"]\s*,\s*(\[[\s\S]*?\])\s*\)",
     lambda m: f"await safeGradioPredict('{m.group(1)}', {m.group(2)})",
@@ -133,20 +131,9 @@ text2, n = re.subn(
 print(f"client.predict -> safeGradioPredict: {n}")
 text = text2
 
-# Also catch client.predict with template or variable first arg — leave as-is if any
-
-# Fix result.data pattern after safeGradioPredict
 text = re.sub(
     r"const result = await safeGradioPredict\(([^;]+)\);\s*const data = result\.data as unknown\[\];",
     r"const __pred = await safeGradioPredict(\1);\n    if (!__pred.ok) { res.status(502).json({ error: 'Gradio endpoint failed', detail: __pred.error, endpoint: __pred.endpoint }); return; }\n    const data = __pred.data;",
-    text,
-)
-
-# Any remaining `result = await safeGradioPredict` then `result.data` without ok check:
-# broader fix for init-model style that does predict and uses result without ok
-text = re.sub(
-    r"(const result = await safeGradioPredict\([^;]+\);)\s*\n(\s*)(const data = \(result\.data)",
-    r"\1\n\2if (!(result as any).ok) { res.status(502).json({ error: 'Gradio endpoint failed', detail: (result as any).error, endpoint: (result as any).endpoint }); return; }\n\2const data = ((result as any).data",
     text,
 )
 
@@ -166,28 +153,43 @@ def replace_route(src: str, path: str, new_body: str):
     while j < len(src):
         c = src[j]
         if in_s:
-            if esc: esc = False
-            elif c == "\\": esc = True
-            elif c == "'": in_s = False
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == "'":
+                in_s = False
         elif in_d:
-            if esc: esc = False
-            elif c == "\\": esc = True
-            elif c == '"': in_d = False
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_d = False
         elif in_t:
-            if esc: esc = False
-            elif c == "\\": esc = True
-            elif c == "`": in_t = False
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == "`":
+                in_t = False
         else:
-            if c == "'": in_s = True
-            elif c == '"': in_d = True
-            elif c == "`": in_t = True
-            elif c == "{": depth += 1
+            if c == "'":
+                in_s = True
+            elif c == '"':
+                in_d = True
+            elif c == "`":
+                in_t = True
+            elif c == "{":
+                depth += 1
             elif c == "}":
                 depth -= 1
                 if depth == 0:
                     end = j + 1
-                    if end < len(src) and src[end] == ")": end += 1
-                    if end < len(src) and src[end] == ";": end += 1
+                    if end < len(src) and src[end] == ")":
+                        end += 1
+                    if end < len(src) and src[end] == ";":
+                        end += 1
                     return src[:start] + new_body.strip() + src[end:], True
         j += 1
     return src, False
@@ -214,21 +216,12 @@ router.post("/auto-label", authMiddleware, async (_req: AuthenticatedRequest, re
 
 text, ok = replace_route(text, "/init-model", INIT)
 print("init-model route", ok)
-if not ok:
-    # force: strip any remaining safeGradioPredict('/init_service_wrapper'
-    pass
 
 text, ok = replace_route(text, "/auto-label", AUTO)
 print("auto-label route", ok)
 
-# Nuclear: any remaining init_service_wrapper string in predict calls -> blacklist already handles
-# But if code does: const result = await safeGradioPredict('/init_service_wrapper'...
-# and then uses result without checking ok, still throws when accessing?
-# Unhandled rejection was from predict itself - blacklist prevents predict call.
-
-# Replace init-model body if route replace failed but still has init_service_wrapper
+# Any leftover init_service_wrapper predict calls -> still blacklisted
 if "init_service_wrapper" in text:
-    # Replace the predict call sites with immediate soft result
     text = text.replace(
         "await safeGradioPredict('/init_service_wrapper'",
         "await safeGradioPredict('/__blacklisted_init_service_wrapper'",
@@ -237,13 +230,7 @@ if "init_service_wrapper" in text:
         'await safeGradioPredict("/init_service_wrapper"',
         'await safeGradioPredict("/__blacklisted_init_service_wrapper"',
     )
-    GRADIO_ENDPOINT_BLACKLIST also needs the renamed one - add to set in helper already has init_service_wrapper
-    # Add the mangled name to blacklist via string in helper - already returns false for unknown that we add:
-    text = text.replace(
-        '"/auto_label",',
-        '"/auto_label",\n  "/__blacklisted_init_service_wrapper",',
-    )
-    print("mangled remaining init_service_wrapper call sites")
+    print("rewrote leftover init_service_wrapper call sites")
 
 PREPROCESS = r'''
 router.post("/preprocess", authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
