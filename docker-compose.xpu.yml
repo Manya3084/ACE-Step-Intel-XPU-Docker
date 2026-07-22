@@ -7,11 +7,12 @@
 #   acestep-ui   — Spotify-style web UI
 #                   host 3003 = frontend
 #                   host 3004 = UI backend
+#                   Console (SSE) streams docker logs in-browser
 #
 # Shared host dirs (Training / LoRA):
 #   ./datasets      — audio, JSON, uploads, preprocessed tensors
 #   ./lora_output   — trained adapters / checkpoints
-#   ./checkpoints   — DiT/LM weights (also listed in Training UI)
+#   ./checkpoints   — DiT/LM weights
 #
 # Usage:
 #   mkdir -p datasets/uploads lora_output checkpoints
@@ -49,7 +50,6 @@ services:
       - SYCL_CACHE_PERSISTENT=1
       - SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS=1
       - ZE_FLAT_DEVICE_HIERARCHY=COMPOSITE
-      # Training paths (same layout as UI)
       - DATASETS_DIR=/app/datasets
       - LORA_OUTPUT_DIR=/app/lora_output
 
@@ -62,7 +62,6 @@ services:
       - hf_cache:/root/.cache/huggingface
       - ./gradio_outputs:/app/gradio_outputs
       - ./output:/app/output
-      # Shared with acestep-ui for LoRA Training tab
       - ./datasets:/app/datasets
       - ./lora_output:/app/lora_output
 
@@ -99,9 +98,10 @@ services:
       - FRONTEND_URL=${FRONTEND_URL:-http://localhost:3003}
       - PEXELS_API_KEY=${PEXELS_API_KEY:-}
       - ENABLE_DOCKER_RESTART=${ENABLE_DOCKER_RESTART:-true}
+      - ENABLE_LOG_STREAM=${ENABLE_LOG_STREAM:-true}
       - XPU_CONTAINER_NAME=${XPU_CONTAINER_NAME:-acestep-xpu}
+      - UI_CONTAINER_NAME=${UI_CONTAINER_NAME:-acestep-ui}
       - DOCKER_HOST=unix:///var/run/docker.sock
-      # Training: must match mounts below (overrides ACE-Step-1.5 defaults)
       - DATASETS_DIR=/app/datasets
       - DATASETS_UPLOADS_DIR=/app/datasets/uploads
       - ACESTEP_PATH=/app
@@ -115,18 +115,16 @@ services:
       - ui_data:/app/data
       - ui_audio:/app/server/public/audio
       - /var/run/docker.sock:/var/run/docker.sock
-      # Shared with acestep-xpu
       - ./datasets:/app/datasets
       - ./lora_output:/app/lora_output
-      # So Training "checkpoints" list can see DiT configs
       - ./checkpoints:/app/checkpoints:ro
 
     restart: unless-stopped
 
     healthcheck:
       test: >-
-        curl -sf http://localhost:3003/ > /dev/null 2>&1 ||
-        curl -sf http://localhost:3001/ > /dev/null 2>&1 ||
+        curl -sf http://localhost:3003/ >/dev/null 2>&1 ||
+        curl -sf http://localhost:3001/ >/dev/null 2>&1 ||
         exit 1
       interval: 30s
       timeout: 10s
