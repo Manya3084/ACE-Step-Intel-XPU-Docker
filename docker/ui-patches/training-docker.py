@@ -2,6 +2,7 @@
 """Patch training.ts — XPU paths, safe Gradio, local save-dataset, docker preprocess."""
 from pathlib import Path
 import re
+import sys
 
 training = Path("server/src/routes/training.ts")
 text = training.read_text()
@@ -149,6 +150,68 @@ def replace_route(src: str, path: str, new_body: str):
     else:
         return src, False
     i = src.find("{", start)
+    if i < 0:
+        return src, False
+    depth = 0
+    in_s = in_d = in_t = False
+    esc = False
+    j = i
+    while j < len(src):
+        c = src[j]
+        if in_s:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == "'":
+                in_s = False
+        elif in_d:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_d = False
+        elif in_t:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == "`":
+                in_t = False
+        else:
+            if c == "'":
+                in_s = True
+            elif c == '"':
+                in_d = True
+            elif c == "`":
+                in_t = True
+            elif c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    end = j + 1
+                    if end < len(src) and src[end] == ")":
+                        end += 1
+                    if end < len(src) and src[end] == ";":
+                        end += 1
+                    return src[:start] + new_body.strip() + src[end:], True
+        j += 1
+    return src, False
+
+def replace_route_containing(src: str, marker: str, new_body: str):
+    """Find router.post whose body contains marker and replace whole route."""
+    idx = src.find(marker)
+    if idx < 0:
+        return src, False
+    # walk back to router.post
+    start = src.rfind("router.post", 0, idx)
+    if start < 0:
+        return src, False
+    i = src.find("{", start)
+    if i < 0:
+        return src, False
     depth = 0
     in_s = in_d = in_t = False
     esc = False
@@ -198,7 +261,7 @@ def replace_route(src: str, path: str, new_body: str):
     return src, False
 
 INIT = r'''
-router.post("/init-model", authMiddleware, async (_req: AuthenticatedRequest, res: Response) => {
+router.post('/init-model', authMiddleware, async (_req: AuthenticatedRequest, res: Response) => {
   res.status(200).json({
     status: "Model service assumed ready (container auto-init)",
     modelReady: true,
@@ -209,7 +272,7 @@ router.post("/init-model", authMiddleware, async (_req: AuthenticatedRequest, re
 '''
 
 AUTO = r'''
-router.post("/auto-label", authMiddleware, async (_req: AuthenticatedRequest, res: Response) => {
+router.post('/auto-label', authMiddleware, async (_req: AuthenticatedRequest, res: Response) => {
   res.status(501).json({
     error: "Auto-label API not exposed on this ACE-Step Gradio build",
     hint: "Label samples in the UI (caption + labeled) then Save dataset",
@@ -217,8 +280,9 @@ router.post("/auto-label", authMiddleware, async (_req: AuthenticatedRequest, re
 });
 '''
 
+# Match upstream quote style: single quotes on path
 SAVE = r'''
-router.post("/save-dataset", authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
+router.post('/save-dataset', authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const body = req.body || {};
     const datasetName = String(body.datasetName || body.dataset_name || "my_lora_dataset").trim() || "my_lora_dataset";
@@ -354,7 +418,7 @@ router.post("/save-dataset", authMiddleware, async (req: AuthenticatedRequest, r
 '''
 
 PREPROCESS = r'''
-router.post("/preprocess", authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
+router.post('/preprocess', authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const body = req.body || {};
     const datasetPath = body.datasetPath as string | undefined;
@@ -414,10 +478,17 @@ text, ok = replace_route(text, "/auto-label", AUTO)
 print("auto-label route", ok)
 
 text, ok = replace_route(text, "/save-dataset", SAVE)
-print("save-dataset route", ok)
+print("save-dataset route by path", ok)
 if not ok:
-    text, ok = replace_route(text, "/save_dataset", SAVE)
-    print("save_dataset route", ok)
+    text, ok = replace_route_containing(text, "/v1/dataset/save", SAVE)
+    print("save-dataset route by /v1/dataset/save marker", ok)
+if not ok:
+    text, ok = replace_route_containing(text, "Save dataset error", SAVE)
+    print("save-dataset route by error log marker", ok)
+if not ok:
+    # Last resort: append our route (Express uses first match — may not win)
+    text = text + "\n\n" + SAVE + "\n"
+    print("WARNING: appended save-dataset route at end of file")
 
 text, ok = replace_route(text, "/preprocess", PREPROCESS)
 print("preprocess", ok)
@@ -433,16 +504,18 @@ if "init_service_wrapper" in text:
     )
     print("rewrote leftover init_service_wrapper call sites")
 
-# Ensure fs/promises imports for save-dataset
-has_fs_promises = ("from 'fs/promises'" in text) or ('from "fs/promises"' in text)
-if not has_fs_promises:
+# Ensure fs/promises imports
+if "from 'fs/promises'" not in text and 'from "fs/promises"' not in text:
     text = "import { readFile, writeFile, mkdir } from 'fs/promises';\n" + text
     print("added fs/promises import")
-else:
-    # Ensure named imports include what we need
-    if "writeFile" not in text.split("from 'fs/promises'")[0] and "writeFile" not in text[:800]:
-        text = "import { readFile, writeFile, mkdir } from 'fs/promises';\n" + text
-        print("added fs/promises import (ensure writeFile)")
+
+# Hard guarantees for this fork
+if "/v1/dataset/save" in text:
+    print("ERROR: /v1/dataset/save still present after patch", file=sys.stderr)
+    sys.exit(1)
+if "[Training] Saved dataset" not in text:
+    print("ERROR: local save-dataset handler not injected", file=sys.stderr)
+    sys.exit(1)
 
 training.write_text(text)
-print("OK training.ts patched")
+print("OK training.ts patched — save is local filesystem")
