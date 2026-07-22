@@ -50,7 +50,6 @@ function normalizeTrainingPath(input: string | undefined | null, fallback: strin
   if (s === "./lora_output" || s === "lora_output") s = "/app/lora_output";
   if (!s.startsWith("/") && !s.startsWith("./")) s = path.posix.join("/app/datasets", s);
   if (s.startsWith("./")) s = path.posix.join("/app", s.slice(2));
-  // Force dataset JSON under shared volume
   if (s.endsWith(".json") && !s.startsWith("/app/datasets")) {
     s = path.posix.join("/app/datasets", path.posix.basename(s));
   }
@@ -218,7 +217,6 @@ router.post("/auto-label", authMiddleware, async (_req: AuthenticatedRequest, re
 });
 '''
 
-# Local save — Gradio state + /v1/dataset/save are unavailable from ace-step-ui
 SAVE = r'''
 router.post("/save-dataset", authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
   try {
@@ -232,7 +230,6 @@ router.post("/save-dataset", authMiddleware, async (req: AuthenticatedRequest, r
     if (!resolvedPath.endsWith(".json")) {
       resolvedPath = path.posix.join("/app/datasets", `${safeName}.json`);
     }
-    // Always land under shared datasets volume
     if (!resolvedPath.startsWith("/app/datasets")) {
       resolvedPath = path.posix.join("/app/datasets", path.posix.basename(resolvedPath));
     }
@@ -241,10 +238,8 @@ router.post("/save-dataset", authMiddleware, async (req: AuthenticatedRequest, r
     const uploadDir = path.posix.join(uploadsRoot, safeName);
     const audioExt = new Set([".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac", ".opus"]);
 
-    // Prefer explicit samples from client
     let samples: any[] = Array.isArray(body.samples) ? body.samples : [];
 
-    // Merge / fallback: existing JSON
     let existing: any = null;
     try {
       if (existsSync(resolvedPath)) {
@@ -257,7 +252,6 @@ router.post("/save-dataset", authMiddleware, async (req: AuthenticatedRequest, r
       samples = existing.samples;
     }
 
-    // Fallback: scan upload folder for audio files
     if (!samples.length && existsSync(uploadDir)) {
       const { readdirSync } = await import("fs");
       const files = readdirSync(uploadDir).filter((f: string) => audioExt.has(path.extname(f).toLowerCase()));
@@ -291,7 +285,6 @@ router.post("/save-dataset", authMiddleware, async (req: AuthenticatedRequest, r
       return;
     }
 
-    // Normalize samples for ACE-Step DatasetBuilder JSON
     const normalized = samples.map((s: any, i: number) => {
       const filename = s.filename || s.name || path.posix.basename(String(s.audio_path || s.audioPath || `track_${i}`));
       let audioPath = String(s.audio_path || s.audioPath || path.posix.join(uploadDir, filename));
@@ -325,7 +318,6 @@ router.post("/save-dataset", authMiddleware, async (req: AuthenticatedRequest, r
       };
     });
 
-    // Force labeled if every sample still false but user clicked Save (training requires it)
     const anyLabeled = normalized.some((s: any) => s.labeled);
     if (!anyLabeled) {
       for (const s of normalized) s.labeled = true;
@@ -386,7 +378,6 @@ router.post("/preprocess", authMiddleware, async (req: AuthenticatedRequest, res
     } catch (e) {
       console.warn("[Training] stage script", e);
     }
-    // Prefer repo script baked into image under /tmp if present
     const baked = "/tmp/preprocess_dataset_xpu.py";
     const scriptToRun = existsSync(sharedScript) ? sharedScript : (existsSync(baked) ? baked : sharedScript);
     const { execFile } = await import("child_process");
@@ -425,7 +416,6 @@ print("auto-label route", ok)
 text, ok = replace_route(text, "/save-dataset", SAVE)
 print("save-dataset route", ok)
 if not ok:
-    # try alternate path spelling
     text, ok = replace_route(text, "/save_dataset", SAVE)
     print("save_dataset route", ok)
 
@@ -443,16 +433,16 @@ if "init_service_wrapper" in text:
     )
     print("rewrote leftover init_service_wrapper call sites")
 
-# Ensure readFile/writeFile imports if missing
-if "readFile" in text and "from 'fs/promises'" not in text and 'from "fs/promises"' not in text:
-    if "from 'fs'" in text or 'from "fs"' in text:
-        text = text.replace(
-            "import { existsSync", "import { existsSync, readFileSync",
-        )
+# Ensure fs/promises imports for save-dataset
+has_fs_promises = ("from 'fs/promises'" in text) or ('from "fs/promises"' in text)
+if not has_fs_promises:
     text = "import { readFile, writeFile, mkdir } from 'fs/promises';\n" + text
-elif "writeFile" in SAVE and "writeFile" not in text.split("router.post("/save-dataset")[0]:
-    if "from 'fs/promises'" not in text and 'from "fs/promises"' not in text:
+    print("added fs/promises import")
+else:
+    # Ensure named imports include what we need
+    if "writeFile" not in text.split("from 'fs/promises'")[0] and "writeFile" not in text[:800]:
         text = "import { readFile, writeFile, mkdir } from 'fs/promises';\n" + text
+        print("added fs/promises import (ensure writeFile)")
 
 training.write_text(text)
 print("OK training.ts patched")
