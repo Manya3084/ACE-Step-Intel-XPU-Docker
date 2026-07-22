@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Patch training.ts — XPU paths, safe Gradio, local save-dataset, docker preprocess."""
+"""Patch training.ts — XPU paths, soft init-model, local save-dataset, docker preprocess."""
 from pathlib import Path
 import re
 import sys
@@ -26,13 +26,21 @@ HELPER = r'''
 /** ACE-Step-Intel-XPU-Docker training helpers */
 const __aceDirname = path.dirname(fileURLToPath(import.meta.url));
 
+// Endpoints that do not exist (or must not be called) on gradio-api XPU builds.
+// For *init* names we return ok:true soft success so UI does not see 502.
 const GRADIO_ENDPOINT_BLACKLIST = new Set([
   "/init_service_wrapper",
   "init_service_wrapper",
+  "/__blacklisted_init_service_wrapper",
   "/auto_label_all",
   "auto_label_all",
   "/auto_label",
   "auto_label",
+]);
+
+const GRADIO_SOFT_SUCCESS = new Set([
+  "/init_service_wrapper",
+  "init_service_wrapper",
   "/__blacklisted_init_service_wrapper",
 ]);
 
@@ -64,6 +72,17 @@ async function safeGradioPredict(
   const ep0 = endpoint.startsWith("/") ? endpoint : "/" + endpoint;
 
   if (GRADIO_ENDPOINT_BLACKLIST.has(endpoint) || GRADIO_ENDPOINT_BLACKLIST.has(ep0)) {
+    if (GRADIO_SOFT_SUCCESS.has(endpoint) || GRADIO_SOFT_SUCCESS.has(ep0)) {
+      console.warn("[Training] Soft-success for blacklisted init endpoint", ep0);
+      return {
+        ok: true,
+        data: [
+          "Model service assumed ready (container auto-init on acestep-xpu)",
+          true,
+        ],
+        endpoint: ep0,
+      };
+    }
     console.warn("[Training] Skipping blacklisted Gradio endpoint", ep0);
     return {
       ok: false,
@@ -201,11 +220,9 @@ def replace_route(src: str, path: str, new_body: str):
     return src, False
 
 def replace_route_containing(src: str, marker: str, new_body: str):
-    """Find router.post whose body contains marker and replace whole route."""
     idx = src.find(marker)
     if idx < 0:
         return src, False
-    # walk back to router.post
     start = src.rfind("router.post", 0, idx)
     if start < 0:
         return src, False
@@ -262,6 +279,9 @@ def replace_route_containing(src: str, marker: str, new_body: str):
 
 INIT = r'''
 router.post('/init-model', authMiddleware, async (_req: AuthenticatedRequest, res: Response) => {
+  // XPU Docker: models are loaded by acestep-xpu entrypoint (--init_service).
+  // There is no Gradio /init_service_wrapper on this build — always soft-succeed.
+  console.log("[Training] init-model soft success (acestep-xpu auto-init)");
   res.status(200).json({
     status: "Model service assumed ready (container auto-init)",
     modelReady: true,
@@ -280,7 +300,6 @@ router.post('/auto-label', authMiddleware, async (_req: AuthenticatedRequest, re
 });
 '''
 
-# Match upstream quote style: single quotes on path
 SAVE = r'''
 router.post('/save-dataset', authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
   try {
@@ -471,8 +490,21 @@ router.post('/preprocess', authMiddleware, async (req: AuthenticatedRequest, res
 });
 '''
 
+# --- init-model: force soft success ---
 text, ok = replace_route(text, "/init-model", INIT)
-print("init-model route", ok)
+print("init-model route by path", ok)
+if not ok:
+    text, ok = replace_route(text, "/init_model", INIT)
+    print("init_model route by path", ok)
+if not ok:
+    text, ok = replace_route_containing(text, "init_service_wrapper", INIT)
+    print("init route by init_service_wrapper marker", ok)
+if not ok:
+    text, ok = replace_route_containing(text, "Initialize model", INIT)
+    print("init route by Initialize model marker", ok)
+if not ok:
+    text = text + "\n\n" + INIT + "\n"
+    print("WARNING: appended init-model route at end")
 
 text, ok = replace_route(text, "/auto-label", AUTO)
 print("auto-label route", ok)
@@ -486,13 +518,13 @@ if not ok:
     text, ok = replace_route_containing(text, "Save dataset error", SAVE)
     print("save-dataset route by error log marker", ok)
 if not ok:
-    # Last resort: append our route (Express uses first match — may not win)
     text = text + "\n\n" + SAVE + "\n"
     print("WARNING: appended save-dataset route at end of file")
 
 text, ok = replace_route(text, "/preprocess", PREPROCESS)
 print("preprocess", ok)
 
+# Any leftover init_service_wrapper predict → soft blacklist name
 if "init_service_wrapper" in text:
     text = text.replace(
         "await safeGradioPredict('/init_service_wrapper'",
@@ -504,18 +536,19 @@ if "init_service_wrapper" in text:
     )
     print("rewrote leftover init_service_wrapper call sites")
 
-# Ensure fs/promises imports
 if "from 'fs/promises'" not in text and 'from "fs/promises"' not in text:
     text = "import { readFile, writeFile, mkdir } from 'fs/promises';\n" + text
     print("added fs/promises import")
 
-# Hard guarantees for this fork
 if "/v1/dataset/save" in text:
     print("ERROR: /v1/dataset/save still present after patch", file=sys.stderr)
     sys.exit(1)
 if "[Training] Saved dataset" not in text:
     print("ERROR: local save-dataset handler not injected", file=sys.stderr)
     sys.exit(1)
+if "Model service assumed ready" not in text:
+    print("ERROR: soft init-model not injected", file=sys.stderr)
+    sys.exit(1)
 
 training.write_text(text)
-print("OK training.ts patched — save is local filesystem")
+print("OK training.ts patched — init soft, save local")
