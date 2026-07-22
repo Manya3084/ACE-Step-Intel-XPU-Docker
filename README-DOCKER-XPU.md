@@ -28,6 +28,8 @@ Phone / browser  →  :3003  (ace-step-ui)
                     Intel Arc via /dev/dri
 ```
 
+Shared volumes (compose): `./datasets`, `./lora_output`, `./checkpoints`.
+
 ---
 
 ## Quick start (OMV / generic Linux)
@@ -53,6 +55,63 @@ First boot downloads models (several minutes).
 - Docker + Compose
 - `/dev/dri` passed into the container
 - Disk for `./checkpoints` (~10GB+)
+
+---
+
+## LoRA training (XPU) — Save → Preprocess → Train
+
+Verified on **Arc A770 16GB**.
+
+### 1. Save dataset (UI)
+
+- Upload audio under the Training tab (files land in `/app/datasets/uploads/<name>/`).
+- Dataset name e.g. `my_lora_dataset`.
+- **Save dataset** writes `/app/datasets/<name>.json` via a **local filesystem route** (upstream `/v1/dataset/save` is not available in this stack).
+
+### 2. Convert to WAV if needed
+
+TorchCodec is **not** used on pure XPU (CUDA `libnvrtc`). Prefer **WAV 48 kHz stereo**:
+
+```bash
+docker exec acestep-xpu bash -c '
+  cd /app/datasets/uploads/my_lora_dataset
+  for f in *.mp3 *.flac; do
+    [ -f "$f" ] || continue
+    ffmpeg -y -i "$f" -ar 48000 -ac 2 "${f%.*}.wav"
+  done
+'
+```
+
+`soundfile` + `ffmpeg` are baked into `Dockerfile.xpu`.
+
+### 3. Preprocess → `.pt` tensors
+
+Script: `docker/ui-patches/preprocess_dataset.py` (copied to `/app/datasets/_tools/preprocess_dataset.py` on start).
+
+```bash
+docker exec -w /app acestep-xpu bash -c '
+  . /app/.venv/bin/activate
+  export ACESTEP_CHECKPOINTS=/app/checkpoints PYTORCH_DEVICE=xpu ACESTEP_OFFLOAD_TO_CPU=true
+  export ACESTEP_CONFIG_PATH=acestep-v15-turbo
+  python3 /app/datasets/_tools/preprocess_dataset.py \
+    --dataset /app/datasets/my_lora_dataset.json \
+    --output /app/datasets/preprocessed_tensors \
+    --max-duration 240 --json
+'
+```
+
+Expect `.pt` files + `manifest.json` under `/app/datasets/preprocessed_tensors`.
+
+### 4. Train
+
+In the UI Training tab:
+
+| Field | Value |
+|-------|--------|
+| Tensor dir | `/app/datasets/preprocessed_tensors` |
+| LoRA output | `/app/lora_output` |
+| Batch | `1` (A770 + offload) |
+| Rank | start `16–32` |
 
 ---
 
@@ -186,11 +245,12 @@ Then: `docker compose -f docker-compose.xpu.yml up -d --force-recreate acestep-x
 | Package | Notes |
 |---------|--------|
 | PyTorch **nightly XPU** | Forced last via `download.pytorch.org/whl/nightly/xpu` |
-| **torchao ≥ 0.16** | XPU index + `--no-deps` (PEFT/training; avoids CUDA torch overwrite) |
-| **bitsandbytes ≥ 0.48** | `--no-deps` (8-bit optimizers; clears AdamW fallback warning) |
-| **lycoris-lora** | Enables LoKr train/infer |
+| **torchao ≥ 0.16** | XPU index + `--no-deps` (PEFT/training) |
+| **bitsandbytes ≥ 0.48** | `--no-deps` |
+| **lycoris-lora** | LoKr |
+| **soundfile + ffmpeg** | Audio load / convert — **not** TorchCodec |
 
-Do **not** install generic CUDA `torchao`/`bitsandbytes` without `--no-deps` — that can replace `+xpu` torch.
+Do **not** install generic CUDA `torchao`/`bitsandbytes`/`torchcodec` without care — that can break `+xpu` torch or pull `libnvrtc`.
 
 **IPEX** is not used: native PyTorch XPU is preferred (IPEX is EOL).
 
@@ -203,6 +263,8 @@ Do **not** install generic CUDA `torchao`/`bitsandbytes` without `--no-deps` —
 | XPU generation on Arc A770 16GB | Working |
 | ace-step-ui → Gradio songs | Working |
 | AI Format (slow first call with offload) | Working |
+| **Save dataset (local JSON)** | Working |
+| **Preprocess → `.pt` (soundfile)** | Working |
 | torchao ≥0.16 + bitsandbytes + lycoris in image | Baked in Dockerfile.xpu |
 | Mobile-friendly UI | Better than plain Gradio |
 | Per-user settings in SQLite (`ui_data`) | API ready |
@@ -229,9 +291,11 @@ docker restart acestep-xpu
 
 | File | Purpose |
 |------|---------|
-| `Dockerfile.xpu` | Intel packages, XPU PyTorch, torchao/bnb/lycoris, Gradio+API |
-| `Dockerfile.ui` | ace-step-ui patches, settings API, restart button, SSE console |
-| `docker-compose.xpu.yml` | Both services, `/dev/dri`, docker.sock, ports |
+| `Dockerfile.xpu` | Intel packages, XPU PyTorch, torchao/bnb/lycoris/soundfile, Gradio+API |
+| `Dockerfile.ui` | ace-step-ui patches (incl. local save-dataset), settings, restart, SSE |
+| `docker/ui-patches/preprocess_dataset.py` | XPU LoRA preprocess helper |
+| `docker/ui-patches/training-docker.py` | Training route patches (save/preprocess/init) |
+| `docker-compose.xpu.yml` | Both services, `/dev/dri`, shared volumes, ports |
 | `.env.xpu.example` | A770-oriented defaults |
 | `README-DOCKER-XPU.md` | This document |
 
@@ -245,9 +309,13 @@ docker restart acestep-xpu
 
 **Format spins a long time** — first 1.7B+offload Format can take 1–3 minutes.
 
-**Restart button / log console** — log in on the UI first (JWT in localStorage).
+**Save dataset Not Found** — rebuild UI so `training-docker.py` replaces `/v1/dataset/save` with local write. Image must contain `[Training] Saved dataset` and **not** `/v1/dataset/save`.
 
-**Restart button fails** — ensure `docker.sock` mount, `docker` CLI in UI image, and permissions on the host socket.
+**Preprocess TorchCodec / libnvrtc** — convert to WAV; use the soundfile-patched preprocess script (do not rely on TorchCodec on XPU).
+
+**Preprocess 0/N failed** — ensure samples are labeled, paths exist, `genre_ratio` is a number, WAVs present.
+
+**Restart button / log console** — log in on the UI first (JWT in localStorage).
 
 **`pull access denied` for local images** — always `up --build` (images are local).
 
