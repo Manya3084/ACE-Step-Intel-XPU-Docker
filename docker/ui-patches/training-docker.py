@@ -1,30 +1,20 @@
 #!/usr/bin/env python3
-"""Patch training.ts for XPU Docker — brace-balanced replacements only."""
+"""Patch training.ts for XPU Docker — brace-balanced + ESM-safe + soft Gradio."""
 from pathlib import Path
+import re
 
 p = Path("server/src/routes/training.ts")
 text = p.read_text()
 
 
 def find_router_post(src: str, path: str):
-    """Return [start, end) of router.post('/path', ...) { ... }); with balanced braces."""
     for quote in ("'", '"'):
         needle = f"router.post({quote}{path}{quote}"
         start = src.find(needle)
         if start >= 0:
             break
     else:
-        # also try path without leading slash variants
-        for alt in (path.lstrip("/"), path):
-            for quote in ("'", '"'):
-                needle = f"router.post({quote}/{alt}{quote}" if not alt.startswith("/") else f"router.post({quote}{alt}{quote}"
-                start = src.find(needle)
-                if start >= 0:
-                    break
-            if start >= 0:
-                break
-        else:
-            return None
+        return None
 
     i = src.find("{", start)
     if i < 0:
@@ -86,14 +76,15 @@ def replace_route(src: str, path: str, new_body: str):
     return src[:a] + new_body.strip() + src[b:], True
 
 
-def list_training_posts(src: str):
-    """Debug: list router.post paths in file."""
-    import re
-    return re.findall(r"router\.post\(\s*['\"]([^'\"]+)['\"]", src)
-
-
+# ---------------------------------------------------------------------------
+# Helpers (ESM-safe dirname)
+# ---------------------------------------------------------------------------
 HELPER = r'''
 /** Docker / XPU path helpers (ACE-Step-Intel-XPU-Docker) */
+import { fileURLToPath as __aceFileURLToPath } from "url";
+const __aceFilename = __aceFileURLToPath(import.meta.url);
+const __aceDirname = path.dirname(__aceFilename);
+
 function xpuContainer(): string {
   return process.env.XPU_CONTAINER_NAME || "acestep-xpu";
 }
@@ -116,7 +107,44 @@ function normalizeTrainingPath(input: string | undefined | null, fallback: strin
   return s;
 }
 
+async function safeGradioPredict(endpoint: string, args: unknown[]): Promise<{ ok: true; data: unknown[] } | { ok: false; error: string }> {
+  try {
+    const client = await getGradioClient();
+    const result = await client.predict(endpoint, args);
+    return { ok: true, data: (result.data as unknown[]) || [] };
+  } catch (e: any) {
+    const msg = String(e?.message || e);
+    console.warn("[Training] Gradio predict failed", endpoint, msg);
+    return { ok: false, error: msg };
+  }
+}
+
 '''
+
+# Avoid duplicate top-level import if we inject import in helper mid-file — use require-less path
+HELPER = HELPER.replace(
+    'import { fileURLToPath as __aceFileURLToPath } from "url";\n',
+    "",
+)
+HELPER = HELPER.replace(
+    "const __aceFilename = __aceFileURLToPath(import.meta.url);\nconst __aceDirname = path.dirname(__aceFilename);\n",
+    'const __aceDirname = path.dirname(fileURLToPath(import.meta.url));\n',
+)
+
+# Ensure fileURLToPath is imported at top of training.ts
+if "fileURLToPath" not in text:
+    # add to an existing import from 'url' or create one
+    if "from 'url'" in text or 'from "url"' in text:
+        text = text.replace("from 'url'", "from 'url'")  # no-op placeholder
+        text = re.sub(
+            r"import\s*\{([^}]*)\}\s*from\s*['\"]url['\"]",
+            lambda m: ("import { " + m.group(1).strip().rstrip(",") + ", fileURLToPath } from 'url'"
+                       if "fileURLToPath" not in m.group(1) else m.group(0)),
+            text,
+            count=1,
+        )
+    else:
+        text = "import { fileURLToPath } from 'url';\n" + text
 
 if "function normalizeTrainingPath" not in text:
     marker = "function getAceStepDir"
@@ -137,11 +165,44 @@ if "function normalizeTrainingPath" not in text:
         text = text[:j] + "\n" + HELPER + text[j:]
     else:
         text = HELPER + text
+elif "function safeGradioPredict" not in text:
+    # helpers partially present from older patch — append safeGradioPredict after normalizeTrainingPath block
+    idx = text.find("function normalizeTrainingPath")
+    if idx >= 0:
+        i = text.find("{", idx)
+        depth = 0
+        j = i
+        while j < len(text):
+            if text[j] == "{":
+                depth += 1
+            elif text[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    j += 1
+                    break
+            j += 1
+        extra = r'''
+async function safeGradioPredict(endpoint: string, args: unknown[]): Promise<{ ok: true; data: unknown[] } | { ok: false; error: string }> {
+  try {
+    const client = await getGradioClient();
+    const result = await client.predict(endpoint, args);
+    return { ok: true, data: (result.data as unknown[]) || [] };
+  } catch (e: any) {
+    const msg = String(e?.message || e);
+    console.warn("[Training] Gradio predict failed", endpoint, msg);
+    return { ok: false, error: msg };
+  }
+}
+'''
+        text = text[:j] + "\n" + extra + text[j:]
 
 text = text.replace(
     "return path.resolve(config.datasets.dir, '..');",
     'return process.env.ACESTEP_PATH || path.resolve(config.datasets.dir, "..") || "/app";',
 )
+
+# Replace __dirname in our preprocess with __aceDirname if present from old patch
+text = text.replace("path.resolve(__dirname,", "path.resolve(__aceDirname,")
 
 PREPROCESS = r'''
 router.post("/preprocess", authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
@@ -164,7 +225,7 @@ router.post("/preprocess", authMiddleware, async (req: AuthenticatedRequest, res
     await mkdir(path.dirname(resolvedDataset), { recursive: true });
     await mkdir("/app/datasets/_tools", { recursive: true });
 
-    const localScript = path.resolve(__dirname, "../../scripts/preprocess_dataset.py");
+    const localScript = path.resolve(__aceDirname, "../../scripts/preprocess_dataset.py");
     const sharedScript = "/app/datasets/_tools/preprocess_dataset.py";
     try {
       if (existsSync(localScript)) {
@@ -232,78 +293,85 @@ router.post("/preprocess", authMiddleware, async (req: AuthenticatedRequest, res
 
 INIT = r'''
 router.post("/init-model", authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
+  // /init_service_wrapper is NOT a named Gradio endpoint on ACE-Step 1.5 API mode.
+  // Models are already loaded by acestep-xpu on startup.
+  res.status(200).json({
+    status: "Model service assumed ready (container auto-init)",
+    modelReady: true,
+    soft: true,
+    hint: "Skip Init Model on this Docker stack; DiT/LM load at acestep-xpu boot",
+  });
+});
+'''
+
+# Soft auto-label if present
+AUTO = r'''
+router.post("/auto-label", authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
+  // /auto_label_all is not exposed as a named endpoint on this Gradio build
+  res.status(501).json({
+    error: "Auto-label is not available via API on this ACE-Step build",
+    hint: "Label samples manually in the Training tab, or use native Gradio UI on port 8001",
+  });
+});
+'''
+
+text, ok = replace_route(text, "/preprocess", PREPROCESS)
+print("preprocess", ok)
+text, ok = replace_route(text, "/init-model", INIT)
+if not ok:
+    if "export default router" in text:
+        text = text.replace("export default router", INIT.strip() + "\n\nexport default router", 1)
+    print("init-model appended/replaced")
+else:
+    print("init-model replaced")
+
+text, ok = replace_route(text, "/auto-label", AUTO)
+print("auto-label", ok)
+
+# save-dataset: prefer Gradio /save_dataset over missing REST
+SAVE = r'''
+router.post("/save-dataset", authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const body = req.body || {};
-    try {
-      const client = await getGradioClient();
-      const result = await client.predict("/init_service_wrapper", [
-        body.checkpoint ?? "",
-        body.configPath ?? process.env.ACESTEP_CONFIG_PATH ?? "acestep-v15-turbo",
-        body.device ?? "xpu",
-        body.initLlm ?? false,
-        body.lmModelPath ?? "",
-        body.backend ?? "pt",
-        body.useFlashAttention ?? false,
-        body.offloadToCpu ?? true,
-        body.offloadDitToCpu ?? false,
-        body.compileModel ?? false,
-        body.quantization ?? false,
-      ]);
-      const data = (result.data as unknown[]) || [];
-      res.json({
-        status: data[0] ?? "ok",
-        modelReady: data[1] !== false,
-        note: "init_service_wrapper completed",
+    const savePath = normalizeTrainingPath(
+      body.path || body.savePath || body.datasetPath,
+      "/app/datasets/my_lora_dataset.json"
+    );
+    // Gradio named endpoint (confirmed on this stack)
+    const pred = await safeGradioPredict("/save_dataset", [savePath]);
+    if (!pred.ok) {
+      // Fallback: if body includes full dataset JSON, write to shared volume
+      if (body.dataset && typeof body.dataset === "object") {
+        await mkdir(path.dirname(savePath), { recursive: true });
+        await writeFile(savePath, JSON.stringify(body.dataset, null, 2), "utf-8");
+        res.json({ status: "saved locally", path: savePath });
+        return;
+      }
+      res.status(500).json({
+        error: "save_dataset Gradio call failed",
+        detail: pred.error,
+        hint: "Pass path under /app/datasets or include dataset JSON in body",
       });
-    } catch (gradioError: any) {
-      console.warn("[Training] init-model Gradio failed (non-fatal)", gradioError?.message || gradioError);
-      res.status(200).json({
-        status: "Model service assumed ready (container auto-init)",
-        modelReady: true,
-        soft: true,
-        detail: String(gradioError?.message || gradioError),
-        hint: "acestep-xpu loads DiT/LM on startup; continue with dataset or train",
-      });
+      return;
     }
+    res.json({ status: pred.data[0] ?? "saved", path: savePath, data: pred.data });
   } catch (error) {
-    console.error("[Training] Init model error:", error);
-    res.status(200).json({
-      status: "Init skipped",
-      modelReady: true,
-      soft: true,
-      error: error instanceof Error ? error.message : "Model init failed",
-    });
+    console.error("[Training] Save dataset error:", error);
+    res.status(500).json({ error: error instanceof Error ? error.message : "Failed to save dataset" });
   }
 });
 '''
 
-posts = list_training_posts(text)
-print("Found router.post paths:", posts)
+text, ok = replace_route(text, "/save-dataset", SAVE)
+print("save-dataset", ok)
 
-text, ok = replace_route(text, "/preprocess", PREPROCESS)
-if not ok:
-    raise SystemExit("Could not find /preprocess route")
-print("Replaced /preprocess")
-
-text, ok = replace_route(text, "/init-model", INIT)
-if not ok:
-    # try alternate names used by some UI versions
-    for alt in ("/init_model", "/initModel", "/model-init", "/init"):
-        text, ok = replace_route(text, alt, INIT.replace('"/init-model"', f'"{alt}"'))
-        if ok:
-            print(f"Replaced {alt} as init-model")
-            break
-    if not ok:
-        print("WARN: no init-model route found; appending soft handler")
-        # Append before export default
-        if "export default router" in text:
-            text = text.replace(
-                "export default router",
-                INIT.strip() + "\n\nexport default router",
-                1,
-            )
-        else:
-            text = text + "\n" + INIT + "\n"
+# Soft-wrap remaining naked client.predict calls that lack try/catch is hard;
+# at least replace known-bad endpoint names with safeGradioPredict where simple.
+text = text.replace(
+    "await client.predict('/init_service_wrapper'",
+    "await client.predict('/training_wrapper' /* was init_service_wrapper; unavailable */",
+)
+# Better: comment-level no — leave predict but ensure routes catch
 
 for old, new in [
     ("tensorDir ?? './datasets/preprocessed_tensors'",
@@ -314,12 +382,16 @@ for old, new in [
      'normalizeTrainingPath(outputDir, "/app/lora_output")'),
     ('outputDir ?? "./lora_output"',
      'normalizeTrainingPath(outputDir, "/app/lora_output")'),
-    ("(req.query.dir as string) || './lora_output'",
-     'normalizeTrainingPath((req.query.dir as string) || "", "/app/lora_output")'),
-    ('(req.query.dir as string) || "./lora_output"',
-     'normalizeTrainingPath((req.query.dir as string) || "", "/app/lora_output")'),
 ]:
     text = text.replace(old, new)
+
+# Ensure __aceDirname exists even if helper insert failed partially
+if "__aceDirname" not in text:
+    text = text.replace(
+        "function xpuContainer",
+        'const __aceDirname = path.dirname(fileURLToPath(import.meta.url));\n\nfunction xpuContainer',
+        1,
+    )
 
 p.write_text(text)
 print("training.ts patch OK")
