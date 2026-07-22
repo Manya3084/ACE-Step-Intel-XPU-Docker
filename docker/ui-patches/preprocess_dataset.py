@@ -1,7 +1,16 @@
 #!/usr/bin/env python3
-"""Standalone dataset preprocessor for ACE-Step LoRA training (XPU Docker).
+"""Preprocess ACE-Step dataset JSON -> .pt tensors (Intel XPU Docker).
 
-Uses DatasetBuilder.load_dataset() + AceStepHandler.initialize_service().
+- DatasetBuilder.load_dataset() (not load_from_dict)
+- AceStepHandler.initialize_service()
+- soundfile audio load (TorchCodec is CUDA-only / needs libnvrtc)
+- Coerces genre_ratio to float; forces samples labeled
+
+Usage:
+  python preprocess_dataset.py \\
+    --dataset /app/datasets/my_lora_dataset.json \\
+    --output /app/datasets/preprocessed_tensors \\
+    --max-duration 240 --json
 """
 from __future__ import annotations
 
@@ -23,10 +32,26 @@ def _ensure_labeled(dataset_path: Path) -> dict:
         if not (s.get("lyrics") or "").strip():
             s["lyrics"] = "[Instrumental]"
         ap = s.get("audio_path") or ""
-        if ap and not Path(ap).is_file():
-            raise FileNotFoundError(f"audio missing: {ap}")
+        if not ap:
+            continue
+        p = Path(ap)
+        # Prefer companion .wav when original is mp3/flac (soundfile-friendly)
+        wav = p.with_suffix(".wav")
+        if wav.is_file():
+            s["audio_path"] = str(wav)
+            s["filename"] = wav.name
+            p = wav
+        if not p.is_file():
+            raise FileNotFoundError(f"audio missing: {p}")
     data["samples"] = samples
     meta = data.get("metadata") or {}
+    gr = meta.get("genre_ratio", 0)
+    if isinstance(gr, dict):
+        gr = gr.get("ratio", gr.get("value", 0)) or 0
+    try:
+        meta["genre_ratio"] = float(gr)
+    except Exception:
+        meta["genre_ratio"] = 0.0
     meta["num_samples"] = len(samples)
     meta.setdefault("name", dataset_path.stem)
     data["metadata"] = meta
@@ -34,23 +59,48 @@ def _ensure_labeled(dataset_path: Path) -> dict:
     return data
 
 
+def _patch_soundfile_audio_load() -> None:
+    """TorchCodec fails on pure XPU (libnvrtc). Use soundfile instead."""
+    import torch
+    import soundfile as sf
+    import acestep.training.dataset_builder_modules.preprocess_audio as pa
+    import acestep.training.dataset_builder_modules.preprocess as preprocess_mod
+
+    def load_audio_stereo(audio_path, target_sample_rate=48000, max_duration=240.0):
+        data, sr = sf.read(str(audio_path), always_2d=True)
+        audio = torch.from_numpy(data.T).float()
+        if audio.shape[0] == 1:
+            audio = audio.repeat(2, 1)
+        elif audio.shape[0] > 2:
+            audio = audio[:2]
+        if sr != target_sample_rate:
+            audio = torch.nn.functional.interpolate(
+                audio.unsqueeze(0),
+                size=int(audio.shape[1] * target_sample_rate / float(sr)),
+                mode="linear",
+                align_corners=False,
+            ).squeeze(0)
+        max_len = int(max_duration * target_sample_rate)
+        if audio.shape[1] > max_len:
+            audio = audio[:, :max_len]
+        return audio, target_sample_rate
+
+    pa.load_audio_stereo = load_audio_stereo
+    preprocess_mod.load_audio_stereo = load_audio_stereo
+    print("[preprocess] patched load_audio_stereo -> soundfile", file=sys.stderr)
+
+
 def _init_dit_handler():
-    """Create AceStepHandler and call initialize_service with Docker paths."""
     from acestep.handler import AceStepHandler
 
-    project_root = os.environ.get("ACESTEP_PATH", "/app")
-    checkpoints = os.environ.get("ACESTEP_CHECKPOINTS", "/app/checkpoints")
-    # initialize_service accepts project_root that may be checkpoints dir
-    root = checkpoints if Path(checkpoints).is_dir() else project_root
-
-    config_path = (
+    root = os.environ.get("ACESTEP_CHECKPOINTS", "/app/checkpoints")
+    if not Path(root).is_dir():
+        root = os.environ.get("ACESTEP_PATH", "/app")
+    config_path = Path(
         os.environ.get("ACESTEP_CONFIG_PATH")
         or os.environ.get("ACESTEP_DIT_MODEL")
         or "acestep-v15-turbo"
-    )
-    # strip path if full path given
-    config_path = Path(config_path).name
-
+    ).name
     device = os.environ.get("PYTORCH_DEVICE") or os.environ.get("ACESTEP_DEVICE") or "xpu"
     offload = (os.environ.get("ACESTEP_OFFLOAD_TO_CPU", "true") or "true").lower() in (
         "1",
@@ -69,18 +119,18 @@ def _init_dit_handler():
         offload_to_cpu=offload,
         offload_dit_to_cpu=False,
     )
-    print(f"[preprocess] initialize_service: ok={ok} status={status}", file=sys.stderr)
+    print(f"[preprocess] initialize_service ok={ok} status={status}", file=sys.stderr)
     if not ok and getattr(h, "model", None) is None and getattr(h, "vae", None) is None:
         raise RuntimeError(f"initialize_service failed: {status}")
     return h
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Preprocess dataset to tensors for LoRA training")
-    parser.add_argument("--dataset", required=True, help="Path to dataset JSON file")
-    parser.add_argument("--output", required=True, help="Output directory for tensor files")
-    parser.add_argument("--max-duration", type=float, default=240.0, help="Max audio duration in seconds")
-    parser.add_argument("--json", action="store_true", help="Output JSON summary")
+    parser = argparse.ArgumentParser(description="Preprocess dataset to tensors for LoRA training (XPU)")
+    parser.add_argument("--dataset", required=True)
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--max-duration", type=float, default=240.0)
+    parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
     dataset_path = Path(args.dataset)
@@ -99,8 +149,15 @@ def main() -> int:
         print(json.dumps(err) if args.json else str(e))
         return 1
 
-    print(f"Loading dataset: {dataset_path}", file=sys.stderr)
+    try:
+        _patch_soundfile_audio_load()
+    except Exception as e:
+        err = {"ok": False, "error": f"soundfile patch failed: {e}"}
+        print(json.dumps(err) if args.json else str(e))
+        traceback.print_exc()
+        return 1
 
+    print(f"Loading dataset: {dataset_path}", file=sys.stderr)
     try:
         from acestep.training.dataset_builder import DatasetBuilder
     except Exception as e:
@@ -127,15 +184,22 @@ def main() -> int:
     for s in builder.samples:
         if hasattr(s, "labeled"):
             s.labeled = True
+    gr = getattr(builder.metadata, "genre_ratio", 0)
+    if isinstance(gr, dict):
+        gr = 0
+    try:
+        builder.metadata.genre_ratio = float(gr or 0)
+    except Exception:
+        builder.metadata.genre_ratio = 0.0
 
-    print(f"Initializing DiT handler for preprocess ({len(builder.samples)} samples)...", file=sys.stderr)
+    print(f"Initializing DiT handler ({len(builder.samples)} samples)...", file=sys.stderr)
     try:
         dit_handler = _init_dit_handler()
     except Exception as e:
         err = {
             "ok": False,
             "error": str(e),
-            "hint": "AceStepHandler.initialize_service failed; check /app/checkpoints and VRAM",
+            "hint": "AceStepHandler.initialize_service failed; check /app/checkpoints",
             "samples_loaded": len(builder.samples),
         }
         print(json.dumps(err) if args.json else str(e))
@@ -167,12 +231,12 @@ def main() -> int:
         "ok": True,
         "status": status,
         "count": len(paths) if paths else 0,
-        "paths": paths or [],
+        "paths": [str(p) for p in (paths or [])],
         "samples_loaded": len(builder.samples),
         "output": str(output_dir),
     }
     print(json.dumps(result) if args.json else status)
-    return 0
+    return 0 if result["count"] else 1
 
 
 if __name__ == "__main__":
