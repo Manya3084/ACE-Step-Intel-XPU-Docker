@@ -8,7 +8,7 @@ Run full-song local music generation on **Intel Arc GPUs** under **Linux Docker*
 |--|--|
 | **Upstream model** | [ace-step/ACE-Step-1.5](https://github.com/ace-step/ACE-Step-1.5) |
 | **This fork’s focus** | Linux Docker, Level Zero / XPU, ace-step-ui, Arc A/B/Pro settings |
-| **Verified** | Intel Arc **A770 16GB** on OMV — generate + AI Format |
+| **Verified** | Intel Arc **A770 16GB** on OMV — generate, AI Format, **Save dataset**, **preprocess → `.pt`** |
 | **Detailed guide** | **[README-DOCKER-XPU.md](./README-DOCKER-XPU.md)** |
 
 Upstream supports XPU on Windows and ships **NVIDIA CUDA Docker only**. This repository adds the missing path.
@@ -20,8 +20,6 @@ Upstream supports XPU on Windows and ships **NVIDIA CUDA Docker only**. This rep
 ```bash
 git clone https://github.com/Manya3084/ACE-Step-Intel-XPU-Docker.git
 cd ACE-Step-Intel-XPU-Docker
-# if your remote still uses the old fork name:
-# git clone https://github.com/Manya3084/ACE-Step-1.5.git
 
 cp .env.xpu.example .env
 # edit .env for your GPU (see GPU tables in README-DOCKER-XPU.md)
@@ -47,10 +45,11 @@ Host needs Intel Level Zero drivers and `/dev/dri` passed into the container.
 
 ## What you get
 
-- **Dockerfile.xpu** — Ubuntu + Intel GPU packages + PyTorch XPU nightly + Gradio `--enable-api`
-- **Dockerfile.ui** — [ace-step-ui](https://github.com/fspecii/ace-step-ui) with CORS, Gradio arg fixes, ffmpeg/ffprobe
-- **docker-compose.xpu.yml** — full stack for OMV / home servers
+- **Dockerfile.xpu** — Ubuntu + Intel GPU packages + PyTorch XPU nightly + Gradio `--enable-api` + **soundfile/ffmpeg** (no CUDA TorchCodec)
+- **Dockerfile.ui** — [ace-step-ui](https://github.com/fspecii/ace-step-ui) with CORS, local **Save dataset**, Gradio arg fixes, ffmpeg/ffprobe
+- **docker-compose.xpu.yml** — full stack + shared `datasets` / `lora_output` / `checkpoints`
 - **AI Format** via `/format_input` (threaded; works with CPU offload on 16GB)
+- **LoRA path** — Save JSON → preprocess helper → `.pt` tensors → train (see [README-DOCKER-XPU.md](./README-DOCKER-XPU.md))
 - **Settings tables** for Arc **A-series**, **B-series**, **Pro**, and **Flex** by VRAM
 
 Default profile (A770 16GB): `acestep-v15-turbo` + `acestep-5Hz-lm-1.7B` + CPU offload + `pt` backend.
@@ -61,7 +60,7 @@ Default profile (A770 16GB): `acestep-v15-turbo` + `acestep-5Hz-lm-1.7B` + CPU o
 
 | Doc | Contents |
 |-----|----------|
-| **[README-DOCKER-XPU.md](./README-DOCKER-XPU.md)** | Full setup, GPU recommendations, troubleshooting |
+| **[README-DOCKER-XPU.md](./README-DOCKER-XPU.md)** | Full setup, GPU recommendations, LoRA preprocess, troubleshooting |
 | **[FORK.md](./FORK.md)** | Short “why this fork exists” |
 | Upstream ACE-Step guides | Still under `docs/` (API, Gradio, install, etc.) |
 | Windows XPU (upstream-style) | [README-XPU.md](./README-XPU.md) |
