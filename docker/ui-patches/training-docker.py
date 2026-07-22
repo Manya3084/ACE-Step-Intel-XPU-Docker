@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Patch training.ts — blacklist missing Gradio names; never call them."""
+"""Patch training.ts — XPU paths, safe Gradio, local save-dataset, docker preprocess."""
 from pathlib import Path
 import re
 
@@ -50,6 +50,10 @@ function normalizeTrainingPath(input: string | undefined | null, fallback: strin
   if (s === "./lora_output" || s === "lora_output") s = "/app/lora_output";
   if (!s.startsWith("/") && !s.startsWith("./")) s = path.posix.join("/app/datasets", s);
   if (s.startsWith("./")) s = path.posix.join("/app", s.slice(2));
+  // Force dataset JSON under shared volume
+  if (s.endsWith(".json") && !s.startsWith("/app/datasets")) {
+    s = path.posix.join("/app/datasets", path.posix.basename(s));
+  }
   return s;
 }
 
@@ -209,28 +213,153 @@ AUTO = r'''
 router.post("/auto-label", authMiddleware, async (_req: AuthenticatedRequest, res: Response) => {
   res.status(501).json({
     error: "Auto-label API not exposed on this ACE-Step Gradio build",
-    hint: "Use Gradio UI :8001 or label samples manually",
+    hint: "Label samples in the UI (caption + labeled) then Save dataset",
   });
 });
 '''
 
-text, ok = replace_route(text, "/init-model", INIT)
-print("init-model route", ok)
+# Local save — Gradio state + /v1/dataset/save are unavailable from ace-step-ui
+SAVE = r'''
+router.post("/save-dataset", authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const body = req.body || {};
+    const datasetName = String(body.datasetName || body.dataset_name || "my_lora_dataset").trim() || "my_lora_dataset";
+    const safeName = datasetName.replace(/[^a-zA-Z0-9._-]+/g, "_");
+    let resolvedPath = normalizeTrainingPath(
+      body.savePath || body.save_path,
+      path.posix.join("/app/datasets", `${safeName}.json`)
+    );
+    if (!resolvedPath.endsWith(".json")) {
+      resolvedPath = path.posix.join("/app/datasets", `${safeName}.json`);
+    }
+    // Always land under shared datasets volume
+    if (!resolvedPath.startsWith("/app/datasets")) {
+      resolvedPath = path.posix.join("/app/datasets", path.posix.basename(resolvedPath));
+    }
 
-text, ok = replace_route(text, "/auto-label", AUTO)
-print("auto-label route", ok)
+    const uploadsRoot = process.env.DATASETS_UPLOADS_DIR || "/app/datasets/uploads";
+    const uploadDir = path.posix.join(uploadsRoot, safeName);
+    const audioExt = new Set([".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac", ".opus"]);
 
-# Any leftover init_service_wrapper predict calls -> still blacklisted
-if "init_service_wrapper" in text:
-    text = text.replace(
-        "await safeGradioPredict('/init_service_wrapper'",
-        "await safeGradioPredict('/__blacklisted_init_service_wrapper'",
-    )
-    text = text.replace(
-        'await safeGradioPredict("/init_service_wrapper"',
-        'await safeGradioPredict("/__blacklisted_init_service_wrapper"',
-    )
-    print("rewrote leftover init_service_wrapper call sites")
+    // Prefer explicit samples from client
+    let samples: any[] = Array.isArray(body.samples) ? body.samples : [];
+
+    // Merge / fallback: existing JSON
+    let existing: any = null;
+    try {
+      if (existsSync(resolvedPath)) {
+        existing = JSON.parse(await readFile(resolvedPath, "utf8"));
+      }
+    } catch {
+      existing = null;
+    }
+    if (!samples.length && existing?.samples?.length) {
+      samples = existing.samples;
+    }
+
+    // Fallback: scan upload folder for audio files
+    if (!samples.length && existsSync(uploadDir)) {
+      const { readdirSync } = await import("fs");
+      const files = readdirSync(uploadDir).filter((f: string) => audioExt.has(path.extname(f).toLowerCase()));
+      samples = files.map((filename: string, i: number) => ({
+        id: `sample_${i}_${filename.replace(/[^a-zA-Z0-9]+/g, "_").slice(0, 24)}`,
+        audio_path: path.posix.join(uploadDir, filename),
+        filename,
+        caption: body.defaultCaption || "instrumental, high quality music",
+        genre: body.defaultGenre || "",
+        lyrics: "[Instrumental]",
+        raw_lyrics: "",
+        formatted_lyrics: "",
+        bpm: null,
+        keyscale: "",
+        timesignature: "",
+        duration: null,
+        language: "instrumental",
+        is_instrumental: true,
+        custom_tag: body.customTag || "",
+        labeled: true,
+        prompt_override: null,
+      }));
+    }
+
+    if (!samples.length) {
+      res.status(400).json({
+        error: "No samples to save",
+        hint: `Upload audio under ${uploadDir} or pass body.samples`,
+        path: resolvedPath,
+      });
+      return;
+    }
+
+    // Normalize samples for ACE-Step DatasetBuilder JSON
+    const normalized = samples.map((s: any, i: number) => {
+      const filename = s.filename || s.name || path.posix.basename(String(s.audio_path || s.audioPath || `track_${i}`));
+      let audioPath = String(s.audio_path || s.audioPath || path.posix.join(uploadDir, filename));
+      audioPath = audioPath.split("/app/ACE-Step-1.5/datasets").join("/app/datasets");
+      if (!audioPath.startsWith("/")) {
+        audioPath = path.posix.join(uploadDir, path.posix.basename(audioPath));
+      }
+      const lyrics = (s.lyrics != null && String(s.lyrics).trim()) ? String(s.lyrics) : "[Instrumental]";
+      const isInst = s.is_instrumental === true || s.isInstrumental === true || lyrics.trim() === "[Instrumental]";
+      let caption = (s.caption != null && String(s.caption).trim()) ? String(s.caption) : "";
+      if (!caption) caption = body.defaultCaption || "instrumental, high quality music";
+      const labeled = s.labeled === true || s.labeled === "true" || body.forceLabeled === true;
+      return {
+        id: s.id || `s_${i}`,
+        audio_path: audioPath,
+        filename,
+        caption,
+        genre: s.genre || "",
+        lyrics,
+        raw_lyrics: s.raw_lyrics || s.rawLyrics || "",
+        formatted_lyrics: s.formatted_lyrics || s.formattedLyrics || "",
+        bpm: s.bpm ?? null,
+        keyscale: s.keyscale || s.keyScale || "",
+        timesignature: s.timesignature || s.timeSignature || "",
+        duration: s.duration ?? null,
+        language: s.language || (isInst ? "instrumental" : "en"),
+        is_instrumental: isInst,
+        custom_tag: s.custom_tag || s.customTag || body.customTag || "",
+        labeled,
+        prompt_override: s.prompt_override ?? s.promptOverride ?? null,
+      };
+    });
+
+    // Force labeled if every sample still false but user clicked Save (training requires it)
+    const anyLabeled = normalized.some((s: any) => s.labeled);
+    if (!anyLabeled) {
+      for (const s of normalized) s.labeled = true;
+    }
+
+    const payload = {
+      metadata: {
+        name: safeName,
+        custom_tag: body.customTag || body.custom_tag || existing?.metadata?.custom_tag || "",
+        tag_position: body.tagPosition || body.tag_position || existing?.metadata?.tag_position || "replace",
+        created_at: existing?.metadata?.created_at || new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+        num_samples: normalized.length,
+        all_instrumental: body.allInstrumental ?? normalized.every((s: any) => s.is_instrumental),
+        genre_ratio: body.genreRatio ?? body.genre_ratio ?? existing?.metadata?.genre_ratio ?? 0,
+      },
+      samples: normalized,
+    };
+
+    await mkdir(path.posix.dirname(resolvedPath), { recursive: true });
+    await writeFile(resolvedPath, JSON.stringify(payload, null, 2), "utf8");
+    console.log("[Training] Saved dataset", resolvedPath, "samples=", normalized.length);
+    res.json({
+      status: `Saved ${normalized.length} sample(s)`,
+      path: resolvedPath,
+      numSamples: normalized.length,
+      labeledCount: normalized.filter((s: any) => s.labeled).length,
+    });
+  } catch (error) {
+    console.error("[Training] Save dataset error:", error);
+    res.status(500).json({ error: error instanceof Error ? error.message : "Failed to save dataset" });
+  }
+});
+'''
 
 PREPROCESS = r'''
 router.post("/preprocess", authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
@@ -257,13 +386,16 @@ router.post("/preprocess", authMiddleware, async (req: AuthenticatedRequest, res
     } catch (e) {
       console.warn("[Training] stage script", e);
     }
+    // Prefer repo script baked into image under /tmp if present
+    const baked = "/tmp/preprocess_dataset_xpu.py";
+    const scriptToRun = existsSync(sharedScript) ? sharedScript : (existsSync(baked) ? baked : sharedScript);
     const { execFile } = await import("child_process");
     const { promisify } = await import("util");
     const execFileAsync = promisify(execFile);
     try {
       const { stdout, stderr } = await execFileAsync(
         "docker",
-        ["exec", "-w", "/app", container, "python3", sharedScript,
+        ["exec", "-w", "/app", container, "python3", scriptToRun,
          "--dataset", resolvedDataset, "--output", resolvedOutput,
          "--max-duration", String(duration), "--json"],
         { timeout: 60 * 60 * 1000, maxBuffer: 20 * 1024 * 1024, env: process.env }
@@ -283,8 +415,44 @@ router.post("/preprocess", authMiddleware, async (req: AuthenticatedRequest, res
   }
 });
 '''
+
+text, ok = replace_route(text, "/init-model", INIT)
+print("init-model route", ok)
+
+text, ok = replace_route(text, "/auto-label", AUTO)
+print("auto-label route", ok)
+
+text, ok = replace_route(text, "/save-dataset", SAVE)
+print("save-dataset route", ok)
+if not ok:
+    # try alternate path spelling
+    text, ok = replace_route(text, "/save_dataset", SAVE)
+    print("save_dataset route", ok)
+
 text, ok = replace_route(text, "/preprocess", PREPROCESS)
 print("preprocess", ok)
 
+if "init_service_wrapper" in text:
+    text = text.replace(
+        "await safeGradioPredict('/init_service_wrapper'",
+        "await safeGradioPredict('/__blacklisted_init_service_wrapper'",
+    )
+    text = text.replace(
+        'await safeGradioPredict("/init_service_wrapper"',
+        'await safeGradioPredict("/__blacklisted_init_service_wrapper"',
+    )
+    print("rewrote leftover init_service_wrapper call sites")
+
+# Ensure readFile/writeFile imports if missing
+if "readFile" in text and "from 'fs/promises'" not in text and 'from "fs/promises"' not in text:
+    if "from 'fs'" in text or 'from "fs"' in text:
+        text = text.replace(
+            "import { existsSync", "import { existsSync, readFileSync",
+        )
+    text = "import { readFile, writeFile, mkdir } from 'fs/promises';\n" + text
+elif "writeFile" in SAVE and "writeFile" not in text.split("router.post("/save-dataset")[0]:
+    if "from 'fs/promises'" not in text and 'from "fs/promises"' not in text:
+        text = "import { readFile, writeFile, mkdir } from 'fs/promises';\n" + text
+
 training.write_text(text)
-print("OK")
+print("OK training.ts patched")
