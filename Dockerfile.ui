@@ -2,6 +2,7 @@
 # ACE-Step UI — Docker image (fspecii/ace-step-ui)
 # =============================================================================
 # Frontend 3003, Express 3001. Training uses shared /app/datasets + docker exec XPU.
+# SSE console: /api/logs/stream + public/ace-xpu-console.js
 # =============================================================================
 
 FROM node:20-bookworm-slim
@@ -39,7 +40,7 @@ p.write_text(pat.sub(new, text, count=1))
 print("CORS patched OK")
 PY
 
-# Patch 2: buildGradioArgs (72 params) — kept minimal reference; full map in prior releases
+# Patch 2: buildGradioArgs (72 params)
 RUN python3 - <<'PY'
 from pathlib import Path
 import re
@@ -112,14 +113,13 @@ for path in Path("server/src").rglob("*.ts"):
 print("Format patch files", n)
 PY
 
-# Patch 4: settings + system routes (compact)
+# Patch 4: settings + system routes
 COPY docker/ui-patches/training-docker.py /tmp/training-docker.py
+COPY docker/ui-patches/logs-sse.py /tmp/logs-sse.py
 
 RUN python3 - <<'PY'
 from pathlib import Path
-import re
 
-# settings table
 mig = Path("server/src/db/migrate.ts")
 mt = mig.read_text()
 if "user_settings" not in mt:
@@ -133,7 +133,6 @@ CREATE TABLE IF NOT EXISTS user_settings (
     mt = mt.replace("-- Indexes for performance", extra + "\n-- Indexes for performance") if "-- Indexes for performance" in mt else mt + extra
     mig.write_text(mt)
 
-# minimal settings route
 Path("server/src/routes/settings.ts").write_text('''
 import { Router, Response } from \'express\';
 import { pool } from \'../db/pool.js\';
@@ -171,7 +170,6 @@ router.delete(\'/\', authMiddleware, async (req: AuthenticatedRequest, res: Resp
 export default router;
 '''.replace("\\'", "'"))
 
-# system restart route
 Path("server/src/routes/system.ts").write_text('''
 import { Router, Response } from \'express\';
 import { execFile } from \'child_process\';
@@ -207,10 +205,10 @@ if "/api/settings" not in it:
 print("settings/system routes wired")
 PY
 
-# Patch 5: training docker (preprocess on XPU, soft init, paths)
+# Patch 5: training docker
 RUN python3 /tmp/training-docker.py
 
-# Patch 6: process-level safety so training errors never kill Express
+# Patch 6: process-level safety
 RUN python3 - <<'PY'
 from pathlib import Path
 p = Path("server/src/index.ts")
@@ -229,6 +227,9 @@ process.on('uncaughtException', (err) => {
 else:
     print("fatal guards already present")
 PY
+
+# Patch 7: SSE log streaming + console panel
+RUN python3 /tmp/logs-sse.py
 
 # Floating restart button
 RUN python3 - <<'PY'
@@ -255,7 +256,9 @@ ENV DATASETS_UPLOADS_DIR=/app/datasets/uploads
 ENV ACESTEP_PATH=/app
 ENV LORA_OUTPUT_DIR=/app/lora_output
 ENV ENABLE_DOCKER_RESTART=true
+ENV ENABLE_LOG_STREAM=true
 ENV XPU_CONTAINER_NAME=acestep-xpu
+ENV UI_CONTAINER_NAME=acestep-ui
 
 RUN mkdir -p /app/data /app/server/data /app/server/public/audio /app/logs /app/datasets/uploads \
     && chmod -R 777 /app/data /app/server/data /app/server/public/audio
@@ -271,22 +274,23 @@ echo "==========================================="
 echo "ACE-Step API : ${ACESTEP_API_URL}"
 echo "Datasets     : ${DATASETS_DIR:-/app/datasets}"
 echo "LoRA output  : ${LORA_OUTPUT_DIR:-/app/lora_output}"
+echo "Log stream   : ${ENABLE_LOG_STREAM:-true}"
 echo "==========================================="
 
 mkdir -p /app/data /app/server/data /app/server/public/audio \
   /app/datasets/uploads /app/datasets/preprocessed_tensors /app/datasets/_tools \
   /app/lora_output/checkpoints /app/lora_output/final /app/ACE-Step-1.5
 
-# Compat symlinks for any leftover hardcoded paths
 ln -sfn /app/datasets /app/ACE-Step-1.5/datasets || true
 ln -sfn /app/checkpoints /app/ACE-Step-1.5/checkpoints || true
 ln -sfn /app/lora_output /app/server/lora_output || true
 
-if [ -f /app/public/ace-xpu-restart.js ]; then
-  mkdir -p /app/server/public
-  cp -f /app/public/ace-xpu-restart.js /app/server/public/ 2>/dev/null || true
-fi
-# Stage preprocess script onto shared volume for XPU docker exec
+mkdir -p /app/server/public /app/public
+for f in ace-xpu-restart.js ace-xpu-console.js; do
+  if [ -f /app/public/$f ]; then
+    cp -f /app/public/$f /app/server/public/ 2>/dev/null || true
+  fi
+done
 if [ -f /app/server/scripts/preprocess_dataset.py ]; then
   cp -f /app/server/scripts/preprocess_dataset.py /app/datasets/_tools/preprocess_dataset.py || true
 fi
@@ -304,7 +308,9 @@ DATASETS_UPLOADS_DIR=${DATASETS_UPLOADS_DIR:-/app/datasets/uploads}
 ACESTEP_PATH=${ACESTEP_PATH:-/app}
 LORA_OUTPUT_DIR=${LORA_OUTPUT_DIR:-/app/lora_output}
 ENABLE_DOCKER_RESTART=${ENABLE_DOCKER_RESTART:-true}
+ENABLE_LOG_STREAM=${ENABLE_LOG_STREAM:-true}
 XPU_CONTAINER_NAME=${XPU_CONTAINER_NAME:-acestep-xpu}
+UI_CONTAINER_NAME=${UI_CONTAINER_NAME:-acestep-ui}
 ENVEOF
 cp /app/server/.env /app/.env
 
