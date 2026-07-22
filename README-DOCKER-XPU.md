@@ -181,6 +181,19 @@ Then: `docker compose -f docker-compose.xpu.yml up -d --force-recreate acestep-x
 | Mode | `gradio-api` |
 | UI ports | 3003 / 3004 |
 
+### Python packages baked into `acestep-xpu`
+
+| Package | Notes |
+|---------|--------|
+| PyTorch **nightly XPU** | Forced last via `download.pytorch.org/whl/nightly/xpu` |
+| **torchao ≥ 0.16** | XPU index + `--no-deps` (PEFT/training; avoids CUDA torch overwrite) |
+| **bitsandbytes ≥ 0.48** | `--no-deps` (8-bit optimizers; clears AdamW fallback warning) |
+| **lycoris-lora** | Enables LoKr train/infer |
+
+Do **not** install generic CUDA `torchao`/`bitsandbytes` without `--no-deps` — that can replace `+xpu` torch.
+
+**IPEX** is not used: native PyTorch XPU is preferred (IPEX is EOL).
+
 ---
 
 ## Verified features
@@ -190,9 +203,11 @@ Then: `docker compose -f docker-compose.xpu.yml up -d --force-recreate acestep-x
 | XPU generation on Arc A770 16GB | Working |
 | ace-step-ui → Gradio songs | Working |
 | AI Format (slow first call with offload) | Working |
+| torchao ≥0.16 + bitsandbytes + lycoris in image | Baked in Dockerfile.xpu |
 | Mobile-friendly UI | Better than plain Gradio |
 | Per-user settings in SQLite (`ui_data`) | API ready |
 | Restart XPU from UI | Optional via docker.sock |
+| SSE log console (login required) | Optional |
 
 ---
 
@@ -214,8 +229,8 @@ docker restart acestep-xpu
 
 | File | Purpose |
 |------|---------|
-| `Dockerfile.xpu` | Intel packages, XPU PyTorch, Gradio+API |
-| `Dockerfile.ui` | ace-step-ui patches, settings API, restart button |
+| `Dockerfile.xpu` | Intel packages, XPU PyTorch, torchao/bnb/lycoris, Gradio+API |
+| `Dockerfile.ui` | ace-step-ui patches, settings API, restart button, SSE console |
 | `docker-compose.xpu.yml` | Both services, `/dev/dri`, docker.sock, ports |
 | `.env.xpu.example` | A770-oriented defaults |
 | `README-DOCKER-XPU.md` | This document |
@@ -229,6 +244,8 @@ docker restart acestep-xpu
 **NaN latents** — restart XPU; shorter duration; try `float32`; avoid bad LoRAs.
 
 **Format spins a long time** — first 1.7B+offload Format can take 1–3 minutes.
+
+**Restart button / log console** — log in on the UI first (JWT in localStorage).
 
 **Restart button fails** — ensure `docker.sock` mount, `docker` CLI in UI image, and permissions on the host socket.
 
