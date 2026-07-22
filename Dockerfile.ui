@@ -5,6 +5,7 @@
 # SSE console: /api/logs/stream + public/ace-xpu-console.js
 # Mobile: off-canvas left nav + hamburger (mobile-sidebar.py)
 # Mobile: draft persist lyrics/style across tab switch (draft-persist.py)
+# LoRA picker: list /app/lora_output + load/unload/scale (lora-picker.py)
 # =============================================================================
 
 FROM node:20-bookworm-slim
@@ -120,6 +121,7 @@ COPY docker/ui-patches/training-docker.py /tmp/training-docker.py
 COPY docker/ui-patches/logs-sse.py /tmp/logs-sse.py
 COPY docker/ui-patches/mobile-sidebar.py /tmp/mobile-sidebar.py
 COPY docker/ui-patches/draft-persist.py /tmp/draft-persist.py
+COPY docker/ui-patches/lora-picker.py /tmp/lora-picker.py
 
 RUN python3 - <<'PY'
 from pathlib import Path
@@ -233,6 +235,7 @@ PY
 RUN python3 /tmp/logs-sse.py
 RUN python3 /tmp/mobile-sidebar.py
 RUN python3 /tmp/draft-persist.py
+RUN python3 /tmp/lora-picker.py
 
 # Floating restart button
 RUN python3 - <<'PY'
@@ -289,7 +292,7 @@ ln -sfn /app/checkpoints /app/ACE-Step-1.5/checkpoints || true
 ln -sfn /app/lora_output /app/server/lora_output || true
 
 mkdir -p /app/server/public /app/public
-for f in ace-xpu-restart.js ace-xpu-console.js ace-xpu-draft.js; do
+for f in ace-xpu-restart.js ace-xpu-console.js ace-xpu-draft.js ace-xpu-lora-picker.js; do
   if [ -f /app/public/$f ]; then
     cp -f /app/public/$f /app/server/public/ 2>/dev/null || true
   fi
