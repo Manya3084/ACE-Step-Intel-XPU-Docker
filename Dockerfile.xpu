@@ -58,16 +58,11 @@ COPY . /app/
 
 # ---------------------------------------------------------------------------
 # Patch: Gradio --enable-api format endpoint
-# Problem: /format_input either missing or runs blocking LM on the asyncio loop
-# and never returns (UI spinner forever / curl hang).
-# Fix: after setup_api_routes, force-register a working /format_input that runs
-# format_sample in a worker thread and returns the standard wrap_response shape.
 # ---------------------------------------------------------------------------
 RUN python3 - <<'PY'
 from pathlib import Path
 import re
 
-# Locate pipeline module that calls setup_api_routes
 candidates = list(Path("/app").rglob("acestep_v15_pipeline.py"))
 if not candidates:
     raise SystemExit("acestep_v15_pipeline.py not found")
@@ -77,7 +72,6 @@ text = pipeline.read_text()
 if "_xpu_register_format_input" in text:
     print("Format patch already present")
 else:
-    # Inject helper + call right after setup_api_routes(...)
     helper = '''
 
 def _xpu_register_format_input(demo, llm_handler):
@@ -88,7 +82,7 @@ def _xpu_register_format_input(demo, llm_handler):
     from fastapi import Request
 
     try:
-        app = demo.app  # Gradio Blocks FastAPI app
+        app = demo.app
     except Exception as exc:
         print(f"[XPU] format_input: no demo.app ({exc})")
         return
@@ -188,7 +182,6 @@ def _xpu_register_format_input(demo, llm_handler):
             "extra": None,
         }
 
-    # Remove any prior route on /format_input then add ours
     try:
         app.router.routes = [
             r for r in app.router.routes
@@ -198,34 +191,22 @@ def _xpu_register_format_input(demo, llm_handler):
         pass
 
     app.add_api_route("/format_input", format_input_endpoint, methods=["POST"])
-    # Compatibility alias used by some UI builds
     app.add_api_route("/format_lyrics", format_input_endpoint, methods=["POST"])
     print("[XPU] Registered working /format_input and /format_lyrics (threaded)")
 '''
 
-    if "setup_api_routes(demo" not in text and "setup_api_routes(" not in text:
-        raise SystemExit("Could not find setup_api_routes call to hook")
-
-    # Insert helper before main if missing
     text = helper + "\n" + text
-
-    # After setup_api_routes(...), call our registrar
-    # Match a typical call line and append our hook on the next line
-    pat = re.compile(
-        r"(setup_api_routes\([^\n]*\))",
-    )
+    pat = re.compile(r"(setup_api_routes\([^\n]*\))")
     m = pat.search(text)
     if not m:
         raise SystemExit("setup_api_routes call pattern not found")
-
-    # Prefer handlers named demo + llm_handler from surrounding scope
     injection = m.group(1) + "\n            _xpu_register_format_input(demo, llm_handler)"
     text = pat.sub(injection, text, count=1)
     pipeline.write_text(text)
     print(f"Patched {pipeline}")
 PY
 
-# Install project without CUDA torch, then force XPU torch
+# Install project, then force XPU torch + matching torchao (>=0.16 for ACE-Step training)
 RUN uv venv /app/.venv --python python3.11 \
     && . /app/.venv/bin/activate \
     && uv pip install --upgrade pip \
@@ -233,7 +214,13 @@ RUN uv venv /app/.venv --python python3.11 \
     && uv pip install -r requirements-xpu.txt \
     && uv pip install --pre --force-reinstall \
          torch torchaudio torchvision \
-         --index-url https://download.pytorch.org/whl/nightly/xpu
+         --index-url https://download.pytorch.org/whl/nightly/xpu \
+    && ( uv pip install --pre --force-reinstall "torchao>=0.16.0" \
+           --index-url https://download.pytorch.org/whl/nightly/xpu \
+         || uv pip install --pre --force-reinstall "torchao>=0.16.0" \
+           --index-url https://download.pytorch.org/whl/xpu \
+         || uv pip install --pre --force-reinstall "torchao>=0.16.0" ) \
+    && python -c "import torchao; print('torchao', torchao.__version__)"
 
 ENV PATH="/app/.venv/bin:$PATH"
 ENV VIRTUAL_ENV=/app/.venv
@@ -249,7 +236,6 @@ ENV ZE_FLAT_DEVICE_HIERARCHY=COMPOSITE
 ENV GRADIO_SERVER_NAME=0.0.0.0
 ENV ACESTEP_API_HOST=0.0.0.0
 
-# Default: Gradio + API endpoints (required by ace-step-ui)
 ENV ACESTEP_MODE=gradio-api
 ENV ACESTEP_INIT_SERVICE=true
 
@@ -277,6 +263,7 @@ echo "==========================================="
 echo "Mode      : ${ACESTEP_MODE}"
 echo "Python    : $(python --version 2>&1)"
 echo "PyTorch   : $(python -c 'import torch; print(torch.__version__)' 2>/dev/null || echo 'N/A')"
+echo "torchao   : $(python -c 'import torchao; print(torchao.__version__)' 2>/dev/null || echo 'N/A')"
 
 if python -c 'import torch; assert hasattr(torch, "xpu") and torch.xpu.is_available()' 2>/dev/null; then
     echo "XPU       : AVAILABLE"
