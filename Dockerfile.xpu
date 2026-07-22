@@ -3,6 +3,7 @@
 # =============================================================================
 # Optimized for Intel Arc A770 16GB on Linux / OMV
 # Bakes: PyTorch XPU nightly, torchao>=0.16 (+xpu), bitsandbytes, lycoris-lora
+#         soundfile + ffmpeg (TorchCodec is CUDA-only — do not use on pure XPU)
 # =============================================================================
 
 FROM ubuntu:22.04
@@ -207,8 +208,9 @@ def _xpu_register_format_input(demo, llm_handler):
     print(f"Patched {pipeline}")
 PY
 
-# Install project, force XPU torch LAST, then matching torchao / bnb / lycoris
+# Install project, force XPU torch LAST, then matching torchao / bnb / lycoris / soundfile
 # --no-deps on torchao + bitsandbytes protects +xpu torch from CUDA PyPI wheels
+# Do NOT install torchcodec (CUDA / libnvrtc) — use soundfile + ffmpeg instead
 RUN uv venv /app/.venv --python python3.11 \
     && . /app/.venv/bin/activate \
     && uv pip install --upgrade pip \
@@ -223,11 +225,19 @@ RUN uv venv /app/.venv --python python3.11 \
            --index-url https://download.pytorch.org/whl/xpu \
          || uv pip install --pre --force-reinstall --no-deps "torchao>=0.16.0" ) \
     && uv pip install --no-deps "bitsandbytes>=0.48.0" \
-    && uv pip install "lycoris-lora" \
+    && uv pip install "lycoris-lora" "soundfile>=0.13.1" \
     && python -c "import torch; print('torch', torch.__version__)" \
     && python -c "import torchao; print('torchao', torchao.__version__)" \
     && python -c "import bitsandbytes as bnb; print('bitsandbytes', bnb.__version__)" \
-    && python -c "import lycoris; print('lycoris ok')"
+    && python -c "import lycoris; print('lycoris ok')" \
+    && python -c "import soundfile; print('soundfile', soundfile.__version__)"
+
+# XPU LoRA preprocess helper (UI docker-execs this via shared volume or baked copy)
+RUN mkdir -p /app/datasets/_tools /tmp \
+    && if [ -f /app/docker/ui-patches/preprocess_dataset.py ]; then \
+         cp /app/docker/ui-patches/preprocess_dataset.py /app/datasets/_tools/preprocess_dataset.py; \
+         cp /app/docker/ui-patches/preprocess_dataset.py /tmp/preprocess_dataset_xpu.py; \
+       fi
 
 ENV PATH="/app/.venv/bin:$PATH"
 ENV VIRTUAL_ENV=/app/.venv
@@ -273,6 +283,7 @@ echo "PyTorch   : $(python -c 'import torch; print(torch.__version__)' 2>/dev/nu
 echo "torchao   : $(python -c 'import torchao; print(torchao.__version__)' 2>/dev/null || echo 'N/A')"
 echo "bnb       : $(python -c 'import bitsandbytes as b; print(b.__version__)' 2>/dev/null || echo 'N/A')"
 echo "lycoris   : $(python -c 'import lycoris; print("ok")' 2>/dev/null || echo 'N/A')"
+echo "soundfile : $(python -c 'import soundfile as s; print(s.__version__)' 2>/dev/null || echo 'N/A')"
 
 if python -c 'import torch; assert hasattr(torch, "xpu") and torch.xpu.is_available()' 2>/dev/null; then
     echo "XPU       : AVAILABLE"
@@ -287,6 +298,14 @@ else
     echo "           Make sure /dev/dri is passed and Intel drivers + Level Zero are on the host"
 fi
 echo "==========================================="
+
+# Ensure preprocess helper exists on shared datasets volume when mounted empty
+if [ -f /tmp/preprocess_dataset_xpu.py ]; then
+  mkdir -p /app/datasets/_tools
+  if [ ! -f /app/datasets/_tools/preprocess_dataset.py ] || ! grep -q 'soundfile' /app/datasets/_tools/preprocess_dataset.py 2>/dev/null; then
+    cp /tmp/preprocess_dataset_xpu.py /app/datasets/_tools/preprocess_dataset.py || true
+  fi
+fi
 
 INIT_ARGS=""
 if [ "${ACESTEP_INIT_SERVICE:-true}" = "true" ]; then
