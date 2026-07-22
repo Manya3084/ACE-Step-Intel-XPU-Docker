@@ -4,6 +4,7 @@
 # Frontend 3003, Express 3001. Training uses shared /app/datasets + docker exec XPU.
 # SSE console: /api/logs/stream + public/ace-xpu-console.js
 # Mobile: off-canvas left nav + hamburger (mobile-sidebar.py)
+# Mobile: draft persist lyrics/style across tab switch (draft-persist.py)
 # =============================================================================
 
 FROM node:20-bookworm-slim
@@ -114,10 +115,11 @@ for path in Path("server/src").rglob("*.ts"):
 print("Format patch files", n)
 PY
 
-# Patch 4: settings + system routes
+# Patch scripts
 COPY docker/ui-patches/training-docker.py /tmp/training-docker.py
 COPY docker/ui-patches/logs-sse.py /tmp/logs-sse.py
 COPY docker/ui-patches/mobile-sidebar.py /tmp/mobile-sidebar.py
+COPY docker/ui-patches/draft-persist.py /tmp/draft-persist.py
 
 RUN python3 - <<'PY'
 from pathlib import Path
@@ -207,10 +209,8 @@ if "/api/settings" not in it:
 print("settings/system routes wired")
 PY
 
-# Patch 5: training docker
 RUN python3 /tmp/training-docker.py
 
-# Patch 6: process-level safety
 RUN python3 - <<'PY'
 from pathlib import Path
 p = Path("server/src/index.ts")
@@ -230,11 +230,9 @@ else:
     print("fatal guards already present")
 PY
 
-# Patch 7: SSE log streaming + console panel
 RUN python3 /tmp/logs-sse.py
-
-# Patch 8: mobile off-canvas sidebar + hamburger
 RUN python3 /tmp/mobile-sidebar.py
+RUN python3 /tmp/draft-persist.py
 
 # Floating restart button
 RUN python3 - <<'PY'
@@ -291,7 +289,7 @@ ln -sfn /app/checkpoints /app/ACE-Step-1.5/checkpoints || true
 ln -sfn /app/lora_output /app/server/lora_output || true
 
 mkdir -p /app/server/public /app/public
-for f in ace-xpu-restart.js ace-xpu-console.js; do
+for f in ace-xpu-restart.js ace-xpu-console.js ace-xpu-draft.js; do
   if [ -f /app/public/$f ]; then
     cp -f /app/public/$f /app/server/public/ 2>/dev/null || true
   fi
