@@ -3,6 +3,7 @@
 # =============================================================================
 # Frontend 3003, Express 3001. Training uses shared /app/datasets + docker exec XPU.
 # SSE console: /api/logs/stream + public/ace-xpu-console.js
+# Mobile: off-canvas left nav + hamburger (mobile-sidebar.py)
 # =============================================================================
 
 FROM node:20-bookworm-slim
@@ -116,6 +117,7 @@ PY
 # Patch 4: settings + system routes
 COPY docker/ui-patches/training-docker.py /tmp/training-docker.py
 COPY docker/ui-patches/logs-sse.py /tmp/logs-sse.py
+COPY docker/ui-patches/mobile-sidebar.py /tmp/mobile-sidebar.py
 
 RUN python3 - <<'PY'
 from pathlib import Path
@@ -230,6 +232,9 @@ PY
 
 # Patch 7: SSE log streaming + console panel
 RUN python3 /tmp/logs-sse.py
+
+# Patch 8: mobile off-canvas sidebar + hamburger
+RUN python3 /tmp/mobile-sidebar.py
 
 # Floating restart button
 RUN python3 - <<'PY'
