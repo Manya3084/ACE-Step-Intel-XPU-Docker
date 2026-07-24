@@ -16,6 +16,7 @@
 #
 # Usage:
 #   mkdir -p datasets/uploads lora_output checkpoints
+#   cp .env.xpu.example .env   # includes --quantization none for LoRA
 #   docker compose -f docker-compose.xpu.yml up -d --build
 #   open http://YOUR_SERVER_IP:3003
 #
@@ -43,7 +44,8 @@ services:
       - ACESTEP_LM_MODEL_PATH=${ACESTEP_LM_MODEL_PATH:-acestep-5Hz-lm-1.7B}
       - ACESTEP_OFFLOAD_TO_CPU=${ACESTEP_OFFLOAD_TO_CPU:-true}
       - ACESTEP_DTYPE=${ACESTEP_DTYPE:-}
-      - ACESTEP_EXTRA_ARGS=${ACESTEP_EXTRA_ARGS:-}
+      # LoRA requires quant off; override in .env if you need INT8 without LoRA
+      - ACESTEP_EXTRA_ARGS=${ACESTEP_EXTRA_ARGS:---quantization none}
       - TOKENIZERS_PARALLELISM=false
       - PYTORCH_DEVICE=xpu
       - TORCH_COMPILE_BACKEND=eager
