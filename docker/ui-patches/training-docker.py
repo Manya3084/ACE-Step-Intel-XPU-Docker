@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Patch training.ts — XPU paths, soft init-model, local save-dataset, docker preprocess."""
+"""Patch training.ts — XPU paths, soft init-model, local save-dataset, docker preprocess,
+auto MP3/FLAC/M4A/OGG/AAC/OPUS → 48 kHz stereo WAV on save (ffmpeg)."""
 from pathlib import Path
 import re
 import sys
@@ -63,6 +64,72 @@ function normalizeTrainingPath(input: string | undefined | null, fallback: strin
     s = path.posix.join("/app/datasets", path.posix.basename(s));
   }
   return s;
+}
+
+/** Convert lossy/container formats to 48 kHz stereo WAV for XPU preprocess (soundfile). */
+async function ensureWavPath(audioPath: string): Promise<string> {
+  const src = String(audioPath || "");
+  if (!src) return src;
+  const ext = path.extname(src).toLowerCase();
+  const convertible = new Set([".mp3", ".flac", ".m4a", ".ogg", ".aac", ".opus", ".wma", ".webm"]);
+  if (!convertible.has(ext)) return src;
+
+  const wavPath = src.slice(0, -ext.length) + ".wav";
+  try {
+    if (existsSync(wavPath)) {
+      const stSrc = await (await import("fs/promises")).stat(src).catch(() => null);
+      const stWav = await (await import("fs/promises")).stat(wavPath).catch(() => null);
+      if (stWav && stSrc && stWav.mtimeMs >= stSrc.mtimeMs && stWav.size > 1024) {
+        return wavPath;
+      }
+    }
+  } catch {
+    /* continue to convert */
+  }
+
+  if (!existsSync(src)) {
+    console.warn("[Training] ensureWavPath: source missing", src);
+    return src;
+  }
+
+  const { execFile } = await import("child_process");
+  const { promisify } = await import("util");
+  const execFileAsync = promisify(execFile);
+  try {
+    console.log("[Training] ffmpeg convert → wav:", src);
+    await execFileAsync(
+      "ffmpeg",
+      ["-y", "-i", src, "-ar", "48000", "-ac", "2", "-sample_fmt", "s16", wavPath],
+      { timeout: 10 * 60 * 1000, maxBuffer: 8 * 1024 * 1024 }
+    );
+    if (existsSync(wavPath)) {
+      console.log("[Training] wav ready:", wavPath);
+      return wavPath;
+    }
+  } catch (e: any) {
+    console.error("[Training] ffmpeg convert failed", src, e?.message || e);
+  }
+  return src;
+}
+
+async function convertUploadDirToWav(uploadDir: string): Promise<string[]> {
+  if (!existsSync(uploadDir)) return [];
+  const { readdirSync } = await import("fs");
+  const convertible = new Set([".mp3", ".flac", ".m4a", ".ogg", ".aac", ".opus", ".wma", ".webm"]);
+  const files = readdirSync(uploadDir);
+  const out: string[] = [];
+  for (const f of files) {
+    const full = path.posix.join(uploadDir, f);
+    const ext = path.extname(f).toLowerCase();
+    if (ext === ".wav") {
+      out.push(full);
+      continue;
+    }
+    if (!convertible.has(ext)) continue;
+    const wav = await ensureWavPath(full);
+    out.push(wav);
+  }
+  return out;
 }
 
 async function safeGradioPredict(
@@ -319,7 +386,14 @@ router.post('/save-dataset', authMiddleware, async (req: AuthenticatedRequest, r
 
     const uploadsRoot = process.env.DATASETS_UPLOADS_DIR || "/app/datasets/uploads";
     const uploadDir = path.posix.join(uploadsRoot, safeName);
-    const audioExt = new Set([".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac", ".opus"]);
+    const audioExt = new Set([".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac", ".opus", ".wma", ".webm"]);
+
+    // Auto-convert anything under this dataset upload folder to 48k stereo WAV
+    try {
+      await convertUploadDirToWav(uploadDir);
+    } catch (e) {
+      console.warn("[Training] upload-dir wav convert", e);
+    }
 
     let samples: any[] = Array.isArray(body.samples) ? body.samples : [];
 
@@ -337,7 +411,11 @@ router.post('/save-dataset', authMiddleware, async (req: AuthenticatedRequest, r
 
     if (!samples.length && existsSync(uploadDir)) {
       const { readdirSync } = await import("fs");
-      const files = readdirSync(uploadDir).filter((f: string) => audioExt.has(path.extname(f).toLowerCase()));
+      // Prefer .wav after conversion; fall back to any remaining audio
+      let files = readdirSync(uploadDir).filter((f: string) => path.extname(f).toLowerCase() === ".wav");
+      if (!files.length) {
+        files = readdirSync(uploadDir).filter((f: string) => audioExt.has(path.extname(f).toLowerCase()));
+      }
       samples = files.map((filename: string, i: number) => ({
         id: `sample_${i}_${filename.replace(/[^a-zA-Z0-9]+/g, "_").slice(0, 24)}`,
         audio_path: path.posix.join(uploadDir, filename),
@@ -368,19 +446,24 @@ router.post('/save-dataset', authMiddleware, async (req: AuthenticatedRequest, r
       return;
     }
 
-    const normalized = samples.map((s: any, i: number) => {
-      const filename = s.filename || s.name || path.posix.basename(String(s.audio_path || s.audioPath || `track_${i}`));
-      let audioPath = String(s.audio_path || s.audioPath || path.posix.join(uploadDir, filename));
+    const normalized = [];
+    for (let i = 0; i < samples.length; i++) {
+      const s = samples[i];
+      const filename0 = s.filename || s.name || path.posix.basename(String(s.audio_path || s.audioPath || `track_${i}`));
+      let audioPath = String(s.audio_path || s.audioPath || path.posix.join(uploadDir, filename0));
       audioPath = audioPath.split("/app/ACE-Step-1.5/datasets").join("/app/datasets");
       if (!audioPath.startsWith("/")) {
         audioPath = path.posix.join(uploadDir, path.posix.basename(audioPath));
       }
+      // Per-sample conversion (covers paths that were not in uploadDir scan)
+      audioPath = await ensureWavPath(audioPath);
+      const filename = path.posix.basename(audioPath);
       const lyrics = (s.lyrics != null && String(s.lyrics).trim()) ? String(s.lyrics) : "[Instrumental]";
       const isInst = s.is_instrumental === true || s.isInstrumental === true || lyrics.trim() === "[Instrumental]";
       let caption = (s.caption != null && String(s.caption).trim()) ? String(s.caption) : "";
       if (!caption) caption = body.defaultCaption || "instrumental, high quality music";
       const labeled = s.labeled === true || s.labeled === "true" || body.forceLabeled === true;
-      return {
+      normalized.push({
         id: s.id || `s_${i}`,
         audio_path: audioPath,
         filename,
@@ -398,8 +481,8 @@ router.post('/save-dataset', authMiddleware, async (req: AuthenticatedRequest, r
         custom_tag: s.custom_tag || s.customTag || body.customTag || "",
         labeled,
         prompt_override: s.prompt_override ?? s.promptOverride ?? null,
-      };
-    });
+      });
+    }
 
     const anyLabeled = normalized.some((s: any) => s.labeled);
     if (!anyLabeled) {
@@ -428,6 +511,7 @@ router.post('/save-dataset', authMiddleware, async (req: AuthenticatedRequest, r
       path: resolvedPath,
       numSamples: normalized.length,
       labeledCount: normalized.filter((s: any) => s.labeled).length,
+      convertedToWav: normalized.filter((s: any) => String(s.audio_path).toLowerCase().endsWith(".wav")).length,
     });
   } catch (error) {
     console.error("[Training] Save dataset error:", error);
@@ -451,6 +535,31 @@ router.post('/preprocess', authMiddleware, async (req: AuthenticatedRequest, res
     const container = xpuContainer();
     await mkdir(resolvedOutput, { recursive: true });
     await mkdir("/app/datasets/_tools", { recursive: true });
+
+    // Ensure dataset JSON paths point at wav (convert any remaining lossy files)
+    try {
+      if (existsSync(resolvedDataset)) {
+        const raw = JSON.parse(await readFile(resolvedDataset, "utf8"));
+        const samples = Array.isArray(raw.samples) ? raw.samples : [];
+        let changed = false;
+        for (const s of samples) {
+          if (!s || !s.audio_path) continue;
+          const wav = await ensureWavPath(String(s.audio_path));
+          if (wav !== s.audio_path) {
+            s.audio_path = wav;
+            s.filename = path.posix.basename(wav);
+            changed = true;
+          }
+        }
+        if (changed) {
+          await writeFile(resolvedDataset, JSON.stringify(raw, null, 2), "utf8");
+          console.log("[Training] Updated dataset paths to wav before preprocess");
+        }
+      }
+    } catch (e) {
+      console.warn("[Training] pre-preprocess wav ensure", e);
+    }
+
     const localScript = path.resolve(__aceDirname, "../../scripts/preprocess_dataset.py");
     const sharedScript = "/app/datasets/_tools/preprocess_dataset.py";
     try {
@@ -546,9 +655,12 @@ if "/v1/dataset/save" in text:
 if "[Training] Saved dataset" not in text:
     print("ERROR: local save-dataset handler not injected", file=sys.stderr)
     sys.exit(1)
+if "ensureWavPath" not in text:
+    print("ERROR: ensureWavPath helper missing", file=sys.stderr)
+    sys.exit(1)
 if "Model service assumed ready" not in text:
     print("ERROR: soft init-model not injected", file=sys.stderr)
     sys.exit(1)
 
 training.write_text(text)
-print("OK training.ts patched — init soft, save local")
+print("OK training.ts patched — init soft, save local, auto wav convert")
