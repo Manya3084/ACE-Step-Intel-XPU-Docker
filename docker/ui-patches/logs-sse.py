@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Wire SSE log streaming (/api/logs/stream) + floating console panel."""
+"""Wire SSE log streaming (/api/logs/stream) + floating console panel.
+
+Open when OPEN_LOCAL_AUTH=true (default for this Docker stack).
+"""
 from pathlib import Path
 
-# ---------------------------------------------------------------------------
-# Backend route
-# ---------------------------------------------------------------------------
 Path("server/src/routes/logs.ts").write_text(r'''
 import { Router, Response, Request } from "express";
 import { spawn, ChildProcessWithoutNullStreams } from "child_process";
@@ -18,7 +18,11 @@ const XPU_NAME = process.env.XPU_CONTAINER_NAME || "acestep-xpu";
 const UI_NAME = process.env.UI_CONTAINER_NAME || "acestep-ui";
 const ENABLE = (process.env.ENABLE_LOG_STREAM || "true").toLowerCase() !== "false";
 
-/** Drop noisy LM token dumps by default */
+function openLocalAuth(): boolean {
+  const v = (process.env.OPEN_LOCAL_AUTH || "true").toLowerCase();
+  return v !== "false" && v !== "0" && v !== "no" && v !== "off";
+}
+
 function shouldFilterLine(line: string, filterNoise: boolean): boolean {
   if (!filterNoise) return false;
   if (/audio_code_/i.test(line)) return true;
@@ -34,6 +38,10 @@ function classify(line: string): "error" | "warn" | "info" {
 }
 
 function authFromQueryOrHeader(req: Request): { ok: boolean; userId?: string } {
+  // Local Docker: no token required
+  if (openLocalAuth()) {
+    return { ok: true, userId: "local-docker-user" };
+  }
   try {
     const hdr = req.headers.authorization;
     let token = "";
@@ -47,10 +55,6 @@ function authFromQueryOrHeader(req: Request): { ok: boolean; userId?: string } {
   }
 }
 
-/**
- * SSE: GET /api/logs/stream?source=xpu|ui|all&filter=1&token=JWT&tail=150
- * EventSource cannot set Authorization headers — pass token as query param.
- */
 router.get("/stream", (req: Request, res: Response) => {
   if (!ENABLE) {
     res.status(403).json({ error: "Log streaming disabled" });
@@ -155,7 +159,6 @@ router.get("/stream", (req: Request, res: Response) => {
   req.on("close", () => clearInterval(heartbeat));
 });
 
-/** Snapshot (non-stream) for debugging */
 router.get("/tail", authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
   if (!ENABLE) {
     res.status(403).json({ error: "Log streaming disabled" });
@@ -184,11 +187,8 @@ router.get("/tail", authMiddleware, async (req: AuthenticatedRequest, res: Respo
 
 export default router;
 ''')
-print("Wrote server/src/routes/logs.ts")
+print("Wrote server/src/routes/logs.ts (open auth)")
 
-# ---------------------------------------------------------------------------
-# Wire into Express index.ts
-# ---------------------------------------------------------------------------
 idx = Path("server/src/index.ts")
 it = idx.read_text()
 if "logsRoutes" not in it and "routes/logs" not in it:
@@ -220,34 +220,9 @@ if "logsRoutes" not in it and "routes/logs" not in it:
 else:
     print("logs routes already wired")
 
-# ---------------------------------------------------------------------------
-# Frontend console panel (vanilla JS, like restart button)
-# ---------------------------------------------------------------------------
 js = r'''(function () {
   const FILTER_KEY = "ace-console-filter";
   const SOURCE_KEY = "ace-console-source";
-
-  function token() {
-    try {
-      for (const k of ["token", "authToken", "access_token", "jwt"]) {
-        let v = localStorage.getItem(k);
-        if (!v) continue;
-        v = v.replace(/^Bearer\s+/i, "").replace(/^"|"$/g, "");
-        if (v.length > 20) return v;
-      }
-      // sometimes nested in user object
-      for (const k of ["user", "auth"]) {
-        const raw = localStorage.getItem(k);
-        if (!raw) continue;
-        try {
-          const o = JSON.parse(raw);
-          const t = o.token || o.accessToken || o.access_token;
-          if (t && String(t).length > 20) return String(t).replace(/^Bearer\s+/i, "");
-        } catch (e) {}
-      }
-    } catch (e) {}
-    return null;
-  }
 
   function el(tag, css, text) {
     const n = document.createElement(tag);
@@ -379,22 +354,14 @@ js = r'''(function () {
 
     function connect() {
       disconnect();
-      const t = token();
-      if (!t) {
-        status.textContent = "Log in first";
-        status.style.color = "#ff6b6b";
-        append("error", "No auth token in localStorage — log in, then Connect", "ui");
-        return;
-      }
       localStorage.setItem(SOURCE_KEY, sourceSel.value);
       localStorage.setItem(FILTER_KEY, filterInput.checked ? "1" : "0");
+      // No token required when OPEN_LOCAL_AUTH=true on the server
       const q = new URLSearchParams({
         source: sourceSel.value,
         filter: filterInput.checked ? "1" : "0",
         tail: "150",
-        token: t,
       });
-      // Vite proxies /api -> backend
       const url = `/api/logs/stream?${q.toString()}`;
       status.textContent = "Connecting…";
       status.style.color = "#ffd43b";
@@ -421,7 +388,6 @@ js = r'''(function () {
           status.textContent = d.message || "Error";
           status.style.color = "#ff6b6b";
         } catch (e) {
-          // EventSource connection errors also fire "error" without data
           if (es && es.readyState === EventSource.CLOSED) {
             status.textContent = "Disconnected";
             status.style.color = "#888";
@@ -429,9 +395,7 @@ js = r'''(function () {
           }
         }
       });
-      es.addEventListener("ping", () => {
-        /* keepalive */
-      });
+      es.addEventListener("ping", () => {});
       es.onerror = () => {
         if (es && es.readyState === EventSource.CLOSED) {
           status.textContent = "Stream closed";
@@ -476,7 +440,7 @@ js = r'''(function () {
 
 Path("public").mkdir(exist_ok=True)
 Path("public/ace-xpu-console.js").write_text(js)
-print("Wrote public/ace-xpu-console.js")
+print("Wrote public/ace-xpu-console.js (no token)")
 
 for hp in ["index.html", "public/index.html"]:
     p = Path(hp)
