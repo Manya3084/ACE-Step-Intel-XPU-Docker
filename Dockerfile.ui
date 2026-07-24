@@ -2,16 +2,15 @@
 # ACE-Step UI — Docker image (fspecii/ace-step-ui)
 # =============================================================================
 # Frontend 3003, Express 3001. Training uses shared /app/datasets + docker exec XPU.
-# SSE console: /api/logs/stream + public/ace-xpu-console.js
-# Mobile: off-canvas left nav + hamburger (mobile-sidebar.py)
-# Mobile: draft persist lyrics/style across tab switch (draft-persist.py)
-# LoRA picker: list /app/lora_output + load/unload/scale (lora-picker.py)
+# OPEN_LOCAL_AUTH=true (default): no JWT required for generate / training / LoRA / etc.
+# SSE console, mobile sidebar, draft persist, inline LoRA picker
 # =============================================================================
 
 FROM node:20-bookworm-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV NODE_ENV=development
+ENV OPEN_LOCAL_AUTH=true
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git \
@@ -25,6 +24,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 RUN git clone --depth 1 https://github.com/fspecii/ace-step-ui.git .
+
+# Patch 0: open local auth (before any route that uses authMiddleware)
+COPY docker/ui-patches/open-auth.py /tmp/open-auth.py
+RUN python3 /tmp/open-auth.py
 
 # Patch 1: CORS
 RUN python3 - <<'PY'
@@ -116,7 +119,6 @@ for path in Path("server/src").rglob("*.ts"):
 print("Format patch files", n)
 PY
 
-# Patch scripts
 COPY docker/ui-patches/training-docker.py /tmp/training-docker.py
 COPY docker/ui-patches/logs-sse.py /tmp/logs-sse.py
 COPY docker/ui-patches/mobile-sidebar.py /tmp/mobile-sidebar.py
@@ -237,10 +239,33 @@ RUN python3 /tmp/mobile-sidebar.py
 RUN python3 /tmp/draft-persist.py
 RUN python3 /tmp/lora-picker.py
 
-# Floating restart button
+# Restart button — no token required under OPEN_LOCAL_AUTH
 RUN python3 - <<'PY'
 from pathlib import Path
-js = r'''(function(){function token(){try{for(const k of["token","authToken","access_token"]){const v=localStorage.getItem(k);if(v&&v.length>20)return v.replace(/^Bearer\s+/i,"");}}catch(e){}return null}function ensure(){if(document.getElementById("ace-xpu-restart-btn"))return;const w=document.createElement("div");w.style.cssText="position:fixed;bottom:16px;right:16px;z-index:99999";const b=document.createElement("button");b.id="ace-xpu-restart-btn";b.textContent="Restart acestep-xpu";b.style.cssText="background:#1db954;color:#000;border:none;border-radius:999px;padding:10px 16px;font-weight:700;cursor:pointer";b.onclick=async()=>{const t=token();if(!t)return alert("Log in first");if(!confirm("Restart acestep-xpu?"))return;b.disabled=true;try{const r=await fetch("/api/system/restart-xpu",{method:"POST",headers:{Authorization:"Bearer "+t}});const d=await r.json();alert(d.message||d.error||"done")}catch(e){alert(String(e))}b.disabled=false};w.appendChild(b);document.body.appendChild(w)}setTimeout(ensure,1500)})();'''
+js = r'''(function(){
+  function ensure(){
+    if(document.getElementById("ace-xpu-restart-btn"))return;
+    var w=document.createElement("div");
+    w.style.cssText="position:fixed;bottom:16px;right:16px;z-index:99999";
+    var b=document.createElement("button");
+    b.id="ace-xpu-restart-btn";
+    b.textContent="Restart acestep-xpu";
+    b.style.cssText="background:#1db954;color:#000;border:none;border-radius:999px;padding:10px 16px;font-weight:700;cursor:pointer";
+    b.onclick=async function(){
+      if(!confirm("Restart acestep-xpu?"))return;
+      b.disabled=true;
+      try{
+        var r=await fetch("/api/system/restart-xpu",{method:"POST",headers:{"Content-Type":"application/json"}});
+        var d=await r.json();
+        alert(d.message||d.error||"done");
+      }catch(e){alert(String(e));}
+      b.disabled=false;
+    };
+    w.appendChild(b);
+    document.body.appendChild(w);
+  }
+  setTimeout(ensure,1500);
+})();'''
 Path("public").mkdir(exist_ok=True)
 Path("public/ace-xpu-restart.js").write_text(js)
 for hp in ["index.html", "public/index.html"]:
@@ -248,7 +273,7 @@ for hp in ["index.html", "public/index.html"]:
     if p.exists() and "ace-xpu-restart" not in p.read_text():
         h = p.read_text()
         p.write_text(h.replace("</body>", '<script src="/ace-xpu-restart.js"></script></body>') if "</body>" in h else h + '<script src="/ace-xpu-restart.js"></script>')
-print("restart button ok")
+print("restart button ok (no token)")
 PY
 
 RUN npm install && cd server && npm install && cd ..
@@ -265,6 +290,7 @@ ENV ENABLE_DOCKER_RESTART=true
 ENV ENABLE_LOG_STREAM=true
 ENV XPU_CONTAINER_NAME=acestep-xpu
 ENV UI_CONTAINER_NAME=acestep-ui
+ENV OPEN_LOCAL_AUTH=true
 
 RUN mkdir -p /app/data /app/server/data /app/server/public/audio /app/logs /app/datasets/uploads \
     && chmod -R 777 /app/data /app/server/data /app/server/public/audio
@@ -281,6 +307,7 @@ echo "ACE-Step API : ${ACESTEP_API_URL}"
 echo "Datasets     : ${DATASETS_DIR:-/app/datasets}"
 echo "LoRA output  : ${LORA_OUTPUT_DIR:-/app/lora_output}"
 echo "Log stream   : ${ENABLE_LOG_STREAM:-true}"
+echo "Open auth    : ${OPEN_LOCAL_AUTH:-true}"
 echo "==========================================="
 
 mkdir -p /app/data /app/server/data /app/server/public/audio \
@@ -309,6 +336,7 @@ ACESTEP_API_URL=${ACESTEP_API_URL:-http://acestep-xpu:8001}
 AUDIO_DIR=./public/audio
 FRONTEND_URL=${FRONTEND_URL:-http://localhost:3003}
 JWT_SECRET=${JWT_SECRET:-ace-step-ui-local-secret}
+OPEN_LOCAL_AUTH=${OPEN_LOCAL_AUTH:-true}
 DATASETS_DIR=${DATASETS_DIR:-/app/datasets}
 DATASETS_UPLOADS_DIR=${DATASETS_UPLOADS_DIR:-/app/datasets/uploads}
 ACESTEP_PATH=${ACESTEP_PATH:-/app}
