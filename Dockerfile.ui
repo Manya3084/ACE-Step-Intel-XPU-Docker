@@ -3,7 +3,7 @@
 # =============================================================================
 # Frontend 3003, Express 3001. Training uses shared /app/datasets + docker exec XPU.
 # OPEN_LOCAL_AUTH=true (default): no JWT required for generate / training / LoRA / etc.
-# SSE console, mobile sidebar, draft persist, inline LoRA picker
+# Create panel: LoRA section has trained-adapter dropdown (createpanel-lora.py)
 # =============================================================================
 
 FROM node:20-bookworm-slim
@@ -25,11 +25,9 @@ WORKDIR /app
 
 RUN git clone --depth 1 https://github.com/fspecii/ace-step-ui.git .
 
-# Patch 0: open local auth (before any route that uses authMiddleware)
 COPY docker/ui-patches/open-auth.py /tmp/open-auth.py
 RUN python3 /tmp/open-auth.py
 
-# Patch 1: CORS
 RUN python3 - <<'PY'
 from pathlib import Path
 import re
@@ -46,7 +44,6 @@ p.write_text(pat.sub(new, text, count=1))
 print("CORS patched OK")
 PY
 
-# Patch 2: buildGradioArgs (72 params)
 RUN python3 - <<'PY'
 from pathlib import Path
 import re
@@ -102,7 +99,6 @@ p.write_text(pat.sub(new_fn.strip(), text, count=1))
 print("buildGradioArgs patched OK")
 PY
 
-# Patch 3: format timeout
 RUN python3 - <<'PY'
 from pathlib import Path
 import re
@@ -124,6 +120,7 @@ COPY docker/ui-patches/logs-sse.py /tmp/logs-sse.py
 COPY docker/ui-patches/mobile-sidebar.py /tmp/mobile-sidebar.py
 COPY docker/ui-patches/draft-persist.py /tmp/draft-persist.py
 COPY docker/ui-patches/lora-picker.py /tmp/lora-picker.py
+COPY docker/ui-patches/createpanel-lora.py /tmp/createpanel-lora.py
 
 RUN python3 - <<'PY'
 from pathlib import Path
@@ -146,7 +143,7 @@ import { Router, Response } from \'express\';
 import { pool } from \'../db/pool.js\';
 import { authMiddleware, AuthenticatedRequest } from \'../middleware/auth.js\';
 const router = Router();
-const DEFAULT_SETTINGS: Record<string, unknown> = { batchSize: 1, inferenceSteps: 8, guidanceScale: 7.0, audioFormat: \'mp3\', vocalLanguage: \'en\', theme: \'dark\', locale: \'en\' };
+const DEFAULT_SETTINGS: Record<string, unknown> = { batchSize: 1, inferenceSteps: 8, guidanceScale: 7.0, audioFormat: \'mp3\', vocalLanguage: \'en\' };
 function parseSettings(raw: unknown): Record<string, unknown> {
   if (raw == null) return { ...DEFAULT_SETTINGS };
   if (typeof raw === \'object\') return { ...DEFAULT_SETTINGS, ...(raw as object) };
@@ -214,6 +211,11 @@ print("settings/system routes wired")
 PY
 
 RUN python3 /tmp/training-docker.py
+RUN python3 /tmp/logs-sse.py
+RUN python3 /tmp/mobile-sidebar.py
+RUN python3 /tmp/draft-persist.py
+RUN python3 /tmp/lora-picker.py
+RUN python3 /tmp/createpanel-lora.py
 
 RUN python3 - <<'PY'
 from pathlib import Path
@@ -229,17 +231,8 @@ process.on('uncaughtException', (err) => {
 });
 '''
     p.write_text(t)
-    print("Added process fatal guards")
-else:
-    print("fatal guards already present")
 PY
 
-RUN python3 /tmp/logs-sse.py
-RUN python3 /tmp/mobile-sidebar.py
-RUN python3 /tmp/draft-persist.py
-RUN python3 /tmp/lora-picker.py
-
-# Restart button — no token required under OPEN_LOCAL_AUTH
 RUN python3 - <<'PY'
 from pathlib import Path
 js = r'''(function(){
@@ -273,7 +266,7 @@ for hp in ["index.html", "public/index.html"]:
     if p.exists() and "ace-xpu-restart" not in p.read_text():
         h = p.read_text()
         p.write_text(h.replace("</body>", '<script src="/ace-xpu-restart.js"></script></body>') if "</body>" in h else h + '<script src="/ace-xpu-restart.js"></script>')
-print("restart button ok (no token)")
+print("restart button ok")
 PY
 
 RUN npm install && cd server && npm install && cd ..
@@ -304,30 +297,18 @@ echo "==========================================="
 echo "  ACE-Step UI"
 echo "==========================================="
 echo "ACE-Step API : ${ACESTEP_API_URL}"
-echo "Datasets     : ${DATASETS_DIR:-/app/datasets}"
-echo "LoRA output  : ${LORA_OUTPUT_DIR:-/app/lora_output}"
-echo "Log stream   : ${ENABLE_LOG_STREAM:-true}"
 echo "Open auth    : ${OPEN_LOCAL_AUTH:-true}"
 echo "==========================================="
-
 mkdir -p /app/data /app/server/data /app/server/public/audio \
   /app/datasets/uploads /app/datasets/preprocessed_tensors /app/datasets/_tools \
   /app/lora_output/checkpoints /app/lora_output/final /app/ACE-Step-1.5
-
 ln -sfn /app/datasets /app/ACE-Step-1.5/datasets || true
 ln -sfn /app/checkpoints /app/ACE-Step-1.5/checkpoints || true
 ln -sfn /app/lora_output /app/server/lora_output || true
-
 mkdir -p /app/server/public /app/public
 for f in ace-xpu-restart.js ace-xpu-console.js ace-xpu-draft.js ace-xpu-lora-picker.js; do
-  if [ -f /app/public/$f ]; then
-    cp -f /app/public/$f /app/server/public/ 2>/dev/null || true
-  fi
+  if [ -f /app/public/$f ]; then cp -f /app/public/$f /app/server/public/ 2>/dev/null || true; fi
 done
-if [ -f /app/server/scripts/preprocess_dataset.py ]; then
-  cp -f /app/server/scripts/preprocess_dataset.py /app/datasets/_tools/preprocess_dataset.py || true
-fi
-
 cat > /app/server/.env <<ENVEOF
 PORT=${PORT:-3001}
 NODE_ENV=development
@@ -347,14 +328,10 @@ XPU_CONTAINER_NAME=${XPU_CONTAINER_NAME:-acestep-xpu}
 UI_CONTAINER_NAME=${UI_CONTAINER_NAME:-acestep-ui}
 ENVEOF
 cp /app/server/.env /app/.env
-
 cd /app/server
 npm run dev &
 BACKEND_PID=$!
-for i in $(seq 1 30); do
-  curl -sf http://127.0.0.1:${PORT:-3001}/ >/dev/null 2>&1 && break
-  sleep 1
-done
+for i in $(seq 1 30); do curl -sf http://127.0.0.1:${PORT:-3001}/ >/dev/null 2>&1 && break; sleep 1; done
 cd /app
 npx vite --host 0.0.0.0 --port "${FRONTEND_PORT:-3003}" &
 FRONTEND_PID=$!
