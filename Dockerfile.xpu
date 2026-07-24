@@ -5,6 +5,8 @@
 # Bakes: PyTorch XPU nightly, torchao>=0.16 (+xpu), bitsandbytes, lycoris-lora
 #         soundfile + ffmpeg (TorchCodec is CUDA-only — do not use on pure XPU)
 #         trainer.py XPU path: basic loop (Lightning Fabric has no accelerator=xpu)
+#         preprocess_audio.py soundfile backend
+# Default runtime: ACESTEP_EXTRA_ARGS=--quantization none (LoRA-compatible)
 # =============================================================================
 
 FROM ubuntu:22.04
@@ -61,9 +63,13 @@ COPY . /app/
 
 # ---------------------------------------------------------------------------
 # Patch: LoRA/LoKR trainer — XPU uses basic loop (Fabric has no accelerator=xpu)
-# Verified on Arc A770: epochs + loss advance on device=xpu
 # ---------------------------------------------------------------------------
 RUN python3 /app/docker/ui-patches/trainer_xpu_fabric.py
+
+# ---------------------------------------------------------------------------
+# Patch: preprocess audio via soundfile (no torchcodec / libnvrtc)
+# ---------------------------------------------------------------------------
+RUN python3 /app/docker/ui-patches/preprocess_audio_soundfile.py
 
 # ---------------------------------------------------------------------------
 # Patch: Gradio --enable-api format endpoint
@@ -218,6 +224,7 @@ PY
 # Install project, force XPU torch LAST, then matching torchao / bnb / lycoris / soundfile
 # --no-deps on torchao + bitsandbytes protects +xpu torch from CUDA PyPI wheels
 # Do NOT install torchcodec (CUDA / libnvrtc) — use soundfile + ffmpeg instead
+# FAIL BUILD if torchao still reports 0.15 (PEFT LoRA training requires >0.16)
 RUN uv venv /app/.venv --python python3.11 \
     && . /app/.venv/bin/activate \
     && uv pip install --upgrade pip \
@@ -226,6 +233,7 @@ RUN uv venv /app/.venv --python python3.11 \
     && uv pip install --pre --force-reinstall \
          torch torchaudio torchvision \
          --index-url https://download.pytorch.org/whl/nightly/xpu \
+    && uv pip uninstall torchao -y || true \
     && ( uv pip install --pre --force-reinstall --no-deps "torchao>=0.16.0" \
            --index-url https://download.pytorch.org/whl/nightly/xpu \
          || uv pip install --pre --force-reinstall --no-deps "torchao>=0.16.0" \
@@ -234,16 +242,18 @@ RUN uv venv /app/.venv --python python3.11 \
     && uv pip install --no-deps "bitsandbytes>=0.48.0" \
     && uv pip install "lycoris-lora" "soundfile>=0.13.1" \
     && python -c "import torch; print('torch', torch.__version__)" \
-    && python -c "import torchao; print('torchao', torchao.__version__)" \
+    && python -c "import torchao; v=str(getattr(torchao,'__version__','')); print('torchao', v); assert '0.15' not in v.split('+')[0].split('.dev')[0] or v.startswith('0.16') or v.startswith('0.17') or v.startswith('0.18') or v.startswith('0.19'), f'torchao too old: {v}'" \
     && python -c "import bitsandbytes as bnb; print('bitsandbytes', bnb.__version__)" \
     && python -c "import lycoris; print('lycoris ok')" \
     && python -c "import soundfile; print('soundfile', soundfile.__version__)"
 
-# XPU LoRA preprocess helper (UI docker-execs this via shared volume or baked copy)
+# XPU LoRA preprocess helper (prefer xpu-specific script; always bake to /tmp for entrypoint)
 RUN mkdir -p /app/datasets/_tools /tmp \
-    && if [ -f /app/docker/ui-patches/preprocess_dataset.py ]; then \
-         cp /app/docker/ui-patches/preprocess_dataset.py /app/datasets/_tools/preprocess_dataset.py; \
-         cp /app/docker/ui-patches/preprocess_dataset.py /tmp/preprocess_dataset_xpu.py; \
+    && SRC=/app/docker/ui-patches/preprocess_dataset_xpu.py \
+    && if [ ! -f "$SRC" ]; then SRC=/app/docker/ui-patches/preprocess_dataset.py; fi \
+    && if [ -f "$SRC" ]; then \
+         cp "$SRC" /app/datasets/_tools/preprocess_dataset.py; \
+         cp "$SRC" /tmp/preprocess_dataset_xpu.py; \
        fi
 
 ENV PATH="/app/.venv/bin:$PATH"
@@ -267,6 +277,8 @@ ENV ACESTEP_CONFIG_PATH=acestep-v15-turbo
 ENV ACESTEP_LM_MODEL_PATH=acestep-5Hz-lm-1.7B
 ENV ACESTEP_LLM_BACKEND=pt
 ENV ACESTEP_OFFLOAD_TO_CPU=true
+# Default: disable INT8 so LoRA can load (override via compose/env if needed)
+ENV ACESTEP_EXTRA_ARGS=--quantization none
 
 ENV TOKENIZERS_PARALLELISM=false
 
@@ -291,6 +303,7 @@ echo "torchao   : $(python -c 'import torchao; print(torchao.__version__)' 2>/de
 echo "bnb       : $(python -c 'import bitsandbytes as b; print(b.__version__)' 2>/dev/null || echo 'N/A')"
 echo "lycoris   : $(python -c 'import lycoris; print(\"ok\")' 2>/dev/null || echo 'N/A')"
 echo "soundfile : $(python -c 'import soundfile as s; print(s.__version__)' 2>/dev/null || echo 'N/A')"
+echo "EXTRA     : ${ACESTEP_EXTRA_ARGS:-}"
 
 if python -c 'import torch; assert hasattr(torch, "xpu") and torch.xpu.is_available()' 2>/dev/null; then
     echo "XPU       : AVAILABLE"
@@ -306,11 +319,16 @@ else
 fi
 echo "==========================================="
 
-# Ensure preprocess helper exists on shared datasets volume when mounted empty
+# Always refresh preprocess helper on shared volume if missing or still using load_from_dict
 if [ -f /tmp/preprocess_dataset_xpu.py ]; then
   mkdir -p /app/datasets/_tools
-  if [ ! -f /app/datasets/_tools/preprocess_dataset.py ] || ! grep -q 'soundfile' /app/datasets/_tools/preprocess_dataset.py 2>/dev/null; then
+  NEED_COPY=0
+  if [ ! -f /app/datasets/_tools/preprocess_dataset.py ]; then NEED_COPY=1; fi
+  if [ -f /app/datasets/_tools/preprocess_dataset.py ] && grep -q 'load_from_dict' /app/datasets/_tools/preprocess_dataset.py 2>/dev/null; then NEED_COPY=1; fi
+  if [ -f /app/datasets/_tools/preprocess_dataset.py ] && ! grep -q 'AceStepHandler\|load_dataset' /app/datasets/_tools/preprocess_dataset.py 2>/dev/null; then NEED_COPY=1; fi
+  if [ "$NEED_COPY" = "1" ]; then
     cp /tmp/preprocess_dataset_xpu.py /app/datasets/_tools/preprocess_dataset.py || true
+    echo "[entrypoint] refreshed /app/datasets/_tools/preprocess_dataset.py"
   fi
 fi
 
