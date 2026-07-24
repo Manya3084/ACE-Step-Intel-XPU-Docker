@@ -1,22 +1,11 @@
 #!/usr/bin/env python3
-"""LoRA checkpoint picker for ace-step-ui (Intel XPU Docker).
-
-- GET /api/lora/list (+ load/unload/scale/status open — no JWT)
-- unload-before-switch on load
-- Inline left-sidebar adapter dropdown (no floating panel)
-
-Auth is stripped on /api/lora/* for single-user LAN Docker installs.
-"""
+"""LoRA picker — open API + always visible left-sidebar block."""
 from pathlib import Path
 import re
 
 lora_ts = Path("server/src/routes/lora.ts")
 text = lora_ts.read_text()
 
-# ---------------------------------------------------------------------------
-# Remove JWT requirement from all LoRA routes (local Docker)
-# router.post('/load', authMiddleware, ...) -> router.post('/load', ...)
-# ---------------------------------------------------------------------------
 text2, n_auth = re.subn(
     r"(router\.(get|post|put|delete|patch)\(\s*['\"][^'\"]+['\"]\s*),\s*authMiddleware\s*,",
     r"\1,",
@@ -83,17 +72,12 @@ function walkAdapters(root: string, depth = 0, out: { path: string; label: strin
       const p = path.join(root, name);
       try {
         if (statSync(p).isDirectory()) walkAdapters(p, depth + 1, out);
-      } catch {
-        /* skip */
-      }
+      } catch {}
     }
-  } catch {
-    /* skip */
-  }
+  } catch {}
   return out;
 }
 
-// GET /api/lora/list — open (no JWT) for local Docker
 router.get('/list', async (_req: any, res: Response) => {
   try {
     const found: { path: string; label: string; loss?: number; epoch?: number }[] = [];
@@ -108,9 +92,7 @@ router.get('/list', async (_req: any, res: Response) => {
     found.sort((a, b) => {
       if (a.label === 'final') return -1;
       if (b.label === 'final') return 1;
-      const ea = a.epoch ?? -1;
-      const eb = b.epoch ?? -1;
-      return eb - ea;
+      return (b.epoch ?? -1) - (a.epoch ?? -1);
     });
     res.json({ adapters: found, current: loraState, roots: loraRoots() });
   } catch (error) {
@@ -119,19 +101,14 @@ router.get('/list', async (_req: any, res: Response) => {
   }
 });
 '''
-    text = text.replace(
-        "export default router;",
-        LIST + "\nexport default router;\n",
-    )
-    print("Added GET /api/lora/list (no auth)")
+    text = text.replace("export default router;", LIST + "\nexport default router;\n")
+    print("Added GET /api/lora/list")
 else:
-    # Ensure existing /list is also open
     text = re.sub(
         r"router\.get\(\s*['\"]/list['\"]\s*,\s*authMiddleware\s*,",
         "router.get('/list',",
         text,
     )
-    print("list route already present (auth stripped if any)")
 
 if "unload before load" not in text:
     old_load = """    const client = await getGradioClient();
@@ -142,147 +119,77 @@ if "unload before load" not in text:
 
     res.json({ message: status, lora_path, loaded: true });"""
     new_load = """    const client = await getGradioClient();
-
-    // unload before load when switching adapters (ACE-Step can stack adapters)
     if (loraState.loaded && loraState.path && loraState.path !== lora_path) {
-      try {
-        await client.predict('/unload_lora', []);
-        console.log('[LoRA] Unloaded previous before switch');
-      } catch (e) {
-        console.warn('[LoRA] Pre-load unload failed (continuing):', e);
-      }
+      try { await client.predict('/unload_lora', []); } catch (e) { console.warn('[LoRA] pre-unload', e); }
     }
-
     const result = await client.predict('/load_lora', [lora_path]);
     const status = (result.data as unknown[])[0] as string;
-
-    try {
-      await client.predict('/set_use_lora', [true]);
-    } catch (e) {
-      console.warn('[LoRA] set_use_lora failed:', e);
-    }
-
+    try { await client.predict('/set_use_lora', [true]); } catch (e) {}
     loraState = { loaded: true, active: true, scale: loraState.scale, path: lora_path };
-
     res.json({ message: status, lora_path, loaded: true, active: true });"""
     if old_load in text:
         text = text.replace(old_load, new_load)
-        print("Improved /load with unload-before-switch")
-    else:
-        print("WARN: load body not matched for unload-before-switch")
 
 lora_ts.write_text(text)
-print("lora.ts updated (open LoRA API)")
+print("lora.ts updated")
 
-# --- Inline left-menu picker — no token required ---
+# Always mount on left sidebar (not dependent on finding "LoRA" label)
 js = r'''(function () {
   var HOST_ID = "ace-xpu-lora-inline";
 
   async function api(path, opts) {
     opts = opts || {};
-    opts.headers = Object.assign(
-      { "Content-Type": "application/json" },
-      opts.headers || {}
-    );
+    opts.headers = Object.assign({ "Content-Type": "application/json" }, opts.headers || {});
     var r = await fetch(path, opts);
     var j = null;
-    try {
-      j = await r.json();
-    } catch (e) {
-      j = { error: await r.text() };
-    }
+    try { j = await r.json(); } catch (e) { j = { error: await r.text() }; }
     if (!r.ok) throw new Error((j && (j.error || j.detail || j.message)) || r.statusText);
     return j;
   }
 
-  function findLoraAnchor() {
-    var root =
+  function findSidebar() {
+    return (
       document.querySelector("aside") ||
-      document.querySelector('[class*="sidebar"]') ||
+      document.querySelector('[class*="sidebar" i]') ||
+      document.querySelector('[class*="SideBar" i]') ||
+      document.querySelector('[class*="left" i][class*="panel" i]') ||
       document.querySelector("nav") ||
-      document.body;
-
-    var candidates = root.querySelectorAll("label, h2, h3, h4, span, div, p, button");
-    for (var i = 0; i < candidates.length; i++) {
-      var el = candidates[i];
-      var t = (el.textContent || "").replace(/\s+/g, " ").trim();
-      if (!t || t.length > 48) continue;
-      if (
-        /^lora$/i.test(t) ||
-        /^use lora$/i.test(t) ||
-        /lora scale/i.test(t) ||
-        /load lora/i.test(t) ||
-        /lora path/i.test(t) ||
-        (/adapter/i.test(t) && /lora/i.test(t))
-      ) {
-        var block = el.closest(
-          'section, fieldset, [class*="panel"], [class*="section"], [class*="card"], form, div'
-        );
-        return block || el.parentElement || el;
-      }
-    }
-    var inputs = document.querySelectorAll("input[type=text], input:not([type])");
-    for (var j = 0; j < inputs.length; j++) {
-      var ph = (inputs[j].getAttribute("placeholder") || "").toLowerCase();
-      var name = (inputs[j].getAttribute("name") || "").toLowerCase();
-      if (ph.indexOf("lora") >= 0 || name.indexOf("lora") >= 0 || ph.indexOf("adapter") >= 0) {
-        return inputs[j].closest("div, section, label") || inputs[j].parentElement;
-      }
-    }
-    return null;
+      null
+    );
   }
 
-  function removeFloatingPanel() {
+  function removeFloating() {
     var old = document.getElementById("ace-xpu-lora-panel");
     if (old && old.parentNode) old.parentNode.removeChild(old);
   }
 
-  function mountInline(anchor) {
-    if (document.getElementById(HOST_ID)) return;
-    removeFloatingPanel();
-
+  function buildHost() {
     var host = document.createElement("div");
     host.id = HOST_ID;
     host.setAttribute("data-ace-xpu", "lora-inline");
     host.style.cssText =
-      "margin:10px 0 12px;padding:10px 0 0;border-top:1px solid rgba(255,255,255,0.08);";
-
+      "margin:12px 8px 16px;padding:12px;border:1px solid rgba(255,255,255,0.12);" +
+      "border-radius:10px;background:rgba(0,0,0,0.25);";
     host.innerHTML =
-      '<div style="font-size:12px;font-weight:600;opacity:0.9;margin-bottom:6px">Trained adapters</div>' +
+      '<div style="font-size:13px;font-weight:700;margin-bottom:8px">Trained LoRA adapters</div>' +
       '<select id="ace-lora-select" style="width:100%;box-sizing:border-box;margin-bottom:8px;' +
-      "background:transparent;color:inherit;border:1px solid rgba(255,255,255,0.15);" +
-      'border-radius:8px;padding:7px 8px;font:inherit"></select>' +
-      '<div style="display:flex;gap:6px;margin-bottom:6px">' +
-      '<button type="button" id="ace-lora-refresh" style="flex:0 0 auto;padding:6px 10px;border-radius:8px;' +
-      "border:1px solid rgba(255,255,255,0.15);background:transparent;color:inherit;cursor:pointer;font:inherit">Refresh</button>" +
+      "background:#1a1a1a;color:#eee;border:1px solid #444;border-radius:8px;padding:8px;font:inherit"></select>' +
+      '<div style="display:flex;gap:6px;margin-bottom:6px;flex-wrap:wrap">' +
+      '<button type="button" id="ace-lora-refresh" style="padding:6px 10px;border-radius:8px;' +
+      "border:1px solid #444;background:#222;color:#eee;cursor:pointer">Refresh</button>' +
       '<button type="button" id="ace-lora-load" style="flex:1;padding:6px 10px;border-radius:8px;border:0;' +
-      'background:#1db954;color:#000;font-weight:700;cursor:pointer;font:inherit">Load</button>' +
+      'background:#1db954;color:#000;font-weight:700;cursor:pointer">Load</button>' +
       '<button type="button" id="ace-lora-unload" style="flex:1;padding:6px 10px;border-radius:8px;' +
-      "border:1px solid rgba(255,255,255,0.15);background:transparent;color:inherit;cursor:pointer;font:inherit">Unload</button>' +
+      "border:1px solid #444;background:#222;color:#eee;cursor:pointer">Unload</button>' +
       "</div>" +
-      '<div id="ace-lora-status" style="font-size:11px;opacity:0.75;word-break:break-all;line-height:1.35">' +
-      "Pick an adapter from /app/lora_output</div>";
+      '<div id="ace-lora-status" style="font-size:11px;opacity:0.8;word-break:break-all;line-height:1.35">' +
+      "Loading list…</div>";
+    return host;
+  }
 
-    if (anchor.parentNode) {
-      if (anchor.nextSibling) anchor.parentNode.insertBefore(host, anchor.nextSibling);
-      else anchor.parentNode.appendChild(host);
-    } else {
-      anchor.appendChild(host);
-    }
-
+  function wire(host) {
     var sel = host.querySelector("#ace-lora-select");
     var status = host.querySelector("#ace-lora-status");
-
-    function syncPathInput() {
-      var pathInput = document.querySelector(
-        'input[placeholder*="lora" i], input[placeholder*="adapter" i], input[name*="lora" i]'
-      );
-      if (pathInput && sel.value) {
-        pathInput.value = sel.value;
-        pathInput.dispatchEvent(new Event("input", { bubbles: true }));
-        pathInput.dispatchEvent(new Event("change", { bubbles: true }));
-      }
-    }
 
     async function refresh() {
       status.textContent = "Listing…";
@@ -291,9 +198,8 @@ js = r'''(function () {
         sel.innerHTML = "";
         var adapters = data.adapters || [];
         if (!adapters.length) {
-          sel.innerHTML = '<option value="">(no adapters found)</option>';
-          status.textContent =
-            "Train a LoRA first — nothing under " + (data.roots || []).join(", ");
+          sel.innerHTML = '<option value="">(no adapters under /app/lora_output)</option>';
+          status.textContent = "No adapters yet";
           return;
         }
         adapters.forEach(function (a) {
@@ -306,21 +212,16 @@ js = r'''(function () {
           sel.appendChild(o);
         });
         if (data.current && data.current.path) {
-          try {
-            sel.value = data.current.path;
-          } catch (e) {}
+          try { sel.value = data.current.path; } catch (e) {}
           status.textContent =
-            (data.current.loaded ? "Loaded: " : "Listed. Last: ") + data.current.path;
+            (data.current.loaded ? "Loaded: " : "") + data.current.path;
         } else {
           status.textContent = adapters.length + " adapter(s)";
         }
-        syncPathInput();
       } catch (e) {
         status.textContent = String(e.message || e);
       }
     }
-
-    sel.addEventListener("change", syncPathInput);
 
     host.querySelector("#ace-lora-refresh").onclick = refresh;
     host.querySelector("#ace-lora-load").onclick = async function () {
@@ -346,16 +247,17 @@ js = r'''(function () {
         status.textContent = "Unload failed: " + (e.message || e);
       }
     };
-
-    setTimeout(refresh, 400);
+    setTimeout(refresh, 300);
   }
 
   function tryMount() {
-    removeFloatingPanel();
+    removeFloating();
     if (document.getElementById(HOST_ID)) return true;
-    var anchor = findLoraAnchor();
-    if (!anchor) return false;
-    mountInline(anchor);
+    var side = findSidebar();
+    if (!side) return false;
+    var host = buildHost();
+    side.appendChild(host);
+    wire(host);
     return true;
   }
 
@@ -364,45 +266,46 @@ js = r'''(function () {
     var tries = 0;
     var iv = setInterval(function () {
       tries++;
-      if (tryMount() || tries > 40) clearInterval(iv);
+      if (tryMount() || tries > 60) clearInterval(iv);
     }, 500);
     try {
-      var obs = new MutationObserver(function () {
-        removeFloatingPanel();
+      new MutationObserver(function () {
+        removeFloating();
         if (!document.getElementById(HOST_ID)) tryMount();
-      });
-      obs.observe(document.body, { childList: true, subtree: true });
+      }).observe(document.body, { childList: true, subtree: true });
     } catch (e) {}
   }
 
   if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", function () {
-      setTimeout(boot, 800);
-    });
+    document.addEventListener("DOMContentLoaded", function () { setTimeout(boot, 600); });
   } else {
-    setTimeout(boot, 800);
+    setTimeout(boot, 600);
   }
 })();
 '''
 
 Path("public").mkdir(exist_ok=True)
 Path("public/ace-xpu-lora-picker.js").write_text(js)
-print("Wrote public/ace-xpu-lora-picker.js (open API, inline)")
 
+# Inject into every HTML shell we can find (Vite root + public)
 for hp in ["index.html", "public/index.html"]:
     p = Path(hp)
     if not p.exists():
         continue
     h = p.read_text()
-    if "ace-xpu-lora-picker" in h:
-        print(f"{hp} already has lora picker script")
-        continue
-    tag = '<script src="/ace-xpu-lora-picker.js"></script>'
-    if "</body>" in h:
-        h = h.replace("</body>", tag + "</body>")
-    else:
-        h = h + "\n" + tag + "\n"
+    for script in [
+        "ace-xpu-lora-picker.js",
+        "ace-xpu-console.js",
+        "ace-xpu-restart.js",
+        "ace-xpu-draft.js",
+    ]:
+        tag = f'<script src="/{script}"></script>'
+        if script not in h:
+            if "</body>" in h:
+                h = h.replace("</body>", tag + "\n</body>")
+            else:
+                h += "\n" + tag + "\n"
     p.write_text(h)
-    print(f"Injected picker into {hp}")
+    print(f"Ensured scripts in {hp}")
 
-print("lora-picker OK — no JWT on /api/lora/*")
+print("lora-picker OK — sidebar append")
