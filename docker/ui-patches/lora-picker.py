@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """LoRA checkpoint picker for ace-step-ui (Intel XPU Docker).
 
-- Extends server/src/routes/lora.ts with GET /api/lora/list
-- Improves load to unload-first when switching adapters
-- Injects adapter dropdown INTO the existing left-sidebar LoRA settings
-  (no floating panel)
+- GET /api/lora/list (+ load/unload/scale/status open — no JWT)
+- unload-before-switch on load
+- Inline left-sidebar adapter dropdown (no floating panel)
+
+Auth is stripped on /api/lora/* for single-user LAN Docker installs.
 """
 from pathlib import Path
 import re
@@ -12,15 +13,27 @@ import re
 lora_ts = Path("server/src/routes/lora.ts")
 text = lora_ts.read_text()
 
-if "GET /api/lora/list" not in text and "router.get('/list'" not in text and 'router.get("/list"' not in text:
-    if "from 'fs'" not in text and 'from "fs"' not in text:
-        text = (
-            "import { existsSync, readdirSync, statSync } from 'fs';\n"
-            "import path from 'path';\n"
-            + text
-        )
+# ---------------------------------------------------------------------------
+# Remove JWT requirement from all LoRA routes (local Docker)
+# router.post('/load', authMiddleware, ...) -> router.post('/load', ...)
+# ---------------------------------------------------------------------------
+text2, n_auth = re.subn(
+    r"(router\.(get|post|put|delete|patch)\(\s*['\"][^'\"]+['\"]\s*),\s*authMiddleware\s*,",
+    r"\1,",
+    text,
+)
+text = text2
+print(f"Removed authMiddleware from {n_auth} lora route(s)")
 
-    LIST_AND_IMPROVED = r'''
+if "from 'fs'" not in text and 'from "fs"' not in text:
+    text = (
+        "import { existsSync, readdirSync, statSync } from 'fs';\n"
+        "import path from 'path';\n"
+        + text
+    )
+
+if "router.get('/list'" not in text and 'router.get("/list"' not in text:
+    LIST = r'''
 function loraRoots(): string[] {
   const roots = [
     process.env.LORA_OUTPUT_DIR || '/app/lora_output',
@@ -80,8 +93,8 @@ function walkAdapters(root: string, depth = 0, out: { path: string; label: strin
   return out;
 }
 
-// GET /api/lora/list — Discover adapters under LORA_OUTPUT_DIR
-router.get('/list', authMiddleware, async (_req: AuthenticatedRequest, res: Response) => {
+// GET /api/lora/list — open (no JWT) for local Docker
+router.get('/list', async (_req: any, res: Response) => {
   try {
     const found: { path: string; label: string; loss?: number; epoch?: number }[] = [];
     const seen = new Set<string>();
@@ -106,14 +119,19 @@ router.get('/list', authMiddleware, async (_req: AuthenticatedRequest, res: Resp
   }
 });
 '''
-
     text = text.replace(
         "export default router;",
-        LIST_AND_IMPROVED + "\nexport default router;\n",
+        LIST + "\nexport default router;\n",
     )
-    print("Added GET /api/lora/list")
+    print("Added GET /api/lora/list (no auth)")
 else:
-    print("list route already present")
+    # Ensure existing /list is also open
+    text = re.sub(
+        r"router\.get\(\s*['\"]/list['\"]\s*,\s*authMiddleware\s*,",
+        "router.get('/list',",
+        text,
+    )
+    print("list route already present (auth stripped if any)")
 
 if "unload before load" not in text:
     old_load = """    const client = await getGradioClient();
@@ -154,33 +172,18 @@ if "unload before load" not in text:
         print("WARN: load body not matched for unload-before-switch")
 
 lora_ts.write_text(text)
-print("lora.ts updated")
+print("lora.ts updated (open LoRA API)")
 
-# --- Inline left-menu picker (no floating panel) ---
+# --- Inline left-menu picker — no token required ---
 js = r'''(function () {
   var HOST_ID = "ace-xpu-lora-inline";
 
-  function token() {
-    try {
-      var keys = ["token", "authToken", "access_token", "jwt"];
-      for (var i = 0; i < keys.length; i++) {
-        var v = localStorage.getItem(keys[i]);
-        if (v && v.length > 12) return v.replace(/^Bearer\s+/i, "");
-      }
-    } catch (e) {}
-    return null;
-  }
-
-  function authHeaders() {
-    var t = token();
-    var h = { "Content-Type": "application/json" };
-    if (t) h["Authorization"] = "Bearer " + t;
-    return h;
-  }
-
   async function api(path, opts) {
     opts = opts || {};
-    opts.headers = Object.assign({}, authHeaders(), opts.headers || {});
+    opts.headers = Object.assign(
+      { "Content-Type": "application/json" },
+      opts.headers || {}
+    );
     var r = await fetch(path, opts);
     var j = null;
     try {
@@ -192,11 +195,10 @@ js = r'''(function () {
     return j;
   }
 
-  /** Find the built-in LoRA block in the left sidebar / settings. */
   function findLoraAnchor() {
     var root =
       document.querySelector("aside") ||
-      document.querySelector("[class*=\"sidebar\"]") ||
+      document.querySelector('[class*="sidebar"]') ||
       document.querySelector("nav") ||
       document.body;
 
@@ -205,14 +207,20 @@ js = r'''(function () {
       var el = candidates[i];
       var t = (el.textContent || "").replace(/\s+/g, " ").trim();
       if (!t || t.length > 48) continue;
-      if (/^lora$/i.test(t) || /^use lora$/i.test(t) || /lora scale/i.test(t) ||
-          /load lora/i.test(t) || /lora path/i.test(t) || /adapter/i.test(t) && /lora/i.test(t)) {
-        // Prefer a stable parent that holds the LoRA controls
-        var block = el.closest("section, fieldset, [class*=\"panel\"], [class*=\"section\"], [class*=\"card\"], form, div");
+      if (
+        /^lora$/i.test(t) ||
+        /^use lora$/i.test(t) ||
+        /lora scale/i.test(t) ||
+        /load lora/i.test(t) ||
+        /lora path/i.test(t) ||
+        (/adapter/i.test(t) && /lora/i.test(t))
+      ) {
+        var block = el.closest(
+          'section, fieldset, [class*="panel"], [class*="section"], [class*="card"], form, div'
+        );
         return block || el.parentElement || el;
       }
     }
-    // Fallback: any input that looks like a path field near "lora"
     var inputs = document.querySelectorAll("input[type=text], input:not([type])");
     for (var j = 0; j < inputs.length; j++) {
       var ph = (inputs[j].getAttribute("placeholder") || "").toLowerCase();
@@ -255,7 +263,6 @@ js = r'''(function () {
       '<div id="ace-lora-status" style="font-size:11px;opacity:0.75;word-break:break-all;line-height:1.35">' +
       "Pick an adapter from /app/lora_output</div>";
 
-    // Insert after the existing LoRA controls so it feels native
     if (anchor.parentNode) {
       if (anchor.nextSibling) anchor.parentNode.insertBefore(host, anchor.nextSibling);
       else anchor.parentNode.appendChild(host);
@@ -266,19 +273,27 @@ js = r'''(function () {
     var sel = host.querySelector("#ace-lora-select");
     var status = host.querySelector("#ace-lora-status");
 
+    function syncPathInput() {
+      var pathInput = document.querySelector(
+        'input[placeholder*="lora" i], input[placeholder*="adapter" i], input[name*="lora" i]'
+      );
+      if (pathInput && sel.value) {
+        pathInput.value = sel.value;
+        pathInput.dispatchEvent(new Event("input", { bubbles: true }));
+        pathInput.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+    }
+
     async function refresh() {
       status.textContent = "Listing…";
       try {
-        if (!token()) {
-          status.textContent = "Log in to list trained adapters";
-          return;
-        }
         var data = await api("/api/lora/list");
         sel.innerHTML = "";
         var adapters = data.adapters || [];
         if (!adapters.length) {
           sel.innerHTML = '<option value="">(no adapters found)</option>';
-          status.textContent = "Train a LoRA first — nothing under " + (data.roots || []).join(", ");
+          status.textContent =
+            "Train a LoRA first — nothing under " + (data.roots || []).join(", ");
           return;
         }
         adapters.forEach(function (a) {
@@ -299,37 +314,18 @@ js = r'''(function () {
         } else {
           status.textContent = adapters.length + " adapter(s)";
         }
-
-        // If native path input exists, keep it in sync when user picks
-        var pathInput = document.querySelector(
-          'input[placeholder*="lora" i], input[placeholder*="adapter" i], input[name*="lora" i]'
-        );
-        if (pathInput && sel.value) {
-          pathInput.value = sel.value;
-          pathInput.dispatchEvent(new Event("input", { bubbles: true }));
-          pathInput.dispatchEvent(new Event("change", { bubbles: true }));
-        }
+        syncPathInput();
       } catch (e) {
         status.textContent = String(e.message || e);
       }
     }
 
-    sel.addEventListener("change", function () {
-      var pathInput = document.querySelector(
-        'input[placeholder*="lora" i], input[placeholder*="adapter" i], input[name*="lora" i]'
-      );
-      if (pathInput && sel.value) {
-        pathInput.value = sel.value;
-        pathInput.dispatchEvent(new Event("input", { bubbles: true }));
-        pathInput.dispatchEvent(new Event("change", { bubbles: true }));
-      }
-    });
+    sel.addEventListener("change", syncPathInput);
 
     host.querySelector("#ace-lora-refresh").onclick = refresh;
     host.querySelector("#ace-lora-load").onclick = async function () {
       var p = sel.value;
       if (!p) return alert("Pick an adapter");
-      if (!token()) return alert("Log in first");
       status.textContent = "Loading…";
       try {
         var r = await api("/api/lora/load", {
@@ -342,7 +338,6 @@ js = r'''(function () {
       }
     };
     host.querySelector("#ace-lora-unload").onclick = async function () {
-      if (!token()) return alert("Log in first");
       status.textContent = "Unloading…";
       try {
         var r = await api("/api/lora/unload", { method: "POST", body: "{}" });
@@ -371,8 +366,6 @@ js = r'''(function () {
       tries++;
       if (tryMount() || tries > 40) clearInterval(iv);
     }, 500);
-
-    // SPA navigation / React re-renders
     try {
       var obs = new MutationObserver(function () {
         removeFloatingPanel();
@@ -394,7 +387,7 @@ js = r'''(function () {
 
 Path("public").mkdir(exist_ok=True)
 Path("public/ace-xpu-lora-picker.js").write_text(js)
-print("Wrote public/ace-xpu-lora-picker.js (inline left-menu)")
+print("Wrote public/ace-xpu-lora-picker.js (open API, inline)")
 
 for hp in ["index.html", "public/index.html"]:
     p = Path(hp)
@@ -412,4 +405,4 @@ for hp in ["index.html", "public/index.html"]:
     p.write_text(h)
     print(f"Injected picker into {hp}")
 
-print("lora-picker OK — inline left menu")
+print("lora-picker OK — no JWT on /api/lora/*")
