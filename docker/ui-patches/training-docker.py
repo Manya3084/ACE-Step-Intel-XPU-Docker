@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Patch training.ts — XPU paths, soft init-model, local save-dataset, docker preprocess,
-auto MP3/FLAC/M4A/OGG/AAC/OPUS → 48 kHz stereo WAV on save (ffmpeg)."""
+auto MP3/FLAC/M4A/OGG/AAC/OPUS → 48 kHz stereo WAV on save (ffmpeg),
+GET /api/training/datasets — list saved dataset JSON files."""
 from pathlib import Path
 import re
 import sys
@@ -11,7 +12,6 @@ text = training.read_text()
 if "fileURLToPath" not in text:
     text = "import { fileURLToPath } from 'url';\n" + text
 
-# Drop prior helper injections
 text = re.sub(
     r"/\*\* ACE-Step-Intel-XPU-Docker training helpers \*/[\s\S]*?async function safeGradioPredict[\s\S]*?\n\}\n",
     "",
@@ -27,8 +27,6 @@ HELPER = r'''
 /** ACE-Step-Intel-XPU-Docker training helpers */
 const __aceDirname = path.dirname(fileURLToPath(import.meta.url));
 
-// Endpoints that do not exist (or must not be called) on gradio-api XPU builds.
-// For *init* names we return ok:true soft success so UI does not see 502.
 const GRADIO_ENDPOINT_BLACKLIST = new Set([
   "/init_service_wrapper",
   "init_service_wrapper",
@@ -66,7 +64,6 @@ function normalizeTrainingPath(input: string | undefined | null, fallback: strin
   return s;
 }
 
-/** Convert lossy/container formats to 48 kHz stereo WAV for XPU preprocess (soundfile). */
 async function ensureWavPath(audioPath: string): Promise<string> {
   const src = String(audioPath || "");
   if (!src) return src;
@@ -84,7 +81,7 @@ async function ensureWavPath(audioPath: string): Promise<string> {
       }
     }
   } catch {
-    /* continue to convert */
+    /* continue */
   }
 
   if (!existsSync(src)) {
@@ -346,8 +343,6 @@ def replace_route_containing(src: str, marker: str, new_body: str):
 
 INIT = r'''
 router.post('/init-model', authMiddleware, async (_req: AuthenticatedRequest, res: Response) => {
-  // XPU Docker: models are loaded by acestep-xpu entrypoint (--init_service).
-  // There is no Gradio /init_service_wrapper on this build — always soft-succeed.
   console.log("[Training] init-model soft success (acestep-xpu auto-init)");
   res.status(200).json({
     status: "Model service assumed ready (container auto-init)",
@@ -388,7 +383,6 @@ router.post('/save-dataset', authMiddleware, async (req: AuthenticatedRequest, r
     const uploadDir = path.posix.join(uploadsRoot, safeName);
     const audioExt = new Set([".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac", ".opus", ".wma", ".webm"]);
 
-    // Auto-convert anything under this dataset upload folder to 48k stereo WAV
     try {
       await convertUploadDirToWav(uploadDir);
     } catch (e) {
@@ -411,7 +405,6 @@ router.post('/save-dataset', authMiddleware, async (req: AuthenticatedRequest, r
 
     if (!samples.length && existsSync(uploadDir)) {
       const { readdirSync } = await import("fs");
-      // Prefer .wav after conversion; fall back to any remaining audio
       let files = readdirSync(uploadDir).filter((f: string) => path.extname(f).toLowerCase() === ".wav");
       if (!files.length) {
         files = readdirSync(uploadDir).filter((f: string) => audioExt.has(path.extname(f).toLowerCase()));
@@ -455,7 +448,6 @@ router.post('/save-dataset', authMiddleware, async (req: AuthenticatedRequest, r
       if (!audioPath.startsWith("/")) {
         audioPath = path.posix.join(uploadDir, path.posix.basename(audioPath));
       }
-      // Per-sample conversion (covers paths that were not in uploadDir scan)
       audioPath = await ensureWavPath(audioPath);
       const filename = path.posix.basename(audioPath);
       const lyrics = (s.lyrics != null && String(s.lyrics).trim()) ? String(s.lyrics) : "[Instrumental]";
@@ -536,7 +528,6 @@ router.post('/preprocess', authMiddleware, async (req: AuthenticatedRequest, res
     await mkdir(resolvedOutput, { recursive: true });
     await mkdir("/app/datasets/_tools", { recursive: true });
 
-    // Ensure dataset JSON paths point at wav (convert any remaining lossy files)
     try {
       if (existsSync(resolvedDataset)) {
         const raw = JSON.parse(await readFile(resolvedDataset, "utf8"));
@@ -599,18 +590,55 @@ router.post('/preprocess', authMiddleware, async (req: AuthenticatedRequest, res
 });
 '''
 
-# --- init-model: force soft success ---
+LIST_DATASETS = r'''
+// GET /api/training/datasets — scan /app/datasets/*.json
+router.get('/datasets', async (_req: AuthenticatedRequest, res: Response) => {
+  try {
+    const root = process.env.DATASETS_DIR || '/app/datasets';
+    const { readdirSync, statSync, readFileSync } = await import('fs');
+    const out: { name: string; path: string; samples?: number; mtime?: string }[] = [];
+    if (!existsSync(root)) {
+      res.json({ datasets: [], root });
+      return;
+    }
+    for (const name of readdirSync(root)) {
+      if (!name.toLowerCase().endsWith('.json')) continue;
+      if (name.startsWith('.')) continue;
+      const full = path.posix.join(root, name);
+      try {
+        const st = statSync(full);
+        if (!st.isFile()) continue;
+        let samples: number | undefined;
+        try {
+          const raw = JSON.parse(readFileSync(full, 'utf8'));
+          if (Array.isArray(raw?.samples)) samples = raw.samples.length;
+          else if (typeof raw?.metadata?.num_samples === 'number') samples = raw.metadata.num_samples;
+        } catch { /* ignore */ }
+        out.push({
+          name: name.replace(/\.json$/i, ''),
+          path: full,
+          samples,
+          mtime: st.mtime?.toISOString?.() || undefined,
+        });
+      } catch { /* skip */ }
+    }
+    out.sort((a, b) => a.name.localeCompare(b.name));
+    res.json({ datasets: out, root });
+  } catch (error) {
+    console.error('[Training] List datasets error:', error);
+    res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to list datasets' });
+  }
+});
+'''
+
 text, ok = replace_route(text, "/init-model", INIT)
 print("init-model route by path", ok)
 if not ok:
     text, ok = replace_route(text, "/init_model", INIT)
-    print("init_model route by path", ok)
 if not ok:
     text, ok = replace_route_containing(text, "init_service_wrapper", INIT)
-    print("init route by init_service_wrapper marker", ok)
 if not ok:
     text, ok = replace_route_containing(text, "Initialize model", INIT)
-    print("init route by Initialize model marker", ok)
 if not ok:
     text = text + "\n\n" + INIT + "\n"
     print("WARNING: appended init-model route at end")
@@ -622,10 +650,8 @@ text, ok = replace_route(text, "/save-dataset", SAVE)
 print("save-dataset route by path", ok)
 if not ok:
     text, ok = replace_route_containing(text, "/v1/dataset/save", SAVE)
-    print("save-dataset route by /v1/dataset/save marker", ok)
 if not ok:
     text, ok = replace_route_containing(text, "Save dataset error", SAVE)
-    print("save-dataset route by error log marker", ok)
 if not ok:
     text = text + "\n\n" + SAVE + "\n"
     print("WARNING: appended save-dataset route at end of file")
@@ -633,7 +659,15 @@ if not ok:
 text, ok = replace_route(text, "/preprocess", PREPROCESS)
 print("preprocess", ok)
 
-# Any leftover init_service_wrapper predict → soft blacklist name
+if "router.get('/datasets'" not in text and 'router.get("/datasets"' not in text:
+    if "export default router" in text:
+        text = text.replace("export default router", LIST_DATASETS + "\nexport default router", 1)
+    else:
+        text = text + "\n" + LIST_DATASETS + "\n"
+    print("added GET /datasets")
+else:
+    print("GET /datasets already present")
+
 if "init_service_wrapper" in text:
     text = text.replace(
         "await safeGradioPredict('/init_service_wrapper'",
@@ -643,11 +677,9 @@ if "init_service_wrapper" in text:
         'await safeGradioPredict("/init_service_wrapper"',
         'await safeGradioPredict("/__blacklisted_init_service_wrapper"',
     )
-    print("rewrote leftover init_service_wrapper call sites")
 
 if "from 'fs/promises'" not in text and 'from "fs/promises"' not in text:
     text = "import { readFile, writeFile, mkdir } from 'fs/promises';\n" + text
-    print("added fs/promises import")
 
 if "/v1/dataset/save" in text:
     print("ERROR: /v1/dataset/save still present after patch", file=sys.stderr)
@@ -661,6 +693,9 @@ if "ensureWavPath" not in text:
 if "Model service assumed ready" not in text:
     print("ERROR: soft init-model not injected", file=sys.stderr)
     sys.exit(1)
+if "router.get('/datasets'" not in text and 'router.get("/datasets"' not in text:
+    print("ERROR: GET /datasets not injected", file=sys.stderr)
+    sys.exit(1)
 
 training.write_text(text)
-print("OK training.ts patched — init soft, save local, auto wav convert")
+print("OK training.ts patched — init soft, save local, auto wav, list datasets")
