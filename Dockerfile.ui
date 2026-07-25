@@ -6,6 +6,7 @@
 # Create panel: LoRA section has trained-adapter dropdown (createpanel-lora.py)
 # Training panel: dataset JSON dropdown scans /app/datasets/*.json
 # Per-dataset LoRA folders: training-panel-lora-output.py (must not clobber trainingParams)
+# XL 4B DiT models always listed in Create advanced dropdown (generate-models-xl.py)
 # =============================================================================
 
 FROM node:20-bookworm-slim
@@ -125,6 +126,7 @@ COPY docker/ui-patches/lora-picker.py /tmp/lora-picker.py
 COPY docker/ui-patches/createpanel-lora.py /tmp/createpanel-lora.py
 COPY docker/ui-patches/training-panel-datasets.py /tmp/training-panel-datasets.py
 COPY docker/ui-patches/training-panel-lora-output.py /tmp/training-panel-lora-output.py
+COPY docker/ui-patches/generate-models-xl.py /tmp/generate-models-xl.py
 
 RUN python3 - <<'PY'
 from pathlib import Path
@@ -222,6 +224,7 @@ RUN python3 /tmp/lora-picker.py
 RUN python3 /tmp/createpanel-lora.py
 RUN python3 /tmp/training-panel-datasets.py
 RUN python3 /tmp/training-panel-lora-output.py
+RUN python3 /tmp/generate-models-xl.py
 
 RUN python3 - <<'PY'
 from pathlib import Path
