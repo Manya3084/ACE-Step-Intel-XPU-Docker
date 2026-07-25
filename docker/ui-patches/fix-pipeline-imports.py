@@ -1,54 +1,52 @@
 #!/usr/bin/env python3
-"""Restore critical imports in acestep_v15_pipeline.py if a prior patch removed them.
+"""Ensure get_gpu_config is importable in acestep_v15_pipeline.py.
 
-Symptom:
-  NameError: name 'get_gpu_config' is not defined
+Do NOT insert a column-0 import inside an existing try: block — that caused:
+  SyntaxError: expected 'except' or 'finally' block (line 52)
 
-Cause:
-  format-ram-headroom (old) deleted the import block between a prepended
-  helper and the next top-level def.
+Upstream already has either:
+  from .gpu_config import get_gpu_config
+or
+  from acestep.gpu_config import get_gpu_config
 """
 from __future__ import annotations
 
+import ast
 import sys
 from pathlib import Path
 
-REQUIRED = [
-    ("get_gpu_config", "from acestep.gpu_config import get_gpu_config"),
-    ("get_gpu_config", "from acestep.gpu_config import get_gpu_config, get_gpu_memory_gb"),
-]
 
-
-def _ensure_get_gpu_config(text: str) -> str:
-    if "get_gpu_config" in text and (
-        "from acestep.gpu_config import" in text
-        or "import acestep.gpu_config" in text
-    ):
-        # If the name is used and some import exists, still verify the symbol
-        if "from acestep.gpu_config import get_gpu_config" in text:
-            return text
-        if "import acestep.gpu_config as" in text:
-            return text
-
-    # Prefer adding next to other acestep imports
-    needle = "from acestep."
-    idx = text.find(needle)
-    line = "from acestep.gpu_config import get_gpu_config\n"
-    if idx >= 0:
-        # insert before first acestep import line
-        return text[:idx] + line + text[idx:]
-
-    # After __future__ / module docstring
-    if text.startswith('"""') or text.startswith("'''"):
-        q = text[:3]
-        end = text.find(q, 3)
-        if end > 0:
-            end = end + 3
-            if end < len(text) and text[end] == "\n":
-                end += 1
-            return text[:end] + line + text[end:]
-
-    return line + text
+def _has_get_gpu_config_import(text: str) -> bool:
+    if "get_gpu_config" not in text:
+        return False
+    # Relative or absolute import forms used by ACE-Step
+    markers = (
+        "from .gpu_config import",
+        "from acestep.gpu_config import",
+        "import acestep.gpu_config",
+    )
+    if not any(m in text for m in markers):
+        return False
+    # Prefer real parse when possible
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        # File may already be broken; still treat marker presence as OK for import
+        return True
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            mod = node.module or ""
+            if mod in ("gpu_config", "acestep.gpu_config") or mod.endswith(
+                ".gpu_config"
+            ):
+                for alias in node.names:
+                    if alias.name == "get_gpu_config" or alias.name == "*":
+                        return True
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if "gpu_config" in (alias.name or ""):
+                    return True
+    return "get_gpu_config" in text and any(m in text for m in markers)
 
 
 def main() -> None:
@@ -61,21 +59,55 @@ def main() -> None:
 
     for path in paths:
         text = path.read_text()
-        if "get_gpu_config()" in text or "get_gpu_config (" in text:
-            if "from acestep.gpu_config import get_gpu_config" not in text:
-                text = _ensure_get_gpu_config(text)
-                path.write_text(text)
-                print(f"Restored get_gpu_config import in {path}")
-            else:
-                print(f"get_gpu_config import OK: {path}")
-        else:
-            # still ensure import for safety if symbol referenced differently
-            if "get_gpu_config" in text and "from acestep.gpu_config import get_gpu_config" not in text:
-                text = _ensure_get_gpu_config(text)
-                path.write_text(text)
-                print(f"Restored get_gpu_config import in {path}")
-            else:
-                print(f"No get_gpu_config usage or already OK: {path}")
+
+        # If already broken, do not make it worse with a blind insert
+        try:
+            ast.parse(text)
+            syntax_ok = True
+        except SyntaxError as exc:
+            syntax_ok = False
+            print(f"WARNING: {path} has SyntaxError before fix: {exc}")
+
+        if _has_get_gpu_config_import(text):
+            print(f"get_gpu_config import OK: {path}")
+            continue
+
+        if not syntax_ok:
+            print(
+                f"Refusing to inject import into syntactically invalid {path}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        # Safe inject: only at module top, after docstring / future imports
+        line = "from acestep.gpu_config import get_gpu_config  # [XPU-import-fix]\n"
+        # Find end of leading docstring
+        insert_at = 0
+        if text.startswith('"""') or text.startswith("'''"):
+            q = text[:3]
+            end = text.find(q, 3)
+            if end > 0:
+                insert_at = end + 3
+                if insert_at < len(text) and text[insert_at] == "\n":
+                    insert_at += 1
+
+        # Skip __future__ imports
+        rest = text[insert_at:]
+        while rest.startswith("from __future__"):
+            nl = rest.find("\n")
+            if nl < 0:
+                break
+            insert_at += nl + 1
+            rest = text[insert_at:]
+
+        text = text[:insert_at] + line + text[insert_at:]
+        try:
+            ast.parse(text)
+        except SyntaxError as exc:
+            print(f"Inject would break {path}: {exc}", file=sys.stderr)
+            sys.exit(1)
+        path.write_text(text)
+        print(f"Added get_gpu_config import at module top: {path}")
 
     print("fix-pipeline-imports complete")
 
