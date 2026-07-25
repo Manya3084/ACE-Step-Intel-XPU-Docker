@@ -4,6 +4,7 @@ Add API endpoints compatible with api_server.py and CustomAceStep to Gradio appl
 """
 import atexit
 import asyncio
+import gc
 import json
 import os
 import random
@@ -40,6 +41,10 @@ _KNOWN_DIT_MODELS = (
     "acestep-v15-turbo-continuous",
 )
 
+# Intel Arc A770 16GB: always dual-offload under this Gradio API path
+_FORCE_OFFLOAD_TO_CPU = True
+_FORCE_OFFLOAD_DIT_TO_CPU = True
+
 
 def set_api_key(key: Optional[str]):
     """Set the API key for authentication."""
@@ -63,6 +68,28 @@ def _wrap_response(data: Any, code: int = 200, error: Optional[str] = None) -> D
         "timestamp": int(time.time() * 1000),
         "extra": None,
     }
+
+
+def _clear_accelerator_cache(reason: str = "") -> None:
+    """Release unoccupied XPU/CUDA cached memory (best-effort)."""
+    try:
+        gc.collect()
+        import torch
+
+        if hasattr(torch, "xpu") and hasattr(torch.xpu, "is_available") and torch.xpu.is_available():
+            if hasattr(torch.xpu, "empty_cache"):
+                torch.xpu.empty_cache()
+            if hasattr(torch.xpu, "synchronize"):
+                try:
+                    torch.xpu.synchronize()
+                except Exception:
+                    pass
+            logger.info(f"[memory] torch.xpu.empty_cache() {reason}".strip())
+        elif torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            logger.info(f"[memory] torch.cuda.empty_cache() {reason}".strip())
+    except Exception as exc:
+        logger.warning(f"[memory] empty_cache failed: {exc}")
 
 
 def verify_token_from_request(body: dict, authorization: Optional[str] = None) -> Optional[str]:
@@ -228,11 +255,17 @@ def _collect_available_dit_names(dit_handler) -> List[str]:
     return sorted(names)
 
 
+def _offload_flags_ok(dit_handler) -> bool:
+    """True when the live handler already uses both CPU offload paths."""
+    prev = getattr(dit_handler, "last_init_params", None) or {}
+    return bool(prev.get("offload_to_cpu")) and bool(prev.get("offload_dit_to_cpu"))
+
+
 def _switch_dit_model_sync(dit_handler, model_name: str) -> Dict[str, Any]:
     """Blocking DiT switch used by POST /v1/init (run in a worker thread).
 
-    Downloads weights if needed, then re-runs initialize_service with the same
-    runtime flags as the previous load (device, offload, quantization, …).
+    Always loads with offload_to_cpu + offload_dit_to_cpu for A770 headroom.
+    Re-inits when the same model is loaded without DiT offload.
     """
     if dit_handler is None:
         raise RuntimeError("DiT handler is not available")
@@ -242,27 +275,28 @@ def _switch_dit_model_sync(dit_handler, model_name: str) -> Dict[str, Any]:
         raise RuntimeError("model name is required")
 
     current = _current_dit_name(dit_handler)
-    if current == model_name and dit_handler.model is not None:
+    if (
+        current == model_name
+        and dit_handler.model is not None
+        and _offload_flags_ok(dit_handler)
+    ):
+        _clear_accelerator_cache("(already loaded, cache only)")
         return {
-            "message": f"Model '{model_name}' already loaded",
+            "message": f"Model '{model_name}' already loaded (dual CPU offload)",
             "loaded_model": model_name,
             "switched": False,
+            "offload_to_cpu": True,
+            "offload_dit_to_cpu": True,
         }
 
-    # Preserve previous runtime settings when possible
+    # Preserve previous runtime settings when possible, but force dual offload
     prev = getattr(dit_handler, "last_init_params", None) or {}
     project_root = prev.get("project_root") or _get_project_root()
     device = prev.get("device") or os.environ.get("PYTORCH_DEVICE", "xpu")
     use_flash_attention = bool(prev.get("use_flash_attention", False))
     compile_model = bool(prev.get("compile_model", False))
-    offload_to_cpu = bool(
-        prev.get(
-            "offload_to_cpu",
-            os.environ.get("ACESTEP_OFFLOAD_TO_CPU", "true").lower()
-            in ("1", "true", "yes", "on"),
-        )
-    )
-    offload_dit_to_cpu = bool(prev.get("offload_dit_to_cpu", offload_to_cpu))
+    offload_to_cpu = _FORCE_OFFLOAD_TO_CPU
+    offload_dit_to_cpu = _FORCE_OFFLOAD_DIT_TO_CPU
     quantization = prev.get("quantization")
     # Env may force "none" for LoRA compatibility
     extra = os.environ.get("ACESTEP_EXTRA_ARGS", "")
@@ -272,7 +306,11 @@ def _switch_dit_model_sync(dit_handler, model_name: str) -> Dict[str, Any]:
     prefer_source = prev.get("prefer_source")
     vae_checkpoint = prev.get("vae_checkpoint")
 
-    logger.info(f"[v1/init] Switching DiT: {current!r} -> {model_name!r}")
+    logger.info(
+        f"[v1/init] Switching DiT: {current!r} -> {model_name!r} "
+        f"(offload_to_cpu={offload_to_cpu}, offload_dit_to_cpu={offload_dit_to_cpu})"
+    )
+    _clear_accelerator_cache("(before model switch)")
 
     status, ok = dit_handler.initialize_service(
         project_root=project_root,
@@ -290,12 +328,15 @@ def _switch_dit_model_sync(dit_handler, model_name: str) -> Dict[str, Any]:
     if not ok:
         raise RuntimeError(status or f"Failed to initialize model '{model_name}'")
 
+    _clear_accelerator_cache("(after model switch)")
     loaded = _current_dit_name(dit_handler) or model_name
     logger.info(f"[v1/init] DiT loaded: {loaded}")
     return {
         "message": status or f"Model '{loaded}' initialized",
         "loaded_model": loaded,
         "switched": True,
+        "offload_to_cpu": offload_to_cpu,
+        "offload_dit_to_cpu": offload_dit_to_cpu,
     }
 
 
@@ -348,6 +389,7 @@ async def init_model(request: Request, authorization: Optional[str] = Header(Non
 
     Used by ace-step-ui switchModelIfNeeded() before generation when the
     Create-panel model dropdown differs from the currently loaded DiT.
+    Always applies dual CPU offload for Intel Arc 16GB headroom.
     """
     content_type = (request.headers.get("content-type") or "").lower()
     if "json" in content_type:
@@ -582,6 +624,8 @@ async def release_task(request: Request, authorization: Optional[str] = Header(N
         return bool(val)
 
     try:
+        _clear_accelerator_cache("(release_task start)")
+
         # Get sample_mode and sample_query parameters
         sample_mode = to_bool(get_param("sample_mode", "sampleMode"), False)
         sample_query = get_param("sample_query", "sampleQuery", "description", "desc", default="") or ""
@@ -748,6 +792,7 @@ async def release_task(request: Request, authorization: Optional[str] = Header(N
             result_data.append(item)
 
         store_result(task_id, result_data)
+        _clear_accelerator_cache("(release_task end)")
 
         return _wrap_response({"task_id": task_id, "status": "succeeded"})
 
