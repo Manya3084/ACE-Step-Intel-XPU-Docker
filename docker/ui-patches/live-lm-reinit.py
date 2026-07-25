@@ -15,13 +15,21 @@ Upstream Gradio /v1/init only switches DiT. This adds LM switch support:
 
 Honors ACESTEP_LM_OFFLOAD_TO_CPU / ACESTEP_LM_DEVICE / ACESTEP_ALLOW_4B_LM
 so 4B can live on system RAM on A770 + 128GB hosts.
+
+IMPORTANT: path helpers MUST NOT embed backslash-escaped string literals
+in the generated code — previous versions produced:
+    rstrip("/\")  # SyntaxError: unterminated string literal
+Use chr(92) / .replace so the written source is always valid Python.
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 MARKER = "# [XPU-LIVE-LM-REINIT]"
 
+# NOTE: HELPERS is written into api_routes.py. Never put \\ inside a
+# normal "..." string in this block — use chr(92) instead.
 HELPERS = '''
 # [XPU-LIVE-LM-REINIT]
 _KNOWN_LM_MODELS = (
@@ -38,6 +46,12 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return str(raw).strip().lower() in ("1", "true", "yes", "y", "on")
 
 
+def _basename_ckpt(path) -> str:
+    """Basename of a checkpoint path; works for both / and \\ separators."""
+    # chr(92) == backslash — avoids writing rstrip("/\\") which breaks Python
+    return os.path.basename(str(path).replace(chr(92), "/").rstrip("/"))
+
+
 def _current_lm_name(llm_handler) -> Optional[str]:
     """Return the currently loaded 5Hz LM checkpoint name, if any."""
     if llm_handler is None or not getattr(llm_handler, "llm_initialized", False):
@@ -45,10 +59,10 @@ def _current_lm_name(llm_handler) -> Optional[str]:
     cfg = getattr(llm_handler, "_last_initialize_config", None) or {}
     path = cfg.get("lm_model_path") or ""
     if path:
-        return os.path.basename(str(path).rstrip("/\\"))
+        return _basename_ckpt(path)
     full = getattr(llm_handler, "_lm_full_model_path", None) or ""
     if full:
-        return os.path.basename(str(full).rstrip("/\\"))
+        return _basename_ckpt(full)
     return None
 
 
@@ -344,6 +358,47 @@ def _replace_function(text: str, decorator_line: str, new_block: str) -> str:
     return text[:start] + new_block.strip() + "\n" + text[end:]
 
 
+def _repair_broken_rstrip(text: str) -> str:
+    """Fix the classic unterminated-string bug from the previous patch version.
+
+    Broken forms seen in the wild:
+      .rstrip("/\")
+      .rstrip("/\\")   # sometimes partially escaped
+    """
+    # Match any rstrip that tries to strip both / and backslash in one literal
+    pattern = re.compile(
+        r'os\.path\.basename\(str\(([^)]+)\)\.rstrip\("[^"\\]*(?:\\.[^"\\]*)*"\)\)'
+    )
+
+    def _repl(m: re.Match) -> str:
+        expr = m.group(1)
+        return f'os.path.basename(str({expr}).replace(chr(92), "/").rstrip("/"))'
+
+    fixed, n = pattern.subn(_repl, text)
+    if n:
+        print(f"Repaired {n} broken rstrip/basename expression(s)")
+    return fixed
+
+
+def _strip_old_helpers(text: str) -> str:
+    """Remove a previously injected [XPU-LIVE-LM-REINIT] block so we can re-apply cleanly."""
+    if MARKER not in text:
+        return text
+    # From the marker comment through the line before "router = APIRouter()"
+    start = text.find(MARKER)
+    if start < 0:
+        return text
+    # Prefer to cut from the blank line before the marker if present
+    while start > 0 and text[start - 1] in "\r\n":
+        start -= 1
+    anchor = "router = APIRouter()"
+    end = text.find(anchor, start)
+    if end < 0:
+        return text
+    print("Stripping previous [XPU-LIVE-LM-REINIT] helper block for clean re-apply")
+    return text[:start] + "\n" + text[end:]
+
+
 def main() -> None:
     paths = list(Path("/app").rglob("api_routes.py"))
     paths = [p for p in paths if "gradio" in str(p) and "api" in str(p)]
@@ -355,11 +410,18 @@ def main() -> None:
 
     for path in paths:
         text = path.read_text()
-        if MARKER in text:
-            print(f"Already patched: {path}")
+
+        # Always repair known broken rstrip forms first (even if already marked)
+        text = _repair_broken_rstrip(text)
+
+        if MARKER in text and "_basename_ckpt" in text and "_switch_lm_model_sync" in text:
+            path.write_text(text)
+            print(f"Already patched (helpers OK): {path}")
             continue
 
-        # Insert helpers after _switch_dit_model_sync return block / before router = APIRouter()
+        # Remove a partial / broken previous injection so we can re-insert cleanly
+        text = _strip_old_helpers(text)
+
         anchor = "router = APIRouter()"
         if anchor not in text:
             raise SystemExit(f"'{anchor}' not found in {path}")
