@@ -18,8 +18,12 @@ so 4B can live on system RAM on A770 + 128GB hosts.
 
 IMPORTANT: path helpers MUST NOT embed backslash-escaped string literals
 in the generated code — previous versions produced:
-    rstrip("/\")  # SyntaxError: unterminated string literal
+    rstrip("/\\")  # SyntaxError: unterminated string literal
 Use chr(92) / .replace so the written source is always valid Python.
+
+Also: never emit multi-line f-strings for the "Download first" error
+message — older images left an unterminated f"Download first, e.g.:
+literal. Use .format() instead.
 """
 from __future__ import annotations
 
@@ -30,6 +34,8 @@ MARKER = "# [XPU-LIVE-LM-REINIT]"
 
 # NOTE: HELPERS is written into api_routes.py. Never put \\ inside a
 # normal "..." string in this block — use chr(92) instead.
+# The RuntimeError message uses .format() so the generated source cannot
+# contain an unterminated multi-line f-string.
 HELPERS = '''
 # [XPU-LIVE-LM-REINIT]
 _KNOWN_LM_MODELS = (
@@ -130,13 +136,16 @@ def _switch_lm_model_sync(llm_handler, lm_model_path: str) -> Dict[str, Any]:
         except Exception as dl_exc:
             logger.warning(f"[v1/init] LM download helper failed: {dl_exc}")
         if not os.path.isdir(full_path):
-            raise RuntimeError(
-                f"LM checkpoint not found at {full_path}. "
-                f"Download first, e.g.:\n"
-                f"  docker exec acestep-xpu bash -c '. /app/.venv/bin/activate && "
-                f"huggingface-cli download ACE-Step/{lm_model_path} "
-                f"--local-dir /app/checkpoints/{lm_model_path}'"
-            )
+            # Use .format() — never multi-line f-strings that can leave an
+            # unterminated literal in older / partially-applied patches.
+            msg = (
+                "LM checkpoint not found at {}. "
+                "Download first, e.g.:\\n"
+                "  docker exec acestep-xpu bash -c '. /app/.venv/bin/activate && "
+                "huggingface-cli download ACE-Step/{} "
+                "--local-dir /app/checkpoints/{}'"
+            ).format(full_path, lm_model_path, lm_model_path)
+            raise RuntimeError(msg)
 
     backend = (
         os.environ.get("ACESTEP_LLM_BACKEND")
@@ -362,8 +371,8 @@ def _repair_broken_rstrip(text: str) -> str:
     """Fix the classic unterminated-string bug from the previous patch version.
 
     Broken forms seen in the wild:
-      .rstrip("/\")
-      .rstrip("/\\")   # sometimes partially escaped
+      .rstrip("/\\")
+      .rstrip("/\\\\")   # sometimes partially escaped
     """
     # Match any rstrip that tries to strip both / and backslash in one literal
     pattern = re.compile(
@@ -399,6 +408,26 @@ def _strip_old_helpers(text: str) -> str:
     return text[:start] + "\n" + text[end:]
 
 
+def _helpers_healthy(text: str) -> bool:
+    """True only if the live-LM helpers look complete *and* the file parses."""
+    if MARKER not in text:
+        return False
+    if "_basename_ckpt" not in text or "_switch_lm_model_sync" not in text:
+        return False
+    # Known broken form left by an earlier multi-line f-string
+    if 'f"Download first, e.g.:' in text:
+        # Accept only the properly closed single-line form (or the .format form)
+        if 'f"Download first, e.g.:\n"' not in text and 'f"Download first, e.g.:\\n"' not in text:
+            print("Detected broken unterminated 'Download first' f-string — will re-apply")
+            return False
+    try:
+        compile(text, "<api_routes.py>", "exec")
+    except SyntaxError as exc:
+        print(f"api_routes.py still has SyntaxError ({exc}) — will re-apply helpers")
+        return False
+    return True
+
+
 def main() -> None:
     paths = list(Path("/app").rglob("api_routes.py"))
     paths = [p for p in paths if "gradio" in str(p) and "api" in str(p)]
@@ -414,7 +443,7 @@ def main() -> None:
         # Always repair known broken rstrip forms first (even if already marked)
         text = _repair_broken_rstrip(text)
 
-        if MARKER in text and "_basename_ckpt" in text and "_switch_lm_model_sync" in text:
+        if _helpers_healthy(text):
             path.write_text(text)
             print(f"Already patched (helpers OK): {path}")
             continue
@@ -440,6 +469,12 @@ def main() -> None:
             '@router.post("/v1/init")',
             NEW_INIT,
         )
+
+        # Final sanity check before writing
+        try:
+            compile(text, str(path), "exec")
+        except SyntaxError as exc:
+            raise SystemExit(f"Patched api_routes.py is still invalid: {exc}") from exc
 
         path.write_text(text)
         print(f"Patched live LM re-init into {path}")
