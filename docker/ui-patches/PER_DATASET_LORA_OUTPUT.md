@@ -1,59 +1,28 @@
 # Per-dataset LoRA output folders
 
-## Rule
-
-| Dataset JSON | LoRA output root |
-|--------------|------------------|
-| `/app/datasets/Leaf_lora.json` | `/app/lora_output/Leaf_lora/` |
-| `/app/datasets/my_lora_dataset.json` | `/app/lora_output/my_lora_dataset/` |
-
-Tree after training:
+Training adapters are written under:
 
 ```text
-/app/lora_output/Leaf_lora/final/adapter/
-/app/lora_output/Leaf_lora/checkpoints/epoch_1000_loss_0.04/adapter/
-/app/lora_output/my_lora_dataset/final/adapter/
+/app/lora_output/<dataset_name>/final/adapter/
+/app/lora_output/<dataset_name>/checkpoints/epoch_*/adapter/
 ```
 
-Create → LoRA list labels them as `Leaf_lora / final`, `Leaf_lora / epoch_1000_…`.
+`<dataset_name>` is taken from the dataset JSON filename (e.g. `Leaf_lora.json` → `Leaf_lora`).
 
-## Wire into Dockerfile.ui
+## UI behaviour
 
-Add **before** `RUN python3 /tmp/training-panel-datasets.py`:
+- Training panel dataset dropdown scans `/app/datasets/*.json`.
+- Selecting a dataset sets:
+  - dataset / save / preprocess paths to that JSON
+  - `trainingParams.outputDir` → `/app/lora_output/<name>`
+  - export paths under the same folder
+- Create panel LoRA picker lists adapters with labels like `Leaf_lora/final`.
 
-```dockerfile
-COPY docker/ui-patches/training-panel-lora-output.py /tmp/training-panel-lora-output.py
-```
+## Critical fix (Train LoRA black screen)
 
-`training-panel-datasets.py` chains `runpy` on that file when present.
+`training-panel-lora-output.py` must **never** replace the entire
+`trainingParams` `useState({ rank, batchSize, outputDir, ... })` object with a
+string path. That made `ParamSlider` call `.toFixed()` on `undefined` and blanked
+the Train tab.
 
-Then rebuild UI:
-
-```bash
-git pull origin main
-docker compose -f docker-compose.xpu.yml up -d --build acestep-ui
-```
-
-## Until rebuild: set path by hand
-
-In Training → LoRA / output path field, type:
-
-```text
-/app/lora_output/Leaf_lora
-```
-
-(use your dataset name). Then start training.
-
-## Migrate an old flat run
-
-```bash
-docker exec acestep-xpu bash -c '
-  NAME=legacy_run   # or Leaf_lora if you know which dataset it was
-  mkdir -p /app/lora_output/$NAME
-  for d in final checkpoints final_lora; do
-    [ -e /app/lora_output/$d ] || continue
-    mv /app/lora_output/$d /app/lora_output/$NAME/
-  done
-  ls -la /app/lora_output/
-'
-```
+Safe approach: only change the `outputDir` **field** (and export string states).

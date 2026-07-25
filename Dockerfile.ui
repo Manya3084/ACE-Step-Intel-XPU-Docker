@@ -5,6 +5,7 @@
 # OPEN_LOCAL_AUTH=true (default): no JWT required for generate / training / LoRA / etc.
 # Create panel: LoRA section has trained-adapter dropdown (createpanel-lora.py)
 # Training panel: dataset JSON dropdown scans /app/datasets/*.json
+# Per-dataset LoRA folders: training-panel-lora-output.py (must not clobber trainingParams)
 # =============================================================================
 
 FROM node:20-bookworm-slim
@@ -123,6 +124,7 @@ COPY docker/ui-patches/draft-persist.py /tmp/draft-persist.py
 COPY docker/ui-patches/lora-picker.py /tmp/lora-picker.py
 COPY docker/ui-patches/createpanel-lora.py /tmp/createpanel-lora.py
 COPY docker/ui-patches/training-panel-datasets.py /tmp/training-panel-datasets.py
+COPY docker/ui-patches/training-panel-lora-output.py /tmp/training-panel-lora-output.py
 
 RUN python3 - <<'PY'
 from pathlib import Path
@@ -219,6 +221,7 @@ RUN python3 /tmp/draft-persist.py
 RUN python3 /tmp/lora-picker.py
 RUN python3 /tmp/createpanel-lora.py
 RUN python3 /tmp/training-panel-datasets.py
+RUN python3 /tmp/training-panel-lora-output.py
 
 RUN python3 - <<'PY'
 from pathlib import Path
