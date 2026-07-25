@@ -8,6 +8,7 @@
 # Per-dataset LoRA folders: training-panel-lora-output.py (must not clobber trainingParams)
 # XL 4B DiT models always listed in Create advanced dropdown (generate-models-xl.py)
 # Song row badges: 1.5XL for XL models (songlist-xl-badge.py)
+# Sticky DiT selection: createpanel-model-sticky.py (no snap-back to turbo)
 # =============================================================================
 
 FROM node:20-bookworm-slim
@@ -129,6 +130,7 @@ COPY docker/ui-patches/training-panel-datasets.py /tmp/training-panel-datasets.p
 COPY docker/ui-patches/training-panel-lora-output.py /tmp/training-panel-lora-output.py
 COPY docker/ui-patches/generate-models-xl.py /tmp/generate-models-xl.py
 COPY docker/ui-patches/songlist-xl-badge.py /tmp/songlist-xl-badge.py
+COPY docker/ui-patches/createpanel-model-sticky.py /tmp/createpanel-model-sticky.py
 
 RUN python3 - <<'PY'
 from pathlib import Path
@@ -228,6 +230,7 @@ RUN python3 /tmp/training-panel-datasets.py
 RUN python3 /tmp/training-panel-lora-output.py
 RUN python3 /tmp/generate-models-xl.py
 RUN python3 /tmp/songlist-xl-badge.py
+RUN python3 /tmp/createpanel-model-sticky.py
 
 RUN python3 - <<'PY'
 from pathlib import Path
