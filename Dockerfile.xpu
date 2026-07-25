@@ -7,6 +7,7 @@
 #         trainer.py XPU path: basic loop (Lightning Fabric has no accelerator=xpu)
 #         preprocess_audio.py soundfile backend
 # Default runtime: ACESTEP_EXTRA_ARGS=--quantization none (LoRA-compatible)
+# Dual CPU offload (offload_to_cpu + offload_dit_to_cpu) for A770 XL headroom
 # =============================================================================
 
 FROM ubuntu:22.04
@@ -277,6 +278,7 @@ ENV ACESTEP_CONFIG_PATH=acestep-v15-turbo
 ENV ACESTEP_LM_MODEL_PATH=acestep-5Hz-lm-1.7B
 ENV ACESTEP_LLM_BACKEND=pt
 ENV ACESTEP_OFFLOAD_TO_CPU=true
+ENV ACESTEP_OFFLOAD_DIT_TO_CPU=true
 # Default: disable INT8 so LoRA can load (override via compose/env if needed)
 # Must be quoted — Docker ENV rejects unquoted values that contain spaces
 ENV ACESTEP_EXTRA_ARGS="--quantization none"
@@ -341,10 +343,15 @@ if [ "${ACESTEP_INIT_SERVICE:-true}" = "true" ]; then
     echo "Auto-init    : DiT=${ACESTEP_CONFIG_PATH:-auto}  LM=${ACESTEP_LM_MODEL_PATH:-none}"
 fi
 
+# Dual offload for A770 16GB (especially XL): weights + post-step DiT to CPU
 OFFLOAD_ARGS=""
 if [ "${ACESTEP_OFFLOAD_TO_CPU:-true}" = "true" ]; then
     OFFLOAD_ARGS="--offload_to_cpu true"
 fi
+if [ "${ACESTEP_OFFLOAD_DIT_TO_CPU:-true}" = "true" ]; then
+    OFFLOAD_ARGS="${OFFLOAD_ARGS} --offload_dit_to_cpu true"
+fi
+echo "Offload     : to_cpu=${ACESTEP_OFFLOAD_TO_CPU:-true}  dit_to_cpu=${ACESTEP_OFFLOAD_DIT_TO_CPU:-true}"
 
 if [ "${ACESTEP_MODE}" = "api" ]; then
     echo "Starting pure REST API on 0.0.0.0:${ACESTEP_API_PORT:-8001} ..."
