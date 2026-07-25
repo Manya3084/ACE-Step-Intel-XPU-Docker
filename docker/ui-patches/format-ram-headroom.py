@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
 """Give /format_input and /format_lyrics the same headroom as generation.
 
-On Arc A770, Format was loading the LM to XPU while XL DiT still occupied
-VRAM, then the HTTP socket dropped (UI: other side closed).
-
-This rewrites _xpu_register_format_input (or injects it) so each Format call:
-  1. torch.xpu.empty_cache() + gc
-  2. forces llm_handler.offload_to_cpu = True when env says so
-  3. best-effort moves DiT weights to CPU for the duration of Format
-  4. runs format_sample
-  5. empty_cache again
+IMPORTANT: When replacing an existing _xpu_register_format_input, end the
+function by *indentation* (column-0 content). Never use "next def" as the
+end marker — that deleted all imports between a prepended helper and main()
+(including get_gpu_config) and crash-looped the container.
 """
 from __future__ import annotations
 
@@ -63,7 +58,6 @@ def _xpu_register_format_input(demo, llm_handler):
             model = getattr(dit, "model", None)
             if model is None:
                 return
-            # Prefer existing offload helpers if present
             for name in ("offload_to_cpu", "_offload_model_to_cpu", "move_to_cpu"):
                 fn = getattr(dit, name, None)
                 if callable(fn):
@@ -119,7 +113,6 @@ def _xpu_register_format_input(demo, llm_handler):
         if not isinstance(param_obj, dict):
             param_obj = {}
 
-        # Also accept flat body fields from ace-step-ui
         user_metadata = {}
         bpm = param_obj.get("bpm") if param_obj.get("bpm") is not None else body.get("bpm")
         duration = (
@@ -235,6 +228,41 @@ def _xpu_register_format_input(demo, llm_handler):
 '''
 
 
+def _function_end_by_indent(text: str, start: int) -> int:
+    """Return index just past a top-level function starting at start.
+
+    A top-level function ends at the first non-empty line that has no indent
+    (column 0) after the def line, excluding blank lines and comments that
+    may sit between nested blocks — we only stop on real column-0 code.
+    """
+    # start at the end of the def line
+    nl = text.find("\n", start)
+    if nl < 0:
+        return len(text)
+    i = nl + 1
+    n = len(text)
+    while i < n:
+        # find end of this line
+        nl = text.find("\n", i)
+        if nl < 0:
+            line = text[i:]
+            line_end = n
+        else:
+            line = text[i:nl]
+            line_end = nl + 1
+        stripped = line.lstrip("\r")
+        if stripped.strip() == "" or stripped.lstrip().startswith("#"):
+            i = line_end
+            continue
+        # Indented body continues the function
+        if line.startswith(" ") or line.startswith("\t"):
+            i = line_end
+            continue
+        # Column-0 content → end of function
+        return i
+    return n
+
+
 def main() -> None:
     paths = list(Path("/app").rglob("acestep_v15_pipeline.py"))
     if not paths:
@@ -250,28 +278,26 @@ def main() -> None:
             continue
 
         if "def _xpu_register_format_input" in text:
-            # Replace existing helper function body through next top-level def after it
             start = text.find("def _xpu_register_format_input")
-            # find end: next "\ndef " at column 0 after start, or before class
-            rest = text[start + 1 :]
-            m = re.search(r"\n(?:def |class )", rest)
-            if not m:
-                # append-style: replace from def to end of file section before first non-indented after long block
-                print("Could not find end of _xpu_register_format_input", file=sys.stderr)
-                sys.exit(1)
-            end = start + 1 + m.start()
+            end = _function_end_by_indent(text, start)
             text = text[:start] + NEW_HELPER.strip() + "\n\n" + text[end:]
             path.write_text(text)
-            print(f"Replaced _xpu_register_format_input in {path}")
+            print(f"Replaced _xpu_register_format_input (indent-safe) in {path}")
         else:
-            # Insert helper near top after imports-ish, and ensure registration call
-            text = NEW_HELPER + "\n" + text
+            # Prefer insert *after* imports: before first top-level def that is not ours
+            m = re.search(r"^(def |class )", text, flags=re.M)
+            if m:
+                insert_at = m.start()
+                text = text[:insert_at] + NEW_HELPER.strip() + "\n\n" + text[insert_at:]
+            else:
+                text = NEW_HELPER + "\n" + text
             if "_xpu_register_format_input(demo, llm_handler)" not in text:
                 pat = re.compile(r"(setup_api_routes\([^\n]*\))")
-                m = pat.search(text)
-                if m:
+                mm = pat.search(text)
+                if mm:
                     text = pat.sub(
-                        m.group(1) + "\n            _xpu_register_format_input(demo, llm_handler)",
+                        mm.group(1)
+                        + "\n            _xpu_register_format_input(demo, llm_handler)",
                         text,
                         count=1,
                     )
