@@ -12,6 +12,7 @@
 # LM RAM path: ACESTEP_LM_OFFLOAD_TO_CPU + ACESTEP_ALLOW_4B_LM (large system RAM)
 # Live LM re-init: POST /v1/init with init_llm + lm_model_path (no container restart)
 # Format: empty_cache + LM offload + park DiT before /format_lyrics (format-ram-headroom)
+# fix-pipeline-imports: restore get_gpu_config if a patch wiped imports
 # =============================================================================
 
 FROM ubuntu:22.04
@@ -66,29 +67,12 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 WORKDIR /app
 COPY . /app/
 
-# ---------------------------------------------------------------------------
-# Patch: LoRA/LoKR trainer — XPU uses basic loop (Fabric has no accelerator=xpu)
-# ---------------------------------------------------------------------------
 RUN python3 /app/docker/ui-patches/trainer_xpu_fabric.py
-
-# ---------------------------------------------------------------------------
-# Patch: preprocess audio via soundfile (no torchcodec / libnvrtc)
-# ---------------------------------------------------------------------------
 RUN python3 /app/docker/ui-patches/preprocess_audio_soundfile.py
-
-# ---------------------------------------------------------------------------
-# Patch: allow 4B LM via system RAM / CPU offload on ~16GB Arc (high host RAM)
-# ---------------------------------------------------------------------------
 RUN python3 /app/docker/ui-patches/lm-ram-offload.py
-
-# ---------------------------------------------------------------------------
-# Patch: live LM re-init via Gradio POST /v1/init (same path as DiT switch)
-# ---------------------------------------------------------------------------
 RUN python3 /app/docker/ui-patches/live-lm-reinit.py
 
-# ---------------------------------------------------------------------------
-# Patch: Gradio --enable-api format endpoint (base registration)
-# ---------------------------------------------------------------------------
+# Base format endpoint registration (prepend helper if missing)
 RUN python3 - <<'PY'
 from pathlib import Path
 import re
@@ -224,22 +208,25 @@ def _xpu_register_format_input(demo, llm_handler):
     app.add_api_route("/format_lyrics", format_input_endpoint, methods=["POST"])
     print("[XPU] Registered working /format_input and /format_lyrics (threaded)")
 '''
-
-    text = helper + "\n" + text
+    # Insert AFTER imports (before first top-level def) to avoid wiping imports later
+    m = re.search(r"^(def |class )", text, flags=re.M)
+    if m:
+        text = text[: m.start()] + helper + "\n" + text[m.start() :]
+    else:
+        text = helper + "\n" + text
     pat = re.compile(r"(setup_api_routes\([^\n]*\))")
-    m = pat.search(text)
-    if not m:
+    mm = pat.search(text)
+    if not mm:
         raise SystemExit("setup_api_routes call pattern not found")
-    injection = m.group(1) + "\n            _xpu_register_format_input(demo, llm_handler)"
+    injection = mm.group(1) + "\n            _xpu_register_format_input(demo, llm_handler)"
     text = pat.sub(injection, text, count=1)
     pipeline.write_text(text)
     print(f"Patched {pipeline}")
 PY
 
-# ---------------------------------------------------------------------------
-# Patch: Format RAM/VRAM headroom (empty_cache, LM offload, park DiT)
-# ---------------------------------------------------------------------------
+# Format headroom (indent-safe replace) + restore any missing imports
 RUN python3 /app/docker/ui-patches/format-ram-headroom.py
+RUN python3 /app/docker/ui-patches/fix-pipeline-imports.py
 
 # Install project, force XPU torch LAST, then matching torchao / bnb / lycoris / soundfile / DCW
 RUN uv venv /app/.venv --python python3.11 \
