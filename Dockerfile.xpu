@@ -6,6 +6,7 @@
 #         soundfile + ffmpeg (TorchCodec is CUDA-only — do not use on pure XPU)
 #         trainer.py XPU path: basic loop (Lightning Fabric has no accelerator=xpu)
 #         preprocess_audio.py soundfile backend
+#         PyWavelets + pytorch_wavelets (DCW Differential Correction Wavelet)
 # Default runtime: ACESTEP_EXTRA_ARGS=--quantization none (LoRA-compatible)
 # Dual CPU offload (offload_to_cpu + offload_dit_to_cpu) for A770 XL headroom
 # LM RAM path: ACESTEP_LM_OFFLOAD_TO_CPU + ACESTEP_ALLOW_4B_LM (large system RAM)
@@ -240,7 +241,7 @@ PY
 # ---------------------------------------------------------------------------
 RUN python3 /app/docker/ui-patches/format-ram-headroom.py
 
-# Install project, force XPU torch LAST, then matching torchao / bnb / lycoris / soundfile
+# Install project, force XPU torch LAST, then matching torchao / bnb / lycoris / soundfile / DCW
 RUN uv venv /app/.venv --python python3.11 \
     && . /app/.venv/bin/activate \
     && uv pip install --upgrade pip \
@@ -257,11 +258,16 @@ RUN uv venv /app/.venv --python python3.11 \
          || uv pip install --pre --force-reinstall --no-deps "torchao>=0.16.0" ) \
     && uv pip install --no-deps "bitsandbytes>=0.48.0" \
     && uv pip install "lycoris-lora" "soundfile>=0.13.1" \
+    && uv pip install "PyWavelets>=1.4.0" \
+    && ( uv pip install "pytorch-wavelets>=1.3.0" \
+         || uv pip install "git+https://github.com/fbcotter/pytorch_wavelets.git" ) \
     && python -c "import torch; print('torch', torch.__version__)" \
     && python -c "import torchao; v=str(getattr(torchao,'__version__','')); print('torchao', v); assert '0.15' not in v.split('+')[0].split('.dev')[0] or v.startswith('0.16') or v.startswith('0.17') or v.startswith('0.18') or v.startswith('0.19'), f'torchao too old: {v}'" \
     && python -c "import bitsandbytes as bnb; print('bitsandbytes', bnb.__version__)" \
     && python -c "import lycoris; print('lycoris ok')" \
-    && python -c "import soundfile; print('soundfile', soundfile.__version__)"
+    && python -c "import soundfile; print('soundfile', soundfile.__version__)" \
+    && python -c "import pywt; print('PyWavelets', pywt.__version__)" \
+    && python -c "import pytorch_wavelets; print('pytorch_wavelets ok')"
 
 RUN mkdir -p /app/datasets/_tools /tmp \
     && SRC=/app/docker/ui-patches/preprocess_dataset_xpu.py \
@@ -320,6 +326,7 @@ echo "torchao   : $(python -c 'import torchao; print(torchao.__version__)' 2>/de
 echo "bnb       : $(python -c 'import bitsandbytes as b; print(b.__version__)' 2>/dev/null || echo 'N/A')"
 echo "lycoris   : $(python -c 'import lycoris; print(\"ok\")' 2>/dev/null || echo 'N/A')"
 echo "soundfile : $(python -c 'import soundfile as s; print(s.__version__)' 2>/dev/null || echo 'N/A')"
+echo "DCW       : $(python -c 'import pytorch_wavelets, pywt; print(\"ok\")' 2>/dev/null || echo 'missing')"
 echo "EXTRA     : ${ACESTEP_EXTRA_ARGS:-}"
 
 if python -c 'import torch; assert hasattr(torch, "xpu") and torch.xpu.is_available()' 2>/dev/null; then
