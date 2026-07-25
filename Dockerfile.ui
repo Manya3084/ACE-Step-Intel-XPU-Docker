@@ -12,6 +12,7 @@
 # LM Model dropdown: live switch via /api/generate/switch-lm -> Gradio /v1/init
 # DiT model menu: live switch via /api/generate/switch-dit -> Gradio /v1/init (XL)
 # Generate button: second click cancels active jobs (createpanel-generate-cancel.py)
+# AI Format: timeout-aware error messaging (format-ui-timeout.py)
 # =============================================================================
 
 FROM node:20-bookworm-slim
@@ -137,6 +138,7 @@ COPY docker/ui-patches/createpanel-model-sticky.py /tmp/createpanel-model-sticky
 COPY docker/ui-patches/createpanel-lm-switch.py /tmp/createpanel-lm-switch.py
 COPY docker/ui-patches/createpanel-dit-live-switch.py /tmp/createpanel-dit-live-switch.py
 COPY docker/ui-patches/createpanel-generate-cancel.py /tmp/createpanel-generate-cancel.py
+COPY docker/ui-patches/format-ui-timeout.py /tmp/format-ui-timeout.py
 
 RUN python3 - <<'PY'
 from pathlib import Path
@@ -240,6 +242,7 @@ RUN python3 /tmp/createpanel-model-sticky.py
 RUN python3 /tmp/createpanel-lm-switch.py
 RUN python3 /tmp/createpanel-dit-live-switch.py
 RUN python3 /tmp/createpanel-generate-cancel.py
+RUN python3 /tmp/format-ui-timeout.py
 
 RUN python3 - <<'PY'
 from pathlib import Path
