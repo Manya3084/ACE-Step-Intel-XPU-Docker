@@ -8,6 +8,7 @@
 #         preprocess_audio.py soundfile backend
 # Default runtime: ACESTEP_EXTRA_ARGS=--quantization none (LoRA-compatible)
 # Dual CPU offload (offload_to_cpu + offload_dit_to_cpu) for A770 XL headroom
+# LM RAM path: ACESTEP_LM_OFFLOAD_TO_CPU + ACESTEP_ALLOW_4B_LM (large system RAM)
 # =============================================================================
 
 FROM ubuntu:22.04
@@ -71,6 +72,11 @@ RUN python3 /app/docker/ui-patches/trainer_xpu_fabric.py
 # Patch: preprocess audio via soundfile (no torchcodec / libnvrtc)
 # ---------------------------------------------------------------------------
 RUN python3 /app/docker/ui-patches/preprocess_audio_soundfile.py
+
+# ---------------------------------------------------------------------------
+# Patch: allow 4B LM via system RAM / CPU offload on ~16GB Arc (high host RAM)
+# ---------------------------------------------------------------------------
+RUN python3 /app/docker/ui-patches/lm-ram-offload.py
 
 # ---------------------------------------------------------------------------
 # Patch: Gradio --enable-api format endpoint
@@ -279,6 +285,11 @@ ENV ACESTEP_LM_MODEL_PATH=acestep-5Hz-lm-1.7B
 ENV ACESTEP_LLM_BACKEND=pt
 ENV ACESTEP_OFFLOAD_TO_CPU=true
 ENV ACESTEP_OFFLOAD_DIT_TO_CPU=true
+# LM on system RAM (pt backend): weights stay on CPU, shuttle to XPU only while generating.
+# ACESTEP_ALLOW_4B_LM skips upstream hard-downgrade of 4B→1.7B on <20GB VRAM.
+# Optional full-CPU LM: ACESTEP_LM_DEVICE=cpu (slower CoT, almost no LM VRAM).
+ENV ACESTEP_LM_OFFLOAD_TO_CPU=true
+ENV ACESTEP_ALLOW_4B_LM=true
 # Default: disable INT8 so LoRA can load (override via compose/env if needed)
 # Must be quoted — Docker ENV rejects unquoted values that contain spaces
 ENV ACESTEP_EXTRA_ARGS="--quantization none"
@@ -352,6 +363,7 @@ if [ "${ACESTEP_OFFLOAD_DIT_TO_CPU:-true}" = "true" ]; then
     OFFLOAD_ARGS="${OFFLOAD_ARGS} --offload_dit_to_cpu true"
 fi
 echo "Offload     : to_cpu=${ACESTEP_OFFLOAD_TO_CPU:-true}  dit_to_cpu=${ACESTEP_OFFLOAD_DIT_TO_CPU:-true}"
+echo "LM RAM      : offload=${ACESTEP_LM_OFFLOAD_TO_CPU:-true}  allow_4B=${ACESTEP_ALLOW_4B_LM:-true}  device=${ACESTEP_LM_DEVICE:-auto}"
 
 if [ "${ACESTEP_MODE}" = "api" ]; then
     echo "Starting pure REST API on 0.0.0.0:${ACESTEP_API_PORT:-8001} ..."
