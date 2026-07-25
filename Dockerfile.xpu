@@ -1,18 +1,8 @@
 # =============================================================================
 # ACE-Step 1.5 — Intel XPU / Arc GPU Dockerfile
 # =============================================================================
-# Optimized for Intel Arc A770 16GB on Linux / OMV
-# Bakes: PyTorch XPU nightly, torchao>=0.16 (+xpu), bitsandbytes, lycoris-lora
-#         soundfile + ffmpeg (TorchCodec is CUDA-only — do not use on pure XPU)
-#         trainer.py XPU path: basic loop (Lightning Fabric has no accelerator=xpu)
-#         preprocess_audio.py soundfile backend
-#         PyWavelets + pytorch_wavelets (DCW Differential Correction Wavelet)
-# Default runtime: ACESTEP_EXTRA_ARGS=--quantization none (LoRA-compatible)
-# Dual CPU offload (offload_to_cpu + offload_dit_to_cpu) for A770 XL headroom
-# LM RAM path: ACESTEP_LM_OFFLOAD_TO_CPU + ACESTEP_ALLOW_4B_LM (large system RAM)
-# Live LM re-init: POST /v1/init with init_llm + lm_model_path (no container restart)
-# Format: empty_cache + LM offload + park DiT before /format_lyrics (format-ram-headroom)
-# fix-pipeline-imports: restore get_gpu_config if a patch wiped imports
+# Format routes: standalone acestep/xpu_format_routes.py (wire-format-routes.py)
+# Never inline large helpers into acestep_v15_pipeline.py (caused SyntaxError).
 # =============================================================================
 
 FROM ubuntu:22.04
@@ -38,7 +28,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         pciutils \
     && rm -rf /var/lib/apt/lists/*
 
-# Intel GPU compute repository (Level Zero)
 RUN wget -qO - https://repositories.intel.com/gpu/intel-graphics.key | \
         gpg --yes --dearmor --output /usr/share/keyrings/intel-graphics.gpg \
     && echo "deb [arch=amd64,i386 signed-by=/usr/share/keyrings/intel-graphics.gpg] https://repositories.intel.com/gpu/ubuntu jammy unified" | \
@@ -72,163 +61,23 @@ RUN python3 /app/docker/ui-patches/preprocess_audio_soundfile.py
 RUN python3 /app/docker/ui-patches/lm-ram-offload.py
 RUN python3 /app/docker/ui-patches/live-lm-reinit.py
 
-# Base format endpoint registration (prepend helper if missing)
-RUN python3 - <<'PY'
-from pathlib import Path
-import re
-
-candidates = list(Path("/app").rglob("acestep_v15_pipeline.py") )
-if not candidates:
-    raise SystemExit("acestep_v15_pipeline.py not found")
-pipeline = candidates[0]
-text = pipeline.read_text()
-
-if "_xpu_register_format_input" in text:
-    print("Format patch already present")
-else:
-    helper = '''
-
-def _xpu_register_format_input(demo, llm_handler):
-    """Ensure POST /format_input works under Gradio --enable-api (Intel fork)."""
-    import asyncio
-    import json
-    import time
-    from fastapi import Request
-
-    try:
-        app = demo.app
-    except Exception as exc:
-        print(f"[XPU] format_input: no demo.app ({exc})")
-        return
-
-    async def format_input_endpoint(request: Request):
-        try:
-            body = await request.json()
-        except Exception:
-            body = {}
-
-        prompt = body.get("prompt") or body.get("caption") or ""
-        lyrics = body.get("lyrics") or ""
-        temperature = body.get("temperature", 0.85)
-        try:
-            temperature = float(temperature)
-        except Exception:
-            temperature = 0.85
-
-        param_obj = body.get("param_obj", {})
-        if isinstance(param_obj, str):
-            try:
-                param_obj = json.loads(param_obj) if param_obj else {}
-            except Exception:
-                param_obj = {}
-        if not isinstance(param_obj, dict):
-            param_obj = {}
-
-        user_metadata = {}
-        bpm = param_obj.get("bpm")
-        duration = param_obj.get("duration")
-        key_scale = param_obj.get("key") or param_obj.get("key_scale") or ""
-        time_signature = param_obj.get("time_signature") or ""
-        language = param_obj.get("language") or ""
-        if bpm not in (None, "", 0, "0"):
-            try:
-                user_metadata["bpm"] = int(bpm)
-            except Exception:
-                pass
-        if duration not in (None, "", 0, "0", -1, "-1"):
-            try:
-                user_metadata["duration"] = int(float(duration))
-            except Exception:
-                pass
-        if key_scale:
-            user_metadata["keyscale"] = str(key_scale)
-        if time_signature:
-            user_metadata["timesignature"] = str(time_signature)
-        if language and language != "unknown":
-            user_metadata["language"] = str(language)
-
-        def _run():
-            from acestep.inference import format_sample
-            return format_sample(
-                llm_handler=llm_handler,
-                caption=prompt,
-                lyrics=lyrics,
-                user_metadata=user_metadata or None,
-                temperature=temperature,
-                use_constrained_decoding=True,
-            )
-
-        try:
-            result = await asyncio.to_thread(_run)
-        except Exception as exc:
-            return {
-                "data": None,
-                "code": 500,
-                "error": f"format_sample error: {exc}",
-                "timestamp": int(time.time() * 1000),
-                "extra": None,
-            }
-
-        if not getattr(result, "success", False):
-            err = getattr(result, "error", None) or getattr(result, "status_message", None) or "format failed"
-            return {
-                "data": None,
-                "code": 500,
-                "error": f"format_sample failed: {err}",
-                "timestamp": int(time.time() * 1000),
-                "extra": None,
-            }
-
-        data = {
-            "caption": getattr(result, "caption", None) or prompt,
-            "lyrics": getattr(result, "lyrics", None) or lyrics,
-            "bpm": getattr(result, "bpm", None) or bpm,
-            "key_scale": getattr(result, "keyscale", None) or key_scale,
-            "time_signature": getattr(result, "timesignature", None) or time_signature,
-            "duration": getattr(result, "duration", None) or duration,
-            "vocal_language": getattr(result, "language", None) or language or "unknown",
-        }
-        return {
-            "data": data,
-            "code": 200,
-            "error": None,
-            "timestamp": int(time.time() * 1000),
-            "extra": None,
-        }
-
-    try:
-        app.router.routes = [
-            r for r in app.router.routes
-            if not (getattr(r, "path", None) == "/format_input")
-        ]
-    except Exception:
-        pass
-
-    app.add_api_route("/format_input", format_input_endpoint, methods=["POST"])
-    app.add_api_route("/format_lyrics", format_input_endpoint, methods=["POST"])
-    print("[XPU] Registered working /format_input and /format_lyrics (threaded)")
-'''
-    # Insert AFTER imports (before first top-level def) to avoid wiping imports later
-    m = re.search(r"^(def |class )", text, flags=re.M)
-    if m:
-        text = text[: m.start()] + helper + "\n" + text[m.start() :]
-    else:
-        text = helper + "\n" + text
-    pat = re.compile(r"(setup_api_routes\([^\n]*\))")
-    mm = pat.search(text)
-    if not mm:
-        raise SystemExit("setup_api_routes call pattern not found")
-    injection = mm.group(1) + "\n            _xpu_register_format_input(demo, llm_handler)"
-    text = pat.sub(injection, text, count=1)
-    pipeline.write_text(text)
-    print(f"Patched {pipeline}")
-PY
-
-# Format headroom (indent-safe replace) + restore any missing imports
-RUN python3 /app/docker/ui-patches/format-ram-headroom.py
+# Format: standalone module + one-line wire (strips any old broken inlined helper)
+RUN python3 /app/docker/ui-patches/wire-format-routes.py
 RUN python3 /app/docker/ui-patches/fix-pipeline-imports.py
 
-# Install project, force XPU torch LAST, then matching torchao / bnb / lycoris / soundfile / DCW
+# Final syntax gate for pipeline
+RUN python3 - <<'PY'
+import ast
+from pathlib import Path
+for p in Path("/app").rglob("acestep_v15_pipeline.py"):
+    src = p.read_text()
+    try:
+        ast.parse(src)
+        print("ast OK", p)
+    except SyntaxError as e:
+        raise SystemExit(f"Pipeline still invalid {p}: {e}")
+PY
+
 RUN uv venv /app/.venv --python python3.11 \
     && . /app/.venv/bin/activate \
     && uv pip install --upgrade pip \
@@ -249,7 +98,7 @@ RUN uv venv /app/.venv --python python3.11 \
     && ( uv pip install "pytorch-wavelets>=1.3.0" \
          || uv pip install "git+https://github.com/fbcotter/pytorch_wavelets.git" ) \
     && python -c "import torch; print('torch', torch.__version__)" \
-    && python -c "import torchao; v=str(getattr(torchao,'__version__','')); print('torchao', v); assert '0.15' not in v.split('+')[0].split('.dev')[0] or v.startswith('0.16') or v.startswith('0.17') or v.startswith('0.18') or v.startswith('0.19'), f'torchao too old: {v}'" \
+    && python -c "import torchao; print('torchao', torchao.__version__)" \
     && python -c "import bitsandbytes as bnb; print('bitsandbytes', bnb.__version__)" \
     && python -c "import lycoris; print('lycoris ok')" \
     && python -c "import soundfile; print('soundfile', soundfile.__version__)" \
@@ -326,7 +175,6 @@ for i in range(torch.xpu.device_count()):
 ' 2>/dev/null || true
 else
     echo "XPU       : NOT DETECTED"
-    echo "           Make sure /dev/dri is passed and Intel drivers + Level Zero are on the host"
 fi
 echo "==========================================="
 
@@ -361,34 +209,25 @@ echo "Offload     : to_cpu=${ACESTEP_OFFLOAD_TO_CPU:-true}  dit_to_cpu=${ACESTEP
 echo "LM RAM      : offload=${ACESTEP_LM_OFFLOAD_TO_CPU:-true}  allow_4B=${ACESTEP_ALLOW_4B_LM:-true}  device=${ACESTEP_LM_DEVICE:-auto}"
 
 if [ "${ACESTEP_MODE}" = "api" ]; then
-    echo "Starting pure REST API on 0.0.0.0:${ACESTEP_API_PORT:-8001} ..."
     exec python -m acestep.api_server \
         --host "${ACESTEP_API_HOST:-0.0.0.0}" \
         --port "${ACESTEP_API_PORT:-8001}" \
         ${ACESTEP_EXTRA_ARGS:-}
-
 elif [ "${ACESTEP_MODE}" = "gradio" ]; then
-    echo "Starting Gradio UI on 0.0.0.0:${GRADIO_PORT:-7860} ..."
     exec python -m acestep.acestep_v15_pipeline \
         --server-name "${GRADIO_SERVER_NAME:-0.0.0.0}" \
         --port "${GRADIO_PORT:-7860}" \
         --backend "${ACESTEP_LLM_BACKEND:-pt}" \
-        ${INIT_ARGS} \
-        ${OFFLOAD_ARGS} \
-        ${ACESTEP_EXTRA_ARGS:-}
-
+        ${INIT_ARGS} ${OFFLOAD_ARGS} ${ACESTEP_EXTRA_ARGS:-}
 else
     PORT="${ACESTEP_API_PORT:-8001}"
     echo "Starting Gradio + API endpoints on 0.0.0.0:${PORT} ..."
-    echo "(ace-step-ui connects via Gradio client to this port)"
     exec python -m acestep.acestep_v15_pipeline \
         --server-name "${GRADIO_SERVER_NAME:-0.0.0.0}" \
         --port "${PORT}" \
         --backend "${ACESTEP_LLM_BACKEND:-pt}" \
         --enable-api \
-        ${INIT_ARGS} \
-        ${OFFLOAD_ARGS} \
-        ${ACESTEP_EXTRA_ARGS:-}
+        ${INIT_ARGS} ${OFFLOAD_ARGS} ${ACESTEP_EXTRA_ARGS:-}
 fi
 ENTRYPOINT_EOF
 
