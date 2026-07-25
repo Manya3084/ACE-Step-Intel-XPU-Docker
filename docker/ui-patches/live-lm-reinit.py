@@ -24,6 +24,9 @@ Use chr(92) / .replace so the written source is always valid Python.
 Also: never emit multi-line f-strings for the "Download first" error
 message — older images left an unterminated f"Download first, e.g.:
 literal. Use .format() instead.
+
+Checkpoint root: do NOT trust _get_project_root() from api_routes.py
+context (it resolves to /app/acestep/ui). Prefer /app/checkpoints.
 """
 from __future__ import annotations
 
@@ -58,6 +61,41 @@ def _basename_ckpt(path) -> str:
     return os.path.basename(str(path).replace(chr(92), "/").rstrip("/"))
 
 
+def _resolve_checkpoint_dir() -> str:
+    """Return the real checkpoints directory used by the Docker image.
+
+    _get_project_root() from api_routes.py context resolves to
+    /app/acestep/ui (wrong). Prefer env, then the fixed Docker path.
+    """
+    for key in ("ACESTEP_CHECKPOINTS_DIR", "ACESTEP_CHECKPOINT_DIR", "CHECKPOINT_DIR"):
+        v = (os.environ.get(key) or "").strip()
+        if v:
+            os.makedirs(v, exist_ok=True)
+            return v
+    if os.path.isdir("/app/checkpoints"):
+        return "/app/checkpoints"
+    # Fallbacks for non-Docker / odd layouts
+    try:
+        root = _get_project_root()
+        candidate = os.path.join(root, "checkpoints")
+        if os.path.isdir(candidate):
+            return candidate
+        # Walk up looking for a checkpoints/ sibling of acestep/
+        cur = root
+        for _ in range(6):
+            parent = os.path.dirname(cur)
+            if parent == cur:
+                break
+            cand = os.path.join(parent, "checkpoints")
+            if os.path.isdir(cand):
+                return cand
+            cur = parent
+    except Exception:
+        pass
+    os.makedirs("/app/checkpoints", exist_ok=True)
+    return "/app/checkpoints"
+
+
 def _current_lm_name(llm_handler) -> Optional[str]:
     """Return the currently loaded 5Hz LM checkpoint name, if any."""
     if llm_handler is None or not getattr(llm_handler, "llm_initialized", False):
@@ -79,9 +117,9 @@ def _collect_available_lm_names(llm_handler) -> List[str]:
             names.update(llm_handler.get_available_5hz_lm_models() or [])
         except Exception as exc:
             logger.warning(f"[v1/models] get_available_5hz_lm_models failed: {exc}")
-    # Also scan checkpoints dir directly
+    # Scan the real checkpoints dir
     try:
-        ckpt = os.path.join(_get_project_root(), "checkpoints")
+        ckpt = _resolve_checkpoint_dir()
         if os.path.isdir(ckpt):
             for entry in os.listdir(ckpt):
                 if entry.startswith("acestep-5Hz-lm-") and os.path.isdir(os.path.join(ckpt, entry)):
@@ -123,8 +161,7 @@ def _switch_lm_model_sync(llm_handler, lm_model_path: str) -> Dict[str, Any]:
             "lm_device": str(getattr(llm_handler, "device", "?")),
         }
 
-    project_root = _get_project_root()
-    checkpoint_dir = os.path.join(project_root, "checkpoints")
+    checkpoint_dir = _resolve_checkpoint_dir()
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     full_path = os.path.join(checkpoint_dir, lm_model_path)
@@ -170,7 +207,8 @@ def _switch_lm_model_sync(llm_handler, lm_model_path: str) -> Dict[str, Any]:
 
     logger.info(
         f"[v1/init] Switching LM: {current!r} -> {lm_model_path!r} "
-        f"(backend={backend}, device={lm_device}, offload_to_cpu={lm_offload})"
+        f"(backend={backend}, device={lm_device}, offload_to_cpu={lm_offload}, "
+        f"checkpoint_dir={checkpoint_dir})"
     )
     _clear_accelerator_cache("(before LM switch)")
 
@@ -205,6 +243,7 @@ def _switch_lm_model_sync(llm_handler, lm_model_path: str) -> Dict[str, Any]:
         "lm_switched": True,
         "lm_offload_to_cpu": lm_offload,
         "lm_device": lm_device,
+        "checkpoint_dir": checkpoint_dir,
     }
 '''
 
@@ -331,6 +370,8 @@ async def init_model(request: Request, authorization: Optional[str] = Header(Non
             result["lm_switched"] = lm_result.get("lm_switched")
             result["lm_offload_to_cpu"] = lm_result.get("lm_offload_to_cpu")
             result["lm_device"] = lm_result.get("lm_device")
+            if lm_result.get("checkpoint_dir"):
+                result["checkpoint_dir"] = lm_result.get("checkpoint_dir")
             if not model_name:
                 result["message"] = lm_result.get("message")
                 result["switched"] = lm_result.get("lm_switched")
@@ -413,6 +454,10 @@ def _helpers_healthy(text: str) -> bool:
     if MARKER not in text:
         return False
     if "_basename_ckpt" not in text or "_switch_lm_model_sync" not in text:
+        return False
+    # Must have the robust checkpoint resolver (not the old _get_project_root only path)
+    if "_resolve_checkpoint_dir" not in text:
+        print("Missing _resolve_checkpoint_dir — will re-apply")
         return False
     # Known broken form left by an earlier multi-line f-string
     if 'f"Download first, e.g.:' in text:
