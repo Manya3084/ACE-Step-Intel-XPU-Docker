@@ -10,6 +10,7 @@
 # Song row badges: 1.5XL for XL models (songlist-xl-badge.py)
 # Sticky DiT selection: createpanel-model-sticky.py (no snap-back to turbo)
 # LM Model dropdown: live switch via /api/generate/switch-lm -> Gradio /v1/init
+# DiT model menu: live switch via /api/generate/switch-dit -> Gradio /v1/init (XL)
 # =============================================================================
 
 FROM node:20-bookworm-slim
@@ -133,6 +134,7 @@ COPY docker/ui-patches/generate-models-xl.py /tmp/generate-models-xl.py
 COPY docker/ui-patches/songlist-xl-badge.py /tmp/songlist-xl-badge.py
 COPY docker/ui-patches/createpanel-model-sticky.py /tmp/createpanel-model-sticky.py
 COPY docker/ui-patches/createpanel-lm-switch.py /tmp/createpanel-lm-switch.py
+COPY docker/ui-patches/createpanel-dit-live-switch.py /tmp/createpanel-dit-live-switch.py
 
 RUN python3 - <<'PY'
 from pathlib import Path
@@ -234,6 +236,7 @@ RUN python3 /tmp/generate-models-xl.py
 RUN python3 /tmp/songlist-xl-badge.py
 RUN python3 /tmp/createpanel-model-sticky.py
 RUN python3 /tmp/createpanel-lm-switch.py
+RUN python3 /tmp/createpanel-dit-live-switch.py
 
 RUN python3 - <<'PY'
 from pathlib import Path
