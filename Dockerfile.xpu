@@ -278,7 +278,8 @@ ENV ACESTEP_LM_MODEL_PATH=acestep-5Hz-lm-1.7B
 ENV ACESTEP_LLM_BACKEND=pt
 ENV ACESTEP_OFFLOAD_TO_CPU=true
 # Default: disable INT8 so LoRA can load (override via compose/env if needed)
-ENV ACESTEP_EXTRA_ARGS=--quantization none
+# Must be quoted — Docker ENV rejects unquoted values that contain spaces
+ENV ACESTEP_EXTRA_ARGS="--quantization none"
 
 ENV TOKENIZERS_PARALLELISM=false
 
