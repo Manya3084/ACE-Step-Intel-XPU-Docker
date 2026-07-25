@@ -2,7 +2,7 @@
 # ACE-Step 1.5 — Intel XPU / Arc GPU Dockerfile
 # =============================================================================
 # Format routes: standalone acestep/xpu_format_routes.py (wire-format-routes.py)
-# Never inline large helpers into acestep_v15_pipeline.py (caused SyntaxError).
+# Turbo steps: no hard clamp to 8 (ACESTEP_TURBO_MAX_INFER_STEPS=0)
 # =============================================================================
 
 FROM ubuntu:22.04
@@ -60,12 +60,11 @@ RUN python3 /app/docker/ui-patches/trainer_xpu_fabric.py
 RUN python3 /app/docker/ui-patches/preprocess_audio_soundfile.py
 RUN python3 /app/docker/ui-patches/lm-ram-offload.py
 RUN python3 /app/docker/ui-patches/live-lm-reinit.py
+RUN python3 /app/docker/ui-patches/turbo-steps-unclamp.py
 
-# Format: standalone module + one-line wire (strips any old broken inlined helper)
 RUN python3 /app/docker/ui-patches/wire-format-routes.py
 RUN python3 /app/docker/ui-patches/fix-pipeline-imports.py
 
-# Final syntax gate for pipeline
 RUN python3 - <<'PY'
 import ast
 from pathlib import Path
@@ -137,6 +136,7 @@ ENV ACESTEP_OFFLOAD_TO_CPU=true
 ENV ACESTEP_OFFLOAD_DIT_TO_CPU=true
 ENV ACESTEP_LM_OFFLOAD_TO_CPU=true
 ENV ACESTEP_ALLOW_4B_LM=true
+ENV ACESTEP_TURBO_MAX_INFER_STEPS=0
 ENV ACESTEP_EXTRA_ARGS="--quantization none"
 
 ENV TOKENIZERS_PARALLELISM=false
@@ -164,6 +164,7 @@ echo "lycoris   : $(python -c 'import lycoris; print(\"ok\")' 2>/dev/null || ech
 echo "soundfile : $(python -c 'import soundfile as s; print(s.__version__)' 2>/dev/null || echo 'N/A')"
 echo "DCW       : $(python -c 'import pytorch_wavelets, pywt; print(\"ok\")' 2>/dev/null || echo 'missing')"
 echo "EXTRA     : ${ACESTEP_EXTRA_ARGS:-}"
+echo "Turbo max steps: ${ACESTEP_TURBO_MAX_INFER_STEPS:-0} (0=uncapped)"
 
 if python -c 'import torch; assert hasattr(torch, "xpu") and torch.xpu.is_available()' 2>/dev/null; then
     echo "XPU       : AVAILABLE"
