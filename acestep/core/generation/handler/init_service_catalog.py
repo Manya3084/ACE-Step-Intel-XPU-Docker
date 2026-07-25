@@ -6,6 +6,20 @@ from typing import List, Optional
 import torch
 from loguru import logger
 
+# Known DiT checkpoint names that should appear in UI dropdowns even before
+# weights are downloaded. Selecting one triggers ensure_dit_model / download.
+_KNOWN_DIT_MODELS = (
+    "acestep-v15-turbo",
+    "acestep-v15-sft",
+    "acestep-v15-base",
+    "acestep-v15-xl-turbo",
+    "acestep-v15-xl-sft",
+    "acestep-v15-xl-base",
+    "acestep-v15-turbo-shift1",
+    "acestep-v15-turbo-shift3",
+    "acestep-v15-turbo-continuous",
+)
+
 
 class InitServiceCatalogMixin:
     """Checkpoint discovery and backend capability helpers."""
@@ -32,18 +46,22 @@ class InitServiceCatalogMixin:
         return []
 
     def get_available_acestep_v15_models(self) -> List[str]:
-        """Scan and return all model directory names starting with ``acestep-v15-``."""
+        """Return DiT model names for UI dropdowns.
+
+        Always includes known official variants (2B turbo/sft/base + XL 4B)
+        so they appear in Create / Gradio advanced options before download.
+        On-disk ``acestep-v15-*`` directories are merged in as well.
+        """
         checkpoint_dir = self._resolve_checkpoint_dir()
 
-        models = []
+        models = set(_KNOWN_DIT_MODELS)
         if os.path.exists(checkpoint_dir):
             for item in os.listdir(checkpoint_dir):
                 item_path = os.path.join(checkpoint_dir, item)
                 if os.path.isdir(item_path) and item.startswith("acestep-v15-"):
-                    models.append(item)
+                    models.add(item)
 
-        models.sort()
-        return models
+        return sorted(models)
 
     def is_flash_attention_available(self, device: Optional[str] = None) -> bool:
         """Check whether flash attention can be used on the target device."""
