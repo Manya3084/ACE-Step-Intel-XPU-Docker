@@ -3,6 +3,7 @@ Gradio API Routes Module
 Add API endpoints compatible with api_server.py and CustomAceStep to Gradio application
 """
 import atexit
+import asyncio
 import json
 import os
 import random
@@ -14,6 +15,7 @@ from uuid import uuid4
 from fastapi import APIRouter, HTTPException, Request, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from loguru import logger
 
 # Global results directory inside project root
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -23,6 +25,20 @@ os.makedirs(DEFAULT_RESULTS_DIR, exist_ok=True)
 # API Key storage (set via setup_api_routes)
 _api_key: Optional[str] = None
 _api_key_lock = Lock()
+_init_lock = Lock()  # serialize DiT model switches
+
+# Known DiT names always listed so UIs can show them before download.
+_KNOWN_DIT_MODELS = (
+    "acestep-v15-turbo",
+    "acestep-v15-sft",
+    "acestep-v15-base",
+    "acestep-v15-xl-turbo",
+    "acestep-v15-xl-sft",
+    "acestep-v15-xl-base",
+    "acestep-v15-turbo-shift1",
+    "acestep-v15-turbo-shift3",
+    "acestep-v15-turbo-continuous",
+)
 
 
 def set_api_key(key: Optional[str]):
@@ -187,39 +203,199 @@ def get_result(task_id: str) -> Optional[dict]:
         return _result_cache.get(key)
 
 
+def _current_dit_name(dit_handler) -> Optional[str]:
+    """Return the currently loaded DiT checkpoint name, if any."""
+    if dit_handler is None:
+        return None
+    params = getattr(dit_handler, "last_init_params", None) or {}
+    config_path = params.get("config_path") or ""
+    if not config_path:
+        return None
+    return os.path.basename(str(config_path).rstrip("/\\"))
+
+
+def _collect_available_dit_names(dit_handler) -> List[str]:
+    """Merge known registry names with on-disk / handler-discovered models."""
+    names = set(_KNOWN_DIT_MODELS)
+    if dit_handler is not None and hasattr(dit_handler, "get_available_acestep_v15_models"):
+        try:
+            names.update(dit_handler.get_available_acestep_v15_models() or [])
+        except Exception as exc:
+            logger.warning(f"[v1/models] get_available_acestep_v15_models failed: {exc}")
+    current = _current_dit_name(dit_handler)
+    if current:
+        names.add(current)
+    return sorted(names)
+
+
+def _switch_dit_model_sync(dit_handler, model_name: str) -> Dict[str, Any]:
+    """Blocking DiT switch used by POST /v1/init (run in a worker thread).
+
+    Downloads weights if needed, then re-runs initialize_service with the same
+    runtime flags as the previous load (device, offload, quantization, …).
+    """
+    if dit_handler is None:
+        raise RuntimeError("DiT handler is not available")
+
+    model_name = (model_name or "").strip()
+    if not model_name:
+        raise RuntimeError("model name is required")
+
+    current = _current_dit_name(dit_handler)
+    if current == model_name and dit_handler.model is not None:
+        return {
+            "message": f"Model '{model_name}' already loaded",
+            "loaded_model": model_name,
+            "switched": False,
+        }
+
+    # Preserve previous runtime settings when possible
+    prev = getattr(dit_handler, "last_init_params", None) or {}
+    project_root = prev.get("project_root") or _get_project_root()
+    device = prev.get("device") or os.environ.get("PYTORCH_DEVICE", "xpu")
+    use_flash_attention = bool(prev.get("use_flash_attention", False))
+    compile_model = bool(prev.get("compile_model", False))
+    offload_to_cpu = bool(
+        prev.get(
+            "offload_to_cpu",
+            os.environ.get("ACESTEP_OFFLOAD_TO_CPU", "true").lower()
+            in ("1", "true", "yes", "on"),
+        )
+    )
+    offload_dit_to_cpu = bool(prev.get("offload_dit_to_cpu", offload_to_cpu))
+    quantization = prev.get("quantization")
+    # Env may force "none" for LoRA compatibility
+    extra = os.environ.get("ACESTEP_EXTRA_ARGS", "")
+    if "quantization none" in extra.replace("=", " ").lower():
+        quantization = None
+    use_mlx_dit = bool(prev.get("use_mlx_dit", False))
+    prefer_source = prev.get("prefer_source")
+    vae_checkpoint = prev.get("vae_checkpoint")
+
+    logger.info(f"[v1/init] Switching DiT: {current!r} -> {model_name!r}")
+
+    status, ok = dit_handler.initialize_service(
+        project_root=project_root,
+        config_path=model_name,
+        device=device,
+        use_flash_attention=use_flash_attention,
+        compile_model=compile_model,
+        offload_to_cpu=offload_to_cpu,
+        offload_dit_to_cpu=offload_dit_to_cpu,
+        quantization=quantization,
+        prefer_source=prefer_source,
+        use_mlx_dit=use_mlx_dit,
+        vae_checkpoint=vae_checkpoint,
+    )
+    if not ok:
+        raise RuntimeError(status or f"Failed to initialize model '{model_name}'")
+
+    loaded = _current_dit_name(dit_handler) or model_name
+    logger.info(f"[v1/init] DiT loaded: {loaded}")
+    return {
+        "message": status or f"Model '{loaded}' initialized",
+        "loaded_model": loaded,
+        "switched": True,
+    }
+
+
 router = APIRouter()
 
 
 @router.get("/health")
-async def health_check():
+async def health_check(request: Request):
     """Health check endpoint"""
+    dit_handler = getattr(request.app.state, "dit_handler", None)
     return _wrap_response({
         "status": "ok",
         "service": "ACE-Step Gradio API",
         "version": "1.0",
+        "loaded_model": _current_dit_name(dit_handler),
+        "models_initialized": bool(dit_handler and dit_handler.model is not None),
     })
 
 
 @router.get("/v1/models")
 async def list_models(request: Request, _: None = Depends(verify_api_key)):
-    """List available DiT models"""
-    dit_handler = request.app.state.dit_handler
+    """List available DiT models and the currently loaded one."""
+    dit_handler = getattr(request.app.state, "dit_handler", None)
+    current = _current_dit_name(dit_handler)
+    available = _collect_available_dit_names(dit_handler)
 
-    models = []
-    if dit_handler and dit_handler.model is not None:
-        # Get current loaded model name
-        _params = getattr(dit_handler, 'last_init_params', None) or {}
-        config_path = _params.get('config_path', '')
-        model_name = os.path.basename(config_path.rstrip("/\\")) if config_path else "unknown"
-        models.append({
-            "name": model_name,
-            "is_default": True,
-        })
+    models = [
+        {
+            "name": name,
+            "is_default": bool(current and name == current),
+            "is_loaded": bool(current and name == current and dit_handler and dit_handler.model is not None),
+        }
+        for name in available
+    ]
+    # Put active first so ace-step-ui's models[0] heuristic stays correct
+    models.sort(key=lambda m: (not m["is_loaded"], m["name"]))
 
     return _wrap_response({
         "models": models,
-        "default_model": models[0]["name"] if models else None,
+        "default_model": current,
     })
+
+
+@router.post("/v1/init")
+async def init_model(request: Request, authorization: Optional[str] = Header(None)):
+    """Download (if needed) and load a DiT model into the live Gradio handler.
+
+    Body JSON:
+      { "model": "acestep-v15-xl-turbo", "init_llm": false }
+
+    Used by ace-step-ui switchModelIfNeeded() before generation when the
+    Create-panel model dropdown differs from the currently loaded DiT.
+    """
+    content_type = (request.headers.get("content-type") or "").lower()
+    if "json" in content_type:
+        body = await request.json()
+    else:
+        try:
+            form = await request.form()
+            body = {k: v for k, v in form.items()}
+        except Exception:
+            body = {}
+
+    verify_token_from_request(body, authorization)
+
+    model_name = (
+        body.get("model")
+        or body.get("dit_model")
+        or body.get("config_path")
+        or ""
+    )
+    model_name = str(model_name).strip()
+    if not model_name:
+        return _wrap_response(None, code=400, error="model is required")
+
+    dit_handler = getattr(request.app.state, "dit_handler", None)
+    if dit_handler is None:
+        return _wrap_response(None, code=500, error="DiT handler not available")
+
+    # Serialize switches — concurrent init would corrupt VRAM state
+    if not _init_lock.acquire(blocking=False):
+        return _wrap_response(
+            None,
+            code=409,
+            error="Another model switch is already in progress; try again shortly",
+        )
+
+    try:
+        result = await asyncio.to_thread(_switch_dit_model_sync, dit_handler, model_name)
+        models_payload = (await list_models(request, None))["data"]  # type: ignore[index]
+        return _wrap_response({
+            **result,
+            "models": models_payload.get("models") if isinstance(models_payload, dict) else None,
+            "default_model": result.get("loaded_model"),
+        })
+    except Exception as exc:
+        logger.exception(f"[v1/init] failed for {model_name}")
+        return _wrap_response(None, code=500, error=str(exc))
+    finally:
+        _init_lock.release()
 
 
 @router.get("/v1/audio")
@@ -547,8 +723,6 @@ async def release_task(request: Request, authorization: Optional[str] = Header(N
             raise HTTPException(status_code=500, detail=result.error or result.status_message)
 
         # Build result data with download URLs and per-audio metadata.
-        # Each audio in result.audios carries a "params" dict from GenerationParams
-        # which includes the actual seed used, caption, bpm, keyscale, etc.
         from urllib.parse import urlencode
         result_data = []
         for audio in result.audios:
@@ -557,13 +731,11 @@ async def release_task(request: Request, authorization: Optional[str] = Header(N
                 continue
             audio_params = audio.get("params", {})
 
-            # Prefer CoT-derived metadata (model's actual decision) over input hints
             item = {
                 "file": audio_path,
                 "url": f"/v1/audio?{urlencode({'path': audio_path})}",
                 "status": 1,
                 "create_time": int(time.time()),
-                # Per-audio generation metadata
                 "seed": audio_params.get("seed"),
                 "caption": audio_params.get("cot_caption") or audio_params.get("caption", ""),
                 "lyrics": audio_params.get("cot_lyrics") or audio_params.get("lyrics", ""),
@@ -575,7 +747,6 @@ async def release_task(request: Request, authorization: Optional[str] = Header(N
             }
             result_data.append(item)
 
-        # Store result
         store_result(task_id, result_data)
 
         return _wrap_response({"task_id": task_id, "status": "succeeded"})
