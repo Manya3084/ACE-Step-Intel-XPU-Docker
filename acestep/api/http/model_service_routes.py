@@ -13,6 +13,20 @@ from pydantic import BaseModel, Field
 from acestep.api.http.model_init_service import initialize_models_for_request
 from acestep.constants import TASK_TYPES_BASE, TASK_TYPES_TURBO
 
+# Known DiT names always listed in inventory so UI dropdowns can show them
+# before weights are on disk. Init endpoint downloads via ensure_dit_model.
+_KNOWN_DIT_MODELS = (
+    "acestep-v15-turbo",
+    "acestep-v15-sft",
+    "acestep-v15-base",
+    "acestep-v15-xl-turbo",
+    "acestep-v15-xl-sft",
+    "acestep-v15-xl-base",
+    "acestep-v15-turbo-shift1",
+    "acestep-v15-turbo-shift3",
+    "acestep-v15-turbo-continuous",
+)
+
 
 class InitModelRequest(BaseModel):
     """Request payload for on-demand DiT/LM model initialization."""
@@ -34,7 +48,12 @@ def _read_model_supported_tasks(checkpoint_dir: str, model_name: str) -> List[st
     """Read config.json for a model and return its supported task types."""
     config_path = os.path.join(checkpoint_dir, model_name, "config.json")
     if not os.path.isfile(config_path):
-        return list(TASK_TYPES_BASE)
+        # Infer from name when weights not yet downloaded
+        if "turbo" in model_name.lower():
+            return list(TASK_TYPES_TURBO)
+        if "base" in model_name.lower() and "sft" not in model_name.lower():
+            return list(TASK_TYPES_BASE)
+        return list(TASK_TYPES_TURBO)
     try:
         with open(config_path, "r") as f:
             config = json.load(f)
@@ -72,7 +91,8 @@ def _collect_model_inventory(
     if getattr(app.state, "_initialized3", False) and third_model:
         loaded_dit_models[third_model] = True
 
-    available_dit_models = set(loaded_dit_models.keys())
+    available_dit_models = set(_KNOWN_DIT_MODELS)
+    available_dit_models.update(loaded_dit_models.keys())
     available_lm_models = set()
 
     if os.path.isdir(checkpoint_dir):
