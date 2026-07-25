@@ -9,6 +9,7 @@
 # Default runtime: ACESTEP_EXTRA_ARGS=--quantization none (LoRA-compatible)
 # Dual CPU offload (offload_to_cpu + offload_dit_to_cpu) for A770 XL headroom
 # LM RAM path: ACESTEP_LM_OFFLOAD_TO_CPU + ACESTEP_ALLOW_4B_LM (large system RAM)
+# Live LM re-init: POST /v1/init with init_llm + lm_model_path (no container restart)
 # =============================================================================
 
 FROM ubuntu:22.04
@@ -79,13 +80,18 @@ RUN python3 /app/docker/ui-patches/preprocess_audio_soundfile.py
 RUN python3 /app/docker/ui-patches/lm-ram-offload.py
 
 # ---------------------------------------------------------------------------
+# Patch: live LM re-init via Gradio POST /v1/init (same path as DiT switch)
+# ---------------------------------------------------------------------------
+RUN python3 /app/docker/ui-patches/live-lm-reinit.py
+
+# ---------------------------------------------------------------------------
 # Patch: Gradio --enable-api format endpoint
 # ---------------------------------------------------------------------------
 RUN python3 - <<'PY'
 from pathlib import Path
 import re
 
-candidates = list(Path("/app").rglob("acestep_v15_pipeline.py"))
+candidates = list(Path("/app").rglob("acestep_v15_pipeline.py") )
 if not candidates:
     raise SystemExit("acestep_v15_pipeline.py not found")
 pipeline = candidates[0]
@@ -229,9 +235,6 @@ def _xpu_register_format_input(demo, llm_handler):
 PY
 
 # Install project, force XPU torch LAST, then matching torchao / bnb / lycoris / soundfile
-# --no-deps on torchao + bitsandbytes protects +xpu torch from CUDA PyPI wheels
-# Do NOT install torchcodec (CUDA / libnvrtc) — use soundfile + ffmpeg instead
-# FAIL BUILD if torchao still reports 0.15 (PEFT LoRA training requires >0.16)
 RUN uv venv /app/.venv --python python3.11 \
     && . /app/.venv/bin/activate \
     && uv pip install --upgrade pip \
@@ -254,7 +257,6 @@ RUN uv venv /app/.venv --python python3.11 \
     && python -c "import lycoris; print('lycoris ok')" \
     && python -c "import soundfile; print('soundfile', soundfile.__version__)"
 
-# XPU LoRA preprocess helper (prefer xpu-specific script; always bake to /tmp for entrypoint)
 RUN mkdir -p /app/datasets/_tools /tmp \
     && SRC=/app/docker/ui-patches/preprocess_dataset_xpu.py \
     && if [ ! -f "$SRC" ]; then SRC=/app/docker/ui-patches/preprocess_dataset.py; fi \
@@ -285,13 +287,8 @@ ENV ACESTEP_LM_MODEL_PATH=acestep-5Hz-lm-1.7B
 ENV ACESTEP_LLM_BACKEND=pt
 ENV ACESTEP_OFFLOAD_TO_CPU=true
 ENV ACESTEP_OFFLOAD_DIT_TO_CPU=true
-# LM on system RAM (pt backend): weights stay on CPU, shuttle to XPU only while generating.
-# ACESTEP_ALLOW_4B_LM skips upstream hard-downgrade of 4B→1.7B on <20GB VRAM.
-# Optional full-CPU LM: ACESTEP_LM_DEVICE=cpu (slower CoT, almost no LM VRAM).
 ENV ACESTEP_LM_OFFLOAD_TO_CPU=true
 ENV ACESTEP_ALLOW_4B_LM=true
-# Default: disable INT8 so LoRA can load (override via compose/env if needed)
-# Must be quoted — Docker ENV rejects unquoted values that contain spaces
 ENV ACESTEP_EXTRA_ARGS="--quantization none"
 
 ENV TOKENIZERS_PARALLELISM=false
@@ -333,7 +330,6 @@ else
 fi
 echo "==========================================="
 
-# Always refresh preprocess helper on shared volume if missing or still using load_from_dict
 if [ -f /tmp/preprocess_dataset_xpu.py ]; then
   mkdir -p /app/datasets/_tools
   NEED_COPY=0
@@ -354,7 +350,6 @@ if [ "${ACESTEP_INIT_SERVICE:-true}" = "true" ]; then
     echo "Auto-init    : DiT=${ACESTEP_CONFIG_PATH:-auto}  LM=${ACESTEP_LM_MODEL_PATH:-none}"
 fi
 
-# Dual offload for A770 16GB (especially XL): weights + post-step DiT to CPU
 OFFLOAD_ARGS=""
 if [ "${ACESTEP_OFFLOAD_TO_CPU:-true}" = "true" ]; then
     OFFLOAD_ARGS="--offload_to_cpu true"
