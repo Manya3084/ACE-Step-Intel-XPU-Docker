@@ -5,6 +5,7 @@ Gradio generate button: validates GPU limits, calls the inference
 pipeline, saves audio files, and optionally runs auto-scoring and
 auto-LRC in a single streaming pass.
 """
+import gc
 import os
 import json
 import time as time_module
@@ -34,6 +35,26 @@ from acestep.ui.gradio.events.results.audio_playback_updates import (
 from acestep.ui.gradio.events.results.scoring import calculate_score_handler
 from acestep.ui.gradio.events.results.lrc_utils import lrc_to_vtt_file
 from acestep.ui.gradio.events.results.session_artifacts import persist_sample_session_artifacts
+
+
+def _clear_accelerator_cache(reason: str = "") -> None:
+    """Release unoccupied XPU/CUDA cached memory before a generation run."""
+    try:
+        gc.collect()
+        if hasattr(torch, "xpu") and hasattr(torch.xpu, "is_available") and torch.xpu.is_available():
+            if hasattr(torch.xpu, "empty_cache"):
+                torch.xpu.empty_cache()
+            if hasattr(torch.xpu, "synchronize"):
+                try:
+                    torch.xpu.synchronize()
+                except Exception:
+                    pass
+            logger.info(f"[generate_with_progress] torch.xpu.empty_cache() {reason}".strip())
+        elif torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            logger.info(f"[generate_with_progress] torch.cuda.empty_cache() {reason}".strip())
+    except Exception as exc:
+        logger.warning(f"[generate_with_progress] empty_cache failed: {exc}")
 
 
 def generate_with_progress(
@@ -81,6 +102,9 @@ def generate_with_progress(
     Yields:
         Tuple of Gradio component updates for the 52-output generate event.
     """
+    # Free fragmented VRAM/XPU cache from the previous job before allocating
+    _clear_accelerator_cache("(start of generation)")
+
     # GPU memory validation
     gpu_config = get_global_gpu_config()
     lm_initialized = llm_handler.llm_initialized if llm_handler else False
@@ -239,6 +263,7 @@ def generate_with_progress(
     )
 
     if not result.success:
+        _clear_accelerator_cache("(after failed generation)")
         yield (
             (None,) * 8
             + (None, generation_info, result.status_message, gr.skip())
@@ -408,6 +433,8 @@ def generate_with_progress(
     extra_to_store = _strip_extra_output_tensors(
         {**result.extra_outputs, "lrcs": final_lrcs_list, "subtitles": final_subtitles_list}
     )
+
+    _clear_accelerator_cache("(end of generation)")
 
     yield (
         *audio_playback_updates,
