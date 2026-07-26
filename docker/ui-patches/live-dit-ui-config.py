@@ -2,9 +2,12 @@
 """Attach model-type ui_config to live DiT switch response.
 
 ace-step-ui can use this to align Create-panel defaults with the loaded DiT.
+
+Also repairs a prior bug where return used result_ui without defining it.
 """
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -56,6 +59,81 @@ def _dit_ui_config_for_model(model_name: str) -> dict:
 '''
 
 
+def _ensure_helper(text: str) -> str:
+    if "_dit_ui_config_for_model" in text:
+        return text
+    anchor = "def _switch_dit_model_sync"
+    idx = text.find(anchor)
+    if idx < 0:
+        return text
+    return text[:idx] + f"# {MARKER}\n" + HELPER + "\n" + text[idx:]
+
+
+def _repair_result_ui(text: str) -> str:
+    """Never leave NameError: result_ui — always call helper inline."""
+    # Broken prior patch
+    text = text.replace(
+        '"ui_config": result_ui,',
+        '"ui_config": _dit_ui_config_for_model(loaded),  # [XPU-DIT-UI-CONFIG]',
+    )
+    text = text.replace(
+        '"ui_config": result_ui',
+        '"ui_config": _dit_ui_config_for_model(loaded)  # [XPU-DIT-UI-CONFIG]',
+    )
+    # Drop orphan assignment if present
+    text = re.sub(
+        r"\n\s*result_ui = _dit_ui_config_for_model\(loaded\)[^\n]*",
+        "",
+        text,
+    )
+    return text
+
+
+def _inject_ui_config_on_returns(text: str) -> str:
+    """Add ui_config key to switch success / already-loaded returns if missing."""
+    if '"ui_config":' in text and "_dit_ui_config_for_model" in text:
+        return text
+
+    # Success return (switched True)
+    old_ok = '''    return {
+        "message": msg,
+        "loaded_model": loaded,
+        "switched": True,
+        "offload_to_cpu": offload_to_cpu,
+        "offload_dit_to_cpu": offload_dit_to_cpu,
+    }'''
+    new_ok = '''    return {
+        "message": msg,
+        "loaded_model": loaded,
+        "switched": True,
+        "offload_to_cpu": offload_to_cpu,
+        "offload_dit_to_cpu": offload_dit_to_cpu,
+        "ui_config": _dit_ui_config_for_model(loaded),
+    }'''
+    if old_ok in text:
+        text = text.replace(old_ok, new_ok, 1)
+
+    old_early = '''        return {
+            "message": f"DiT '{model_name}' already loaded",
+            "loaded_model": model_name,
+            "switched": False,
+            "offload_to_cpu": offload_to_cpu,
+            "offload_dit_to_cpu": offload_dit_to_cpu,
+        }'''
+    new_early = '''        return {
+            "message": f"DiT '{model_name}' already loaded",
+            "loaded_model": model_name,
+            "switched": False,
+            "offload_to_cpu": offload_to_cpu,
+            "offload_dit_to_cpu": offload_dit_to_cpu,
+            "ui_config": _dit_ui_config_for_model(model_name),
+        }'''
+    if old_early in text:
+        text = text.replace(old_early, new_early, 1)
+
+    return text
+
+
 def main() -> None:
     paths = list(Path("/app").rglob("api_routes.py"))
     paths = [p for p in paths if "gradio" in str(p) and "api" in str(p)]
@@ -67,64 +145,18 @@ def main() -> None:
 
     for path in paths:
         text = path.read_text()
-        if MARKER in text and "_dit_ui_config_for_model" in text:
-            print(f"Already has ui_config helper: {path}")
+        if "_switch_dit_model_sync" not in text:
+            print(f"live-dit-switch not present in {path}; skip", file=sys.stderr)
             continue
 
-        if "_switch_dit_model_sync" in text:
-            anchor = "def _switch_dit_model_sync"
-            idx = text.find(anchor)
-            if idx < 0:
-                print(f"no switch fn in {path}", file=sys.stderr)
-                continue
-            text = text[:idx] + f"# {MARKER}\n" + HELPER + "\n" + text[idx:]
-        else:
-            print(f"live-dit-switch not present in {path}; skip ui_config", file=sys.stderr)
-            continue
+        orig = text
+        text = _ensure_helper(text)
+        text = _repair_result_ui(text)
+        text = _inject_ui_config_on_returns(text)
 
-        needle = "loaded = _current_dit_name(dit_handler) or model_name"
-        if needle in text and "result_ui = _dit_ui_config_for_model" not in text:
-            text = text.replace(
-                needle,
-                needle + "\n    result_ui = _dit_ui_config_for_model(loaded)  # " + MARKER,
-                1,
-            )
-            old_ret = '''    return {
-        "message": msg,
-        "loaded_model": loaded,
-        "switched": True,
-        "offload_to_cpu": offload_to_cpu,
-        "offload_dit_to_cpu": offload_dit_to_cpu,
-    }'''
-            new_ret = '''    return {
-        "message": msg,
-        "loaded_model": loaded,
-        "switched": True,
-        "offload_to_cpu": offload_to_cpu,
-        "offload_dit_to_cpu": offload_dit_to_cpu,
-        "ui_config": result_ui,
-    }'''
-            if old_ret in text:
-                text = text.replace(old_ret, new_ret, 1)
-                print("OK success return includes ui_config")
-            old_early = '''        return {
-            "message": f"DiT '{model_name}' already loaded",
-            "loaded_model": model_name,
-            "switched": False,
-            "offload_to_cpu": offload_to_cpu,
-            "offload_dit_to_cpu": offload_dit_to_cpu,
-        }'''
-            new_early = '''        return {
-            "message": f"DiT '{model_name}' already loaded",
-            "loaded_model": model_name,
-            "switched": False,
-            "offload_to_cpu": offload_to_cpu,
-            "offload_dit_to_cpu": offload_dit_to_cpu,
-            "ui_config": _dit_ui_config_for_model(model_name),
-        }'''
-            if old_early in text:
-                text = text.replace(old_early, new_early, 1)
-                print("OK early return includes ui_config")
+        if text == orig:
+            print(f"No changes needed: {path}")
+            continue
 
         try:
             compile(text, str(path), "exec")
@@ -132,7 +164,7 @@ def main() -> None:
             raise SystemExit(f"Invalid after ui_config patch: {e}") from e
 
         path.write_text(text)
-        print(f"Patched ui_config into {path}")
+        print(f"Patched/repaired ui_config in {path}")
 
     print("live-dit-ui-config complete")
 
