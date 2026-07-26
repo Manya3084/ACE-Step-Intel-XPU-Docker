@@ -5,6 +5,7 @@
 # DiT UI sync: live-dit-ui-config.py + gradio-dit-ui-sync.py (steps max 200)
 # APG FP64: apg-xpu-fp64-fallback.py (Arc has no FP64 — CPU project like MPS)
 # DCW DWT: dcw-xpu-cpu-fallback.py (wavelets on CPU fp32, results back to XPU)
+# Last model: persist-last-model.py + entrypoint restore from checkpoints/.last_*
 # LM live switch layered on top: live-lm-reinit.py
 # Format routes: standalone acestep/xpu_format_routes.py (wire-format-routes.py)
 # Turbo steps: no hard clamp to 8 (ACESTEP_TURBO_MAX_INFER_STEPS=0)
@@ -71,6 +72,7 @@ RUN python3 /app/docker/ui-patches/live-lm-reinit.py
 RUN python3 /app/docker/ui-patches/turbo-steps-unclamp.py
 RUN python3 /app/docker/ui-patches/apg-xpu-fp64-fallback.py
 RUN python3 /app/docker/ui-patches/dcw-xpu-cpu-fallback.py
+RUN python3 /app/docker/ui-patches/persist-last-model.py
 
 RUN python3 /app/docker/ui-patches/wire-format-routes.py
 RUN python3 /app/docker/ui-patches/fix-pipeline-imports.py
@@ -189,13 +191,14 @@ else
 fi
 echo "==========================================="
 
-# Re-apply APG XPU FP64 fallback (HF model sync can drop apg_guidance copies)
 if [ -f /app/docker/ui-patches/apg-xpu-fp64-fallback.py ]; then
   python3 /app/docker/ui-patches/apg-xpu-fp64-fallback.py || true
 fi
-# Re-apply DCW DWT CPU fallback
 if [ -f /app/docker/ui-patches/dcw-xpu-cpu-fallback.py ]; then
   python3 /app/docker/ui-patches/dcw-xpu-cpu-fallback.py || true
+fi
+if [ -f /app/docker/ui-patches/persist-last-model.py ]; then
+  python3 /app/docker/ui-patches/persist-last-model.py || true
 fi
 
 if [ -f /tmp/preprocess_dataset_xpu.py ]; then
@@ -207,6 +210,25 @@ if [ -f /tmp/preprocess_dataset_xpu.py ]; then
   if [ "$NEED_COPY" = "1" ]; then
     cp /tmp/preprocess_dataset_xpu.py /app/datasets/_tools/preprocess_dataset.py || true
     echo "[entrypoint] refreshed /app/datasets/_tools/preprocess_dataset.py"
+  fi
+fi
+
+# Restore last DiT / LM from checkpoints volume (survives container recreate)
+# Override only when env still has the image defaults or is empty.
+LAST_DIT_FILE=/app/checkpoints/.last_dit_model
+LAST_LM_FILE=/app/checkpoints/.last_lm_model
+if [ -f "$LAST_DIT_FILE" ]; then
+  _saved_dit=$(tr -d '[:space:]' < "$LAST_DIT_FILE" || true)
+  if [ -n "$_saved_dit" ]; then
+    ACESTEP_CONFIG_PATH="$_saved_dit"
+    echo "Restored DiT : ${ACESTEP_CONFIG_PATH} (from .last_dit_model)"
+  fi
+fi
+if [ -f "$LAST_LM_FILE" ]; then
+  _saved_lm=$(tr -d '[:space:]' < "$LAST_LM_FILE" || true)
+  if [ -n "$_saved_lm" ]; then
+    ACESTEP_LM_MODEL_PATH="$_saved_lm"
+    echo "Restored LM  : ${ACESTEP_LM_MODEL_PATH} (from .last_lm_model)"
   fi
 fi
 
