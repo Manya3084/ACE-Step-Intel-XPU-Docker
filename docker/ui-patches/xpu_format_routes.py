@@ -1,16 +1,21 @@
-"""Standalone format routes — use /xpu/format_input to avoid Gradio route clashes.
+"""Format routes for ACE-Step XPU.
 
-Host curl to /format_input may hit our handler while Express sometimes hit a
-Gradio/FastAPI stub that expects query param 'request' (422). Register a
-dedicated /xpu/format_* path and keep legacy aliases.
+IMPORTANT: Do not annotate endpoints with Request when
+`from __future__ import annotations` is active — older FastAPI treats
+`req: Request` as a *query* parameter → 422 Field required loc=query.req.
+
+Use an explicit JSON Body / Pydantic model instead.
 """
-from __future__ import annotations
 
 import asyncio
 import gc
 import json
 import os
 import time
+from typing import Any, Dict, Optional
+
+from fastapi import Body
+from pydantic import BaseModel, Field
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -26,11 +31,11 @@ def _empty_cache(tag: str = "") -> None:
 
         if hasattr(torch, "xpu") and torch.xpu.is_available():
             torch.xpu.empty_cache()
-            print(f"[XPU-format] torch.xpu.empty_cache() {tag}".strip())
+            print("[XPU-format] torch.xpu.empty_cache() {}".format(tag).strip())
         elif torch.cuda.is_available():
             torch.cuda.empty_cache()
     except Exception as exc:
-        print(f"[XPU-format] empty_cache warning: {exc}")
+        print("[XPU-format] empty_cache warning: {}".format(exc))
     try:
         gc.collect()
     except Exception:
@@ -63,17 +68,27 @@ def _is_llm_ready(handler) -> bool:
     return False
 
 
-def register_format_routes(demo, llm_handler) -> None:
-    try:
-        from fastapi import Request
-    except Exception as exc:
-        print(f"[XPU] format routes: fastapi missing ({exc})")
-        return
+class FormatBody(BaseModel):
+    prompt: str = ""
+    caption: str = ""
+    lyrics: str = ""
+    temperature: float = 0.85
+    param_obj: Optional[Any] = None
+    bpm: Optional[Any] = None
+    duration: Optional[Any] = None
+    key_scale: Optional[str] = None
+    time_signature: Optional[str] = None
+    vocal_language: Optional[str] = None
 
+    class Config:
+        extra = "allow"
+
+
+def register_format_routes(demo, llm_handler) -> None:
     try:
         app = demo.app
     except Exception as exc:
-        print(f"[XPU] format routes: no demo.app ({exc})")
+        print("[XPU] format routes: no demo.app ({})".format(exc))
         return
 
     def _park_dit_cpu() -> None:
@@ -139,28 +154,20 @@ def register_format_routes(demo, llm_handler) -> None:
                     except Exception:
                         pass
                     return handler, None
-                return handler, f"initialize failed: {status}"
+                return handler, "initialize failed: {}".format(status)
             except Exception as exc:
-                return handler, f"initialize error: {exc}"
+                return handler, "initialize error: {}".format(exc)
         return handler, "LLM not initialized"
 
-    async def format_input_endpoint(req: Request):
-        """JSON body: prompt/caption, lyrics, temperature, param_obj."""
+    async def format_input_endpoint(body: FormatBody = Body(...)):
+        prompt = (body.prompt or body.caption or "").strip()
+        lyrics = body.lyrics or ""
         try:
-            body = await req.json()
-        except Exception:
-            body = {}
-        if not isinstance(body, dict):
-            body = {}
-
-        prompt = body.get("prompt") or body.get("caption") or ""
-        lyrics = body.get("lyrics") or ""
-        try:
-            temperature = float(body.get("temperature", 0.85))
+            temperature = float(body.temperature)
         except Exception:
             temperature = 0.85
 
-        if not str(prompt).strip():
+        if not prompt:
             return {
                 "data": None,
                 "code": 400,
@@ -169,30 +176,31 @@ def register_format_routes(demo, llm_handler) -> None:
                 "extra": None,
             }
 
-        param_obj = body.get("param_obj", {}) or {}
-        if isinstance(param_obj, str):
+        param_obj = body.param_obj if isinstance(body.param_obj, dict) else {}
+        if isinstance(body.param_obj, str):
             try:
-                param_obj = json.loads(param_obj) if param_obj else {}
+                param_obj = json.loads(body.param_obj) if body.param_obj else {}
             except Exception:
                 param_obj = {}
-        if not isinstance(param_obj, dict):
-            param_obj = {}
 
         user_metadata = {}
-        bpm = param_obj.get("bpm") if param_obj.get("bpm") is not None else body.get("bpm")
+        bpm = param_obj.get("bpm") if param_obj.get("bpm") is not None else body.bpm
         duration = (
             param_obj.get("duration")
             if param_obj.get("duration") is not None
-            else body.get("duration")
+            else body.duration
         )
         key_scale = (
             param_obj.get("key")
             or param_obj.get("key_scale")
-            or body.get("key_scale")
+            or body.key_scale
             or ""
         )
-        time_signature = param_obj.get("time_signature") or body.get("time_signature") or ""
-        language = param_obj.get("language") or body.get("vocal_language") or ""
+        time_signature = (
+            param_obj.get("time_signature") or body.time_signature or ""
+        )
+        language = param_obj.get("language") or body.vocal_language or ""
+
         if bpm not in (None, "", 0, "0"):
             try:
                 user_metadata["bpm"] = int(bpm)
@@ -213,9 +221,11 @@ def register_format_routes(demo, llm_handler) -> None:
         def _run():
             handler = _resolve_llm()
             print(
-                f"[XPU-format] caption={str(prompt)[:80]!r} "
-                f"llm_initialized={getattr(handler, 'llm_initialized', None)} "
-                f"has_weights={_has_lm_weights(handler)}"
+                "[XPU-format] caption={!r} llm_initialized={} has_weights={}".format(
+                    prompt[:80],
+                    getattr(handler, "llm_initialized", None),
+                    _has_lm_weights(handler),
+                )
             )
             handler, err = _ensure_llm_ready(handler)
             if err:
@@ -244,11 +254,11 @@ def register_format_routes(demo, llm_handler) -> None:
         try:
             result = await asyncio.to_thread(_run)
         except Exception as exc:
-            print(f"[XPU-format] error: {exc}")
+            print("[XPU-format] error: {}".format(exc))
             return {
                 "data": None,
                 "code": 500,
-                "error": f"format_sample error: {exc}",
+                "error": "format_sample error: {}".format(exc),
                 "timestamp": int(time.time() * 1000),
                 "extra": None,
             }
@@ -262,7 +272,7 @@ def register_format_routes(demo, llm_handler) -> None:
             return {
                 "data": None,
                 "code": 500,
-                "error": f"format_sample failed: {err}",
+                "error": "format_sample failed: {}".format(err),
                 "timestamp": int(time.time() * 1000),
                 "extra": None,
             }
@@ -276,7 +286,7 @@ def register_format_routes(demo, llm_handler) -> None:
             "duration": getattr(result, "duration", None) or duration,
             "vocal_language": getattr(result, "language", None) or language or "unknown",
         }
-        print(f"[XPU-format] OK caption={str(data.get('caption') or '')[:60]!r}")
+        print("[XPU-format] OK caption={!r}".format(str(data.get("caption") or "")[:60]))
         return {
             "data": data,
             "code": 200,
@@ -296,13 +306,13 @@ def register_format_routes(demo, llm_handler) -> None:
         for r in list(app.router.routes):
             path = getattr(r, "path", None)
             if path in paths:
-                print(f"[XPU-format] removing old route {path}")
+                print("[XPU-format] removing old route {}".format(path))
                 continue
             kept.append(r)
         app.router.routes = kept
     except Exception as exc:
-        print(f"[XPU-format] route cleanup: {exc}")
+        print("[XPU-format] route cleanup: {}".format(exc))
 
     for path in paths:
         app.add_api_route(path, format_input_endpoint, methods=["POST"])
-    print(f"[XPU] Registered format routes: {', '.join(paths)}")
+    print("[XPU] Registered format routes (Body model): {}".format(", ".join(paths)))
