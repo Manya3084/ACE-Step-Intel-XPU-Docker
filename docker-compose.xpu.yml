@@ -7,7 +7,13 @@
 #   acestep-ui   — Spotify-style web UI
 #                   host 3003 = frontend
 #                   host 3004 = UI backend
-#                   Console (SSE) streams docker logs in-browser
+#   autoheal     — restarts containers that stay unhealthy (hangs / dead API)
+#
+# Crash recovery:
+#   - restart: unless-stopped  → Docker restarts if the process exits (OOM kill,
+#     Python fatal, segfault). This is the main self-heal path.
+#   - autoheal                 → if the process is stuck but still "running",
+#     healthcheck fails → autoheal issues docker restart.
 #
 # Shared host dirs (Training / LoRA):
 #   ./datasets      — audio, JSON, uploads, preprocessed tensors
@@ -16,7 +22,7 @@
 #
 # Usage:
 #   mkdir -p datasets/uploads lora_output checkpoints
-#   cp .env.xpu.example .env   # includes --quantization none for LoRA
+#   cp .env.xpu.example .env
 #   docker compose -f docker-compose.xpu.yml up -d --build
 #   open http://YOUR_SERVER_IP:3003
 #
@@ -43,8 +49,11 @@ services:
       - ACESTEP_CONFIG_PATH=${ACESTEP_CONFIG_PATH:-acestep-v15-turbo}
       - ACESTEP_LM_MODEL_PATH=${ACESTEP_LM_MODEL_PATH:-acestep-5Hz-lm-1.7B}
       - ACESTEP_OFFLOAD_TO_CPU=${ACESTEP_OFFLOAD_TO_CPU:-true}
+      - ACESTEP_OFFLOAD_DIT_TO_CPU=${ACESTEP_OFFLOAD_DIT_TO_CPU:-true}
+      - ACESTEP_LM_OFFLOAD_TO_CPU=${ACESTEP_LM_OFFLOAD_TO_CPU:-true}
+      - ACESTEP_ALLOW_4B_LM=${ACESTEP_ALLOW_4B_LM:-true}
+      - ACESTEP_TURBO_MAX_INFER_STEPS=${ACESTEP_TURBO_MAX_INFER_STEPS:-0}
       - ACESTEP_DTYPE=${ACESTEP_DTYPE:-}
-      # LoRA requires quant off; override in .env if you need INT8 without LoRA
       - ACESTEP_EXTRA_ARGS=${ACESTEP_EXTRA_ARGS:---quantization none}
       - TOKENIZERS_PARALLELISM=false
       - PYTORCH_DEVICE=xpu
@@ -68,16 +77,25 @@ services:
       - ./lora_output:/app/lora_output
 
     shm_size: "2gb"
+
+    # Restart when the main process exits (crash, OOM kill, fatal error).
+    # Does NOT restart a hung process that is still alive — autoheal covers that.
     restart: unless-stopped
 
+    labels:
+      - autoheal=true
+
     healthcheck:
+      # Prefer dedicated /health when routes are up; fall back to Gradio root.
       test: >-
+        curl -sf http://localhost:8001/health > /dev/null 2>&1 ||
         curl -sf http://localhost:8001/ > /dev/null 2>&1 ||
         curl -sf http://localhost:7860/ > /dev/null 2>&1 ||
         exit 1
       interval: 30s
       timeout: 15s
-      start_period: 300s
+      # Model load can take several minutes on first boot / after XL switch
+      start_period: 360s
       retries: 5
 
   acestep-ui:
@@ -123,6 +141,9 @@ services:
 
     restart: unless-stopped
 
+    labels:
+      - autoheal=true
+
     healthcheck:
       test: >-
         curl -sf http://localhost:3003/ >/dev/null 2>&1 ||
@@ -132,6 +153,20 @@ services:
       timeout: 10s
       start_period: 90s
       retries: 5
+
+  # Restarts any container with label autoheal=true after healthcheck stays failed.
+  # Covers "process alive but API dead" cases that restart: unless-stopped misses.
+  autoheal:
+    image: willfarrell/autoheal:latest
+    container_name: acestep-autoheal
+    restart: unless-stopped
+    environment:
+      - AUTOHEAL_CONTAINER_LABEL=autoheal
+      - AUTOHEAL_INTERVAL=30
+      - AUTOHEAL_START_PERIOD=360
+      - AUTOHEAL_DEFAULT_STOP_TIMEOUT=20
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
 
 volumes:
   hf_cache:
