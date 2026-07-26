@@ -48,11 +48,29 @@ Host needs Intel Level Zero drivers and `/dev/dri` passed into the container.
 - **Dockerfile.xpu** — Ubuntu + Intel GPU packages + PyTorch XPU nightly + Gradio `--enable-api` + **soundfile/ffmpeg** (no CUDA TorchCodec)
 - **Dockerfile.ui** — [ace-step-ui](https://github.com/fspecii/ace-step-ui) with CORS, local **Save dataset**, Gradio arg fixes, ffmpeg/ffprobe
 - **docker-compose.xpu.yml** — full stack + shared `datasets` / `lora_output` / `checkpoints`
-- **AI Format** via `/format_input` (threaded; works with CPU offload on 16GB)
+- **CPU offload** — dual DiT offload + LM RAM path for all **1.5** and **1.5XL** models on 16GB Arc (see below)
+- **Live model switch** — Create dropdown switches DiT/LM via `/v1/init` without container restart
+- **AI Format** via `/format_lyrics` (threaded; works with CPU offload on 16GB)
 - **LoRA path** — Save JSON → preprocess helper → `.pt` tensors → train (see [README-DOCKER-XPU.md](./README-DOCKER-XPU.md))
 - **Settings tables** for Arc **A-series**, **B-series**, **Pro**, and **Flex** by VRAM
 
 Default profile (A770 16GB): `acestep-v15-turbo` + `acestep-5Hz-lm-1.7B` + CPU offload + `pt` backend.
+
+### CPU offload at a glance
+
+Edit `.env` then `docker compose -f docker-compose.xpu.yml up -d --force-recreate acestep-xpu`:
+
+```bash
+# DiT (music) — keep true on ≤16GB / when using XL
+ACESTEP_OFFLOAD_TO_CPU=true
+ACESTEP_OFFLOAD_DIT_TO_CPU=true
+
+# LM (lyrics / Format / CoT) — use system RAM on large hosts
+ACESTEP_LM_OFFLOAD_TO_CPU=true
+ACESTEP_ALLOW_4B_LM=true
+```
+
+Set any of those to `false` only if you have VRAM headroom. Full table and guidance: **[CPU offload in README-DOCKER-XPU.md](./README-DOCKER-XPU.md#cpu-offload-enable--disable)**.
 
 ---
 
@@ -60,7 +78,7 @@ Default profile (A770 16GB): `acestep-v15-turbo` + `acestep-5Hz-lm-1.7B` + CPU o
 
 | Doc | Contents |
 |-----|----------|
-| **[README-DOCKER-XPU.md](./README-DOCKER-XPU.md)** | Full setup, GPU recommendations, LoRA preprocess, troubleshooting |
+| **[README-DOCKER-XPU.md](./README-DOCKER-XPU.md)** | Full setup, **CPU offload**, GPU recommendations, LoRA preprocess, troubleshooting |
 | **[FORK.md](./FORK.md)** | Short “why this fork exists” |
 | Upstream ACE-Step guides | Still under `docs/` (API, Gradio, install, etc.) |
 | Windows XPU (upstream-style) | [README-XPU.md](./README-XPU.md) |
@@ -72,7 +90,7 @@ Default profile (A770 16GB): `acestep-v15-turbo` + `acestep-5Hz-lm-1.7B` + CPU o
 ```bash
 curl -sS http://127.0.0.1:8001/health
 
-curl -sS -m 300 -X POST http://127.0.0.1:8001/format_input \
+curl -sS -m 300 -X POST http://127.0.0.1:8001/format_lyrics \
   -H 'Content-Type: application/json' \
   -d '{"prompt":"pop rock","lyrics":"walking down the street"}'
 ```

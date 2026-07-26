@@ -58,6 +58,97 @@ First boot downloads models (several minutes).
 
 ---
 
+## CPU offload (enable / disable)
+
+On **Arc A770 16GB** (and most ≤16GB Arc cards), models are too large to stay fully resident on the GPU. This stack **shuttles weights between system RAM and XPU** so you can run 2B turbo, **4B XL DiT**, and even **4B LM** on a host with enough RAM (e.g. 128GB).
+
+Offload is controlled entirely by environment variables in **`.env`** (copied from `.env.xpu.example`). After changing them, recreate the XPU container:
+
+```bash
+docker compose -f docker-compose.xpu.yml up -d --force-recreate acestep-xpu
+```
+
+Live model switches (`POST /v1/init` from the UI DiT/LM dropdowns) **reuse the same flags** — every 1.5 and 1.5XL DiT variant gets the same dual-offload path.
+
+### DiT (music model) offload
+
+| Variable | Default (A770) | What it does |
+|----------|----------------|--------------|
+| `ACESTEP_OFFLOAD_TO_CPU` | `true` | Keep supporting modules (VAE / text encoder path) offloaded; move to XPU only when needed |
+| `ACESTEP_OFFLOAD_DIT_TO_CPU` | `true` | Park the **DiT** on CPU between steps / after switch; required for **XL 4B** on 16GB |
+
+**Enable (recommended on ≤16GB):**
+
+```bash
+ACESTEP_OFFLOAD_TO_CPU=true
+ACESTEP_OFFLOAD_DIT_TO_CPU=true
+```
+
+**Disable (only if you have headroom, e.g. 24GB+ Arc and you stay on 2B turbo):**
+
+```bash
+ACESTEP_OFFLOAD_TO_CPU=false
+ACESTEP_OFFLOAD_DIT_TO_CPU=false
+```
+
+Turning offload **off** is faster when it fits, but will **OOM** on A770 with XL DiT or long batches. Prefer leaving both `true` on 16GB.
+
+Applies to **all** DiT picks in the Create menu:
+
+- 1.5: `acestep-v15-turbo`, `base`, `sft`, `turbo-shift1/3`, `turbo-continuous`
+- 1.5XL: `acestep-v15-xl-turbo`, `xl-sft`, `xl-base`
+
+### LM (5Hz lyric / CoT / AI Format) offload
+
+| Variable | Default (A770) | What it does |
+|----------|----------------|--------------|
+| `ACESTEP_LM_OFFLOAD_TO_CPU` | `true` | Keep the 5Hz LM mostly in **system RAM**; load to XPU for generate / Format |
+| `ACESTEP_ALLOW_4B_LM` | `true` | Allow `acestep-5Hz-lm-4B` (upstream would otherwise force-downgrade on ~16GB) |
+| `ACESTEP_LM_DEVICE` | unset (`auto` / XPU with offload) | Set to `cpu` for full-CPU LM (slowest, almost no LM VRAM) |
+
+**Enable RAM-backed LM (recommended with 1.7B or 4B on A770 + large host RAM):**
+
+```bash
+ACESTEP_LM_OFFLOAD_TO_CPU=true
+ACESTEP_ALLOW_4B_LM=true
+# optional full-CPU LM:
+# ACESTEP_LM_DEVICE=cpu
+```
+
+**Disable LM offload** (small LM only, or high-VRAM GPU):
+
+```bash
+ACESTEP_LM_OFFLOAD_TO_CPU=false
+# ACESTEP_ALLOW_4B_LM=false   # optional: hide/block 4B on low VRAM
+```
+
+### Startup banner
+
+On boot you should see lines similar to:
+
+```text
+Offload     : to_cpu=true  dit_to_cpu=true
+LM RAM      : offload=true  allow_4B=true  device=auto
+```
+
+Live DiT switches log:
+
+```text
+[v1/init] Switching DiT: '...' -> 'acestep-v15-xl-turbo' (offload_to_cpu=True, offload_dit_to_cpu=True)
+```
+
+### When to change these
+
+| Situation | Suggestion |
+|-----------|------------|
+| A770 16GB, any DiT including XL | Keep **both DiT offloads `true`** |
+| A770 + 128GB RAM, try 4B LM | `ACESTEP_LM_OFFLOAD_TO_CPU=true`, `ACESTEP_ALLOW_4B_LM=true` |
+| XPU OOM during generate / XL | Ensure dual DiT offload is on; lower duration / batch |
+| 24GB+ card, only 2B turbo, want max speed | Try DiT offload **off**; re-enable if OOM |
+| Format / generate hangs then socket closes | Offload + cache clear are intentional; first LM load is slow |
+
+---
+
 ## LoRA training (XPU) — Save → Preprocess → Train
 
 Verified on **Arc A770 16GB**.
@@ -217,6 +308,8 @@ Always use **`ACESTEP_LLM_BACKEND=pt`** on Intel XPU. Prefer **`acestep-v15-turb
 | **16GB (A770)** | **1.7B** | **on** |
 | 24GB+ | 1.7B or 4B | optional |
 
+See **[CPU offload (enable / disable)](#cpu-offload-enable--disable)** for the exact env vars.
+
 If you see **NaN / Inf latents** on XPU, try shorter duration first, restart XPU, and optionally:
 
 ```bash
@@ -236,7 +329,7 @@ Then: `docker compose -f docker-compose.xpu.yml up -d --force-recreate acestep-x
 | DiT | `acestep-v15-turbo` |
 | LM | `acestep-5Hz-lm-1.7B` |
 | LM backend | `pt` |
-| CPU offload | enabled |
+| CPU offload (DiT dual + LM) | **enabled** |
 | Mode | `gradio-api` |
 | UI ports | 3003 / 3004 |
 
@@ -249,6 +342,7 @@ Then: `docker compose -f docker-compose.xpu.yml up -d --force-recreate acestep-x
 | **bitsandbytes ≥ 0.48** | `--no-deps` |
 | **lycoris-lora** | LoKr |
 | **soundfile + ffmpeg** | Audio load / convert — **not** TorchCodec |
+| **PyWavelets + pytorch-wavelets** | DCW (Differential Correction in Wavelet domain) |
 
 Do **not** install generic CUDA `torchao`/`bitsandbytes`/`torchcodec` without care — that can break `+xpu` torch or pull `libnvrtc`.
 
@@ -262,6 +356,8 @@ Do **not** install generic CUDA `torchao`/`bitsandbytes`/`torchcodec` without ca
 |---------|--------|
 | XPU generation on Arc A770 16GB | Working |
 | ace-step-ui → Gradio songs | Working |
+| Live DiT switch (all 1.5 + 1.5XL) + dual offload | Working |
+| Live LM switch (0.6B / 1.7B / 4B) + RAM offload | Working |
 | AI Format (slow first call with offload) | Working |
 | **Save dataset (local JSON)** | Working |
 | **Preprocess → `.pt` (soundfile)** | Working |
@@ -293,10 +389,12 @@ docker restart acestep-xpu
 |------|---------|
 | `Dockerfile.xpu` | Intel packages, XPU PyTorch, torchao/bnb/lycoris/soundfile, Gradio+API |
 | `Dockerfile.ui` | ace-step-ui patches (incl. local save-dataset), settings, restart, SSE |
+| `docker/ui-patches/live-dit-switch.py` | Uniform DiT `/v1/init` + dual CPU offload for all 1.5 / 1.5XL |
+| `docker/ui-patches/live-lm-reinit.py` | LM live switch + RAM offload via `/v1/init` |
 | `docker/ui-patches/preprocess_dataset.py` | XPU LoRA preprocess helper |
 | `docker/ui-patches/training-docker.py` | Training route patches (save/preprocess/init) |
 | `docker-compose.xpu.yml` | Both services, `/dev/dri`, shared volumes, ports |
-| `.env.xpu.example` | A770-oriented defaults |
+| `.env.xpu.example` | A770-oriented defaults (incl. offload flags) |
 | `README-DOCKER-XPU.md` | This document |
 
 ---
@@ -307,7 +405,9 @@ docker restart acestep-xpu
 
 **NaN latents** — restart XPU; shorter duration; try `float32`; avoid bad LoRAs.
 
-**Format spins a long time** — first 1.7B+offload Format can take 1–3 minutes.
+**XPU OOM / tried to allocate … GiB** — keep `ACESTEP_OFFLOAD_TO_CPU=true` and `ACESTEP_OFFLOAD_DIT_TO_CPU=true`; avoid XL+4B LM together on first try; lower duration/batch.
+
+**Format spins a long time** — first 1.7B/4B+offload Format can take 1–3 minutes.
 
 **Save dataset Not Found** — rebuild UI so `training-docker.py` replaces `/v1/dataset/save` with local write. Image must contain `[Training] Saved dataset` and **not** `/v1/dataset/save`.
 
