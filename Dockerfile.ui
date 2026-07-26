@@ -1,7 +1,7 @@
 # =============================================================================
 # ACE-Step UI — Docker image (fspecii/ace-step-ui)
 # =============================================================================
-# XPU defaults: FLAC, ADG off, DCW on, boot-sync LM/DiT to localStorage
+# Format proxy uses /xpu/format_input on acestep-xpu (avoids Gradio 422 clash)
 # =============================================================================
 
 FROM node:20-bookworm-slim
@@ -98,6 +98,7 @@ p.write_text(pat.sub(new_fn.strip(), text, count=1))
 print("buildGradioArgs patched OK")
 PY
 
+# Long timeouts only — do NOT rewrite format_input → format_lyrics (caused 422)
 RUN python3 - <<'PY'
 from pathlib import Path
 import re
@@ -105,13 +106,12 @@ n = 0
 for path in Path("server/src").rglob("*.ts"):
     text = path.read_text()
     orig = text
-    text = text.replace("/format_input", "/format_lyrics").replace("'format_input'", "'format_lyrics'").replace('"format_input"', '"format_lyrics"')
     text = re.sub(r"AbortSignal\.timeout\(\s*\d+\s*\)", "AbortSignal.timeout(180000)", text)
     text = re.sub(r"timeout:\s*\d{4,5}\b", "timeout: 180000", text)
     if text != orig:
         path.write_text(text)
         n += 1
-print("Format patch files", n)
+print("Timeout patch files", n)
 PY
 
 COPY docker/ui-patches/training-docker.py /tmp/training-docker.py
@@ -132,6 +132,7 @@ COPY docker/ui-patches/createpanel-xpu-defaults.py /tmp/createpanel-xpu-defaults
 COPY docker/ui-patches/createpanel-dcw.py /tmp/createpanel-dcw.py
 COPY docker/ui-patches/createpanel-boot-sync.py /tmp/createpanel-boot-sync.py
 COPY docker/ui-patches/format-ui-timeout.py /tmp/format-ui-timeout.py
+COPY docker/ui-patches/format-proxy-xpu-path.py /tmp/format-proxy-xpu-path.py
 
 RUN python3 - <<'PY'
 from pathlib import Path
@@ -230,6 +231,7 @@ RUN python3 /tmp/createpanel-xpu-defaults.py
 RUN python3 /tmp/createpanel-dcw.py
 RUN python3 /tmp/createpanel-boot-sync.py
 RUN python3 /tmp/format-ui-timeout.py
+RUN python3 /tmp/format-proxy-xpu-path.py
 
 RUN python3 - <<'PY'
 from pathlib import Path
