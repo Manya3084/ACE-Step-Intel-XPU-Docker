@@ -2,6 +2,7 @@
 # ACE-Step UI — Docker image (fspecii/ace-step-ui)
 # =============================================================================
 # XPU defaults: FLAC output, ADG never auto-on for base (createpanel-xpu-defaults.py)
+# DCW checkbox + default off (createpanel-dcw.py) — was hard-coded true in args
 # No UI "Restart acestep-xpu" button — compose restart + autoheal
 # =============================================================================
 
@@ -76,7 +77,9 @@ async function buildGradioArgs(params: GenerationParams): Promise<unknown[]> {
     params.instruction || 'Fill the audio semantic mask based on the given conditions:',
     params.audioCoverStrength ?? 1.0, 0.0, params.useAdg ?? false, false,
     params.cfgIntervalStart ?? 0.0, params.cfgIntervalEnd ?? 1.0, params.shift ?? 3.0,
-    params.inferMethod || 'ode', 'euler', 0.0, 0.0, true, 'double', 0.02, 0.06, 'haar',
+    params.inferMethod || 'ode', 'euler', 0.0, 0.0,
+    // [XPU-DCW] was hard-coded true — default off on XPU; UI checkbox sets params.dcwEnabled
+    params.dcwEnabled ?? false, 'double', 0.02, 0.06, 'haar',
     params.customTimesteps || '', params.audioFormat || 'flac', '128k', 48000,
     params.lmTemperature ?? 0.85, isThinking, params.lmCfgScale ?? 2.0,
     params.lmTopK ?? 0, params.lmTopP ?? 0.9, params.lmNegativePrompt || 'NO USER INPUT',
@@ -95,7 +98,7 @@ pat = re.compile(r"async function buildGradioArgs\(params: GenerationParams\): P
 if not pat.search(text):
     raise SystemExit("Could not find buildGradioArgs function")
 p.write_text(pat.sub(new_fn.strip(), text, count=1))
-print("buildGradioArgs patched OK")
+print("buildGradioArgs patched OK (DCW default false)")
 PY
 
 RUN python3 - <<'PY'
@@ -129,6 +132,7 @@ COPY docker/ui-patches/createpanel-lm-switch.py /tmp/createpanel-lm-switch.py
 COPY docker/ui-patches/createpanel-dit-live-switch.py /tmp/createpanel-dit-live-switch.py
 COPY docker/ui-patches/createpanel-generate-cancel.py /tmp/createpanel-generate-cancel.py
 COPY docker/ui-patches/createpanel-xpu-defaults.py /tmp/createpanel-xpu-defaults.py
+COPY docker/ui-patches/createpanel-dcw.py /tmp/createpanel-dcw.py
 COPY docker/ui-patches/format-ui-timeout.py /tmp/format-ui-timeout.py
 
 RUN python3 - <<'PY'
@@ -152,7 +156,7 @@ import { Router, Response } from \'express\';
 import { pool } from \'../db/pool.js\';
 import { authMiddleware, AuthenticatedRequest } from \'../middleware/auth.js\';
 const router = Router();
-const DEFAULT_SETTINGS: Record<string, unknown> = { batchSize: 1, inferenceSteps: 8, guidanceScale: 7.0, audioFormat: \'flac\', vocalLanguage: \'en\' };
+const DEFAULT_SETTINGS: Record<string, unknown> = { batchSize: 1, inferenceSteps: 8, guidanceScale: 7.0, audioFormat: \'flac\', vocalLanguage: \'en\', dcwEnabled: false };
 function parseSettings(raw: unknown): Record<string, unknown> {
   if (raw == null) return { ...DEFAULT_SETTINGS };
   if (typeof raw === \'object\') return { ...DEFAULT_SETTINGS, ...(raw as object) };
@@ -225,6 +229,7 @@ RUN python3 /tmp/createpanel-lm-switch.py
 RUN python3 /tmp/createpanel-dit-live-switch.py
 RUN python3 /tmp/createpanel-generate-cancel.py
 RUN python3 /tmp/createpanel-xpu-defaults.py
+RUN python3 /tmp/createpanel-dcw.py
 RUN python3 /tmp/format-ui-timeout.py
 
 RUN python3 - <<'PY'
