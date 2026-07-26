@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 """Add Enable DCW to CreatePanel Expert checkbox grid (after Use ADG).
 
-Upstream ace-step-ui has no DCW UI; buildGradioArgs hard-coded dcw_enabled=true.
-Place the control next to Use ADG / Allow LM Batch (after Complete Track Classes).
-Default OFF for XPU.
+Default ON for XPU now that dcw-xpu-cpu-fallback runs DWT/IDWT on CPU fp32.
 """
 from __future__ import annotations
 
@@ -13,7 +11,6 @@ from pathlib import Path
 
 MARKER = "[XPU-DCW]"
 
-# Exact upstream block from fspecii/ace-step-ui components/CreatePanel.tsx
 ADG_LABEL = '''              <label
                 className="flex items-center gap-2 text-xs font-medium text-zinc-600 dark:text-zinc-400"
                 title="Adaptive Dual Guidance: dynamically adjusts CFG for quality. Base model only; slower."
@@ -24,7 +21,7 @@ ADG_LABEL = '''              <label
 
 DCW_LABEL = '''              <label
                 className="flex items-center gap-2 text-xs font-medium text-zinc-600 dark:text-zinc-400"
-                title="Differential Correction in Wavelet domain. Experimental; default off on Intel XPU."
+                title="Differential Correction in Wavelet domain. DWT runs on CPU (fp32) on Intel XPU."
               >
                 {/* [XPU-DCW] */}
                 <input type="checkbox" checked={dcwEnabled} onChange={() => setDcwEnabled(!dcwEnabled)} />
@@ -36,7 +33,8 @@ def find_create_panel() -> Path:
     for c in [Path("components/CreatePanel.tsx"), Path("src/components/CreatePanel.tsx")]:
         if c.is_file():
             return c
-    hits = list(Path(".").rglob("CreatePanel.tsx"))
+    hits = list(Path(".").rglob("CreatePanel.tsx")
+    )
     if not hits:
         raise SystemExit("CreatePanel.tsx not found")
     return hits[0]
@@ -45,22 +43,32 @@ def find_create_panel() -> Path:
 def patch_create_panel(path: Path) -> None:
     text = path.read_text()
 
-    # 1) useState after useAdg
+    # 1) useState after useAdg — default true
     if "const [dcwEnabled, setDcwEnabled]" not in text:
         old = "const [useAdg, setUseAdg] = useState(false);"
         if old in text:
             text = text.replace(
                 old,
-                old + f"\n  const [dcwEnabled, setDcwEnabled] = useState(false); // {MARKER}",
+                old + f"\n  const [dcwEnabled, setDcwEnabled] = useState(true); // {MARKER} default on (CPU DWT)",
                 1,
             )
-            print("OK useState dcwEnabled")
+            print("OK useState dcwEnabled=true")
         else:
             print("WARN: useAdg useState not found", file=sys.stderr)
+    else:
+        # Upgrade previous default false → true
+        if "useState(false); // [XPU-DCW]" in text or (
+            "const [dcwEnabled, setDcwEnabled] = useState(false)" in text
+        ):
+            text = text.replace(
+                "const [dcwEnabled, setDcwEnabled] = useState(false)",
+                "const [dcwEnabled, setDcwEnabled] = useState(true)",
+                1,
+            )
+            print("OK upgraded dcwEnabled default to true")
 
-    # 2) onGenerate payload: after useAdg,
-    if re.search(r"\bdcwEnabled,?\s*$", text, re.M) is None and "dcwEnabled," not in text:
-        # handleGenerate object
+    # 2) onGenerate payload
+    if "dcwEnabled," not in text:
         if "        useAdg,\n        cfgIntervalStart," in text:
             text = text.replace(
                 "        useAdg,\n        cfgIntervalStart,",
@@ -72,40 +80,31 @@ def patch_create_panel(path: Path) -> None:
             text = text.replace("useAdg,", f"useAdg,\n        dcwEnabled, // {MARKER}", 1)
             print("OK onGenerate dcwEnabled (loose)")
 
-    # 3) Checkbox in Expert grid after Use ADG
+    # 3) Checkbox
     if "Enable DCW" not in text:
         if ADG_LABEL in text:
             text = text.replace(ADG_LABEL, ADG_LABEL + "\n" + DCW_LABEL, 1)
             print("OK checkbox after Use ADG (exact)")
         else:
-            # Looser: after useAdg checkbox line
-            m = re.search(
-                r"(<input type=\"checkbox\" checked=\{useAdg\}[^/]*/>\s*\n\s*\{t\('useAdg'\)\}\s*\n\s*</label>)",
-                text,
-            )
-            if m:
-                text = text[: m.end()] + "\n" + DCW_LABEL + text[m.end() :]
-                print("OK checkbox after Use ADG (regex)")
+            needle = "{t('useAdg')}\n              </label>"
+            if needle in text:
+                text = text.replace(needle, needle + "\n" + DCW_LABEL, 1)
+                print("OK checkbox after t('useAdg')")
             else:
-                # After completeTrackClasses section closing, before grid of flags
-                needle = "{t('useAdg')}\n              </label>"
-                if needle in text:
-                    text = text.replace(needle, needle + "\n" + DCW_LABEL, 1)
-                    print("OK checkbox after t('useAdg')")
-                else:
-                    print("WARN: could not place Enable DCW checkbox", file=sys.stderr)
+                print("WARN: could not place Enable DCW checkbox", file=sys.stderr)
+    else:
+        # Refresh title text if old "default off" remains
+        text = text.replace(
+            "Experimental; default off on Intel XPU.",
+            "DWT runs on CPU (fp32) on Intel XPU.",
+        )
 
     path.write_text(text)
     print(f"Wrote {path}")
 
 
 def patch_types_and_api() -> None:
-    # types.ts GenerationParams
-    for path in [
-        Path("types.ts"),
-        Path("src/types.ts"),
-        *Path(".").rglob("types.ts"),
-    ]:
+    for path in [Path("types.ts"), Path("src/types.ts"), *Path(".").rglob("types.ts")]:
         if not path.is_file() or "node_modules" in str(path):
             continue
         t = path.read_text()
@@ -118,7 +117,6 @@ def patch_types_and_api() -> None:
             path.write_text(t)
             print(f"OK types: {path}")
 
-    # App.tsx forward params.useAdg → also dcwEnabled
     for path in [Path("App.tsx"), Path("src/App.tsx"), *Path(".").rglob("App.tsx")]:
         if not path.is_file() or "node_modules" in str(path):
             continue
@@ -132,31 +130,15 @@ def patch_types_and_api() -> None:
             path.write_text(t)
             print(f"OK App.tsx: {path}")
 
-    # server generate route destructure + pass-through
     for path in Path(".").rglob("generate.ts"):
         if "node_modules" in str(path):
             continue
         t = path.read_text()
-        changed = False
         if "useAdg," in t and "dcwEnabled," not in t:
             t = t.replace("useAdg,", f"useAdg,\n      dcwEnabled, // {MARKER}", 1)
-            changed = True
-        if "useAdg," in t and "dcwEnabled," in t:
-            # also object pass if present once
-            if "useAdg," in t and t.count("dcwEnabled") < 2:
-                # second site often in the params object sent downstream
-                t2 = t.replace(
-                    "useAdg,",
-                    f"useAdg,\n      dcwEnabled, // {MARKER}",
-                    1,
-                )
-                # only if first already done - avoid infinite; count
-                pass
-        if changed:
             path.write_text(t)
             print(f"OK generate.ts: {path}")
 
-    # services/api.ts type
     for path in Path(".").rglob("api.ts"):
         if "node_modules" in str(path):
             continue
@@ -170,7 +152,6 @@ def patch_types_and_api() -> None:
             path.write_text(t)
             print(f"OK api.ts type: {path}")
 
-    # acestep.ts service type + hardcode
     for path in Path(".").rglob("acestep.ts"):
         if "node_modules" in str(path):
             continue
@@ -181,20 +162,27 @@ def patch_types_and_api() -> None:
                 f"useAdg?: boolean;\n  dcwEnabled?: boolean; // {MARKER}",
                 1,
             )
-        if "true, 'double', 0.02, 0.06, 'haar'" in t:
-            t = t.replace(
-                "true, 'double', 0.02, 0.06, 'haar'",
-                f"params.dcwEnabled ?? false, 'double', 0.02, 0.06, 'haar' /* {MARKER} */",
-                1,
-            )
-            print(f"OK acestep.ts DCW args: {path}")
+        # Default ON when UI omits field
+        for old in (
+            "params.dcwEnabled ?? false, 'double', 0.02, 0.06, 'haar'",
+            "true, 'double', 0.02, 0.06, 'haar'",
+            "false, 'double', 0.02, 0.06, 'haar'",
+        ):
+            if old in t:
+                t = t.replace(
+                    old,
+                    f"params.dcwEnabled ?? true, 'double', 0.02, 0.06, 'haar' /* {MARKER} default on */",
+                    1,
+                )
+                print(f"OK acestep.ts DCW default true: {path}")
+                break
         path.write_text(t)
 
 
 def main() -> None:
     patch_create_panel(find_create_panel())
     patch_types_and_api()
-    print("createpanel-dcw complete")
+    print("createpanel-dcw complete (default ON)")
 
 
 if __name__ == "__main__":
