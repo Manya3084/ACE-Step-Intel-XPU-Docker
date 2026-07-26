@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Add DCW checkbox to CreatePanel and wire GenerationParams.
+"""Add Enable DCW checkbox to CreatePanel; wire params; default off on XPU.
 
-ace-step-ui did not expose DCW; buildGradioArgs hard-coded dcw_enabled=true.
-On XPU default OFF (Arc quality issues / optional experimental). User can
-toggle under the same Expert flag row as Use ADG.
+Root cause of always-on DCW: buildGradioArgs hard-coded
+  true, 'double', 0.02, 0.06, 'haar'
+Dockerfile.ui now uses params.dcwEnabled ?? false; this patch exposes the toggle.
 """
 from __future__ import annotations
 
@@ -13,225 +13,132 @@ from pathlib import Path
 
 MARKER = "[XPU-DCW]"
 
-
-def find_create_panel() -> Path:
-    for c in [
-        Path("components/CreatePanel.tsx"),
-        Path("src/components/CreatePanel.tsx"),
-    ]:
-        if c.is_file():
-            return c
-    for c in Path(".").rglob("CreatePanel.tsx"):
-        return c
-    raise SystemExit("CreatePanel.tsx not found")
-
-
-def patch_create_panel(path: Path) -> None:
-    text = path.read_text()
-    if MARKER in text and "dcwEnabled" in text:
-        print(f"CreatePanel already has DCW: {path}")
-        return
-
-    # 1) useState next to useAdg
-    if "const [dcwEnabled, setDcwEnabled]" not in text:
-        m = re.search(
-            r"const \[useAdg, setUseAdg\] = useState\((?:false|true)\);[^
-]*
-",
-            text,
-        )
-        if not m:
-            print("WARN: useAdg useState not found", file=sys.stderr)
-        else:
-            insert = (
-                m.group(0)
-                + "  const [dcwEnabled, setDcwEnabled] = useState(false); "
-                + f"// {MARKER} default off on XPU
-"
-            )
-            text = text[: m.start()] + insert + text[m.end() :]
-            print("OK added dcwEnabled useState")
-
-    # 2) Include in generate / API payload objects that already pass useAdg
-    if "dcwEnabled," not in text and "useAdg," in text:
-        text2, n = re.subn(
-            r"(useAdg,)(\s*)",n
-            r"\1\2dcwEnabled, // " + MARKER + r"\2",
-            text,
-            count=3,
-        )
-        if n:
-            text = text2
-            print(f"OK injected dcwEnabled into {n} object literal(s)")
-
-    # 3) Checkbox near Use ADG label
-    if "setDcwEnabled" not in text or "Enable DCW" not in text:
-        # Match a simple Use ADG checkbox block variants
-        patterns = [
-            (
-                re.compile(
-                    r"(Use ADG</(?:label|span|div)>[\s\S]{0,200}?)",
-                    re.I,
-                ),
-                None,
-            ),
-        ]
-        # Prefer: after useAdg checkbox input onChange
-        adg_cb = re.search(
-            r"(checked=\{useAdg\}[^>]*>[\s\S]{0,120}?Use ADG[\s\S]{0,80}?)</",
-            text,
-            re.I,
-        )
-        checkbox_jsx = (
-            f"""
-                  {{/* {MARKER} */}}
-                  <label className="flex items-center gap-2 text-sm cursor-pointer">
+CHECKBOX = '''
+                  {/* [XPU-DCW] */}
+                  <label className="flex items-center gap-2 text-sm cursor-pointer select-none">
                     <input
                       type="checkbox"
-                      checked={{dcwEnabled}}
-                      onChange={{(e) => setDcwEnabled(e.target.checked)}}
-                      className="rounded border-zinc-600"
+                      checked={dcwEnabled}
+                      onChange={(e) => setDcwEnabled(e.target.checked)}
                     />
                     <span>Enable DCW</span>
                   </label>
-"""
+'''
+
+
+def find_create_panel() -> Path:
+    for c in [Path("components/CreatePanel.tsx"), Path("src/components/CreatePanel.tsx")]:
+        if c.is_file():
+            return c
+    hits = list(Path(".").rglob("CreatePanel.tsx"))
+    if not hits:
+        raise SystemExit("CreatePanel.tsx not found")
+    return hits[0]
+
+
+def main() -> None:
+    path = find_create_panel()
+    text = path.read_text()
+
+    # --- useState ---
+    if "const [dcwEnabled, setDcwEnabled]" not in text:
+        m = re.search(
+            r"const \[useAdg, setUseAdg\] = useState\((?:false|true)\);",
+            text,
         )
-        if "Enable DCW" not in text:
-            # Insert after first occurrence of Use ADG checkbox group
-            m = re.search(
-                r"([\s\S]*?Use ADG[\s\S]{0,40}?)(\n\s*</(?:label|div)>)",
-                text,
+        if m:
+            text = (
+                text[: m.end()]
+                + f"\n  const [dcwEnabled, setDcwEnabled] = useState(false); // {MARKER}"
+                + text[m.end() :]
             )
-            # Simpler: after useAdg onChange line block
-            m2 = re.search(
-                r"(setUseAdg\(e\.target\.checked\)[\s\S]{0,300}?</label>)",
-                text,
-            )
-            if m2:
-                text = text[: m2.end()] + checkbox_jsx + text[m2.end() :]
-                print("OK inserted Enable DCW checkbox after Use ADG")
-            else:
-                # Fallback: append near completeTrackClasses section end flags
-                m3 = re.search(
-                    r"(Use ADG[\s\S]{0,80})",
-                    text,
-                )
-                if m3:
-                    text = (
-                        text[: m3.end()]
-                        + " / DCW toggle injected below — "
-                        + text[m3.end() :]
-                    )
-                # Last resort: inject before closing of expert flags area with useAdg in JSX
-                if "Enable DCW" not in text and "setUseAdg" in text:
-                    text = text.replace(
-                        "{useAdg}",
-                        "{useAdg}" + " /* dcw sibling below */",
-                        1,
-                    )
-                    # Insert a standalone row before Track Name if present
-                    if "Track Name" in text and "Enable DCW" not in text:
-                        text = text.replace(
-                            "Track Name",
-                            (
-                                f"""Enable DCW"""  # placeholder avoid
-                            ),
-                            0,  # no
-                        )
-                    # Clean approach: insert checkbox JSX before first "Use ADG" text node parent ends
-                    text = re.sub(
-                        r"(>Use ADG</span>)",
-                        r"\1",
-                        text,
-                        count=1,
-                    )
-                    if "Enable DCW" not in text:
-                        text = text.replace(
-                            ">Use ADG<",
-                            ">Use ADG<",
-                            1,
-                        )
-                        # After completeTrackClasses chips area — search Allow LM Batch
-                        if "Allow LM Batch" in text:
-                            text = text.replace(
-                                "Allow LM Batch",
-                                (
-                                    "Enable DCW"
-                                ),
-                                0,
-                            )
-                        # inject before Allow LM Batch checkbox
-                        m_allow = re.search(
-                            r"([\t ]*)((?:<label[\s\S]*?)?Allow LM Batch)",
-                            text,
-                        )
-                        if m_allow and "Enable DCW" not in text:
-                            ind = m_allow.group(1)
-                            block = (
-                                f"{ind}<label className=\"flex items-center gap-2 text-sm cursor-pointer\">\n"
-                                f"{ind}  <input type=\"checkbox\" checked={{dcwEnabled}} "
-                                f"onChange={{(e) => setDcwEnabled(e.target.checked)}} />\n"
-                                f"{ind}  <span>Enable DCW</span>\n"
-                                f"{ind}</label>\n"
-                                f"{ind}{{/* {MARKER} */}}\n"
-                            )
-                            text = text[: m_allow.start()] + block + text[m_allow.start() :]
-                            print("OK inserted Enable DCW before Allow LM Batch")
-                        elif "Enable DCW" not in text:
-                            print("WARN: could not place checkbox JSX", file=sys.stderr)
+            print("OK dcwEnabled useState")
+        else:
+            print("WARN: useAdg useState not found", file=sys.stderr)
+
+    # --- pass dcwEnabled next to useAdg in payloads ---
+    if re.search(r"\bdcwEnabled\s*,", text) is None:
+        text2, n = re.subn(
+            r"(\buseAdg\s*,)",
+            r"\1 dcwEnabled, /* " + MARKER + " */",
+            text,
+            count=5,
+        )
+        if n:
+            text = text2
+            print(f"OK dcwEnabled in {n} payload site(s)")
+
+    # --- checkbox UI ---
+    if "Enable DCW" not in text:
+        inserted = False
+        # Prefer right after Use ADG checkbox label
+        m = re.search(
+            r"setUseAdg\(e\.target\.checked\)[\s\S]{0,400}?</label>",
+            text,
+        )
+        if m:
+            text = text[: m.end()] + CHECKBOX + text[m.end() :]
+            inserted = True
+            print("OK checkbox after Use ADG")
+        if not inserted:
+            m = re.search(r">Use ADG</span>", text)
+            if m:
+                # find closing label after this
+                end = text.find("</label>", m.end())
+                if end > 0:
+                    end += len("</label>")
+                    text = text[:end] + CHECKBOX + text[end:]
+                    inserted = True
+                    print("OK checkbox after Use ADG span")
+        if not inserted and "Allow LM Batch" in text:
+            idx = text.find("Allow LM Batch")
+            # walk back to start of this label-ish block
+            start = text.rfind("<label", 0, idx)
+            if start < 0:
+                start = idx
+            text = text[:start] + CHECKBOX + text[start:]
+            inserted = True
+            print("OK checkbox before Allow LM Batch")
+        if not inserted:
+            print("WARN: checkbox placement failed", file=sys.stderr)
 
     path.write_text(text)
     print(f"Wrote {path}")
 
+    # GenerationParams type
+    for tp in Path(".").rglob("*.ts"):
+        if "node_modules" in str(tp):
+            continue
+        t = tp.read_text()
+        if "useAdg?" in t and "dcwEnabled?" not in t and (
+            "GenerationParams" in t or "interface" in t
+        ):
+            t2 = re.sub(
+                r"(useAdg\?:\s*boolean;?)",
+                r"\1\n  dcwEnabled?: boolean; // " + MARKER,
+                t,
+                count=1,
+            )
+            if t2 != t:
+                tp.write_text(t2)
+                print(f"OK type dcwEnabled in {tp}")
 
-def patch_types() -> None:
-    for path in Path(".").rglob("*.ts*"):
-        if not path.is_file():
+    # acestep.ts hardcode fallback
+    for sp in Path(".").rglob("acestep.ts"):
+        if "node_modules" in str(sp):
             continue
-        if "node_modules" in str(path):
-            continue
-        text = path.read_text()
-        if "useAdg" not in text:
-            continue
-        if "dcwEnabled" in text and MARKER in text:
-            continue
-        if "interface GenerationParams" in text or "type GenerationParams" in text:
-            if "dcwEnabled" not in text:
-                text2 = re.sub(
-                    r"(useAdg\?:\s*boolean;?)",
-                    r"\1\n  dcwEnabled?: boolean; // " + MARKER,
-                    text,
-                    count=1,
-                )
-                if text2 != text:
-                    path.write_text(text2)
-                    print(f"OK GenerationParams.dcwEnabled in {path}")
-
-
-def patch_acestep_service() -> None:
-    """Ensure server maps dcwEnabled → Gradio arg (if not already in Dockerfile)."""
-    for path in Path(".").rglob("acestep.ts"):
-        if "node_modules" in str(path):
-            continue
-        text = path.read_text()
-        if "true, 'double', 0.02, 0.06, 'haar'" in text:
-            text = text.replace(
+        t = sp.read_text()
+        if "true, 'double', 0.02, 0.06, 'haar'" in t:
+            t = t.replace(
                 "true, 'double', 0.02, 0.06, 'haar'",
                 "params.dcwEnabled ?? false, 'double', 0.02, 0.06, 'haar' /* "
                 + MARKER
                 + " */",
                 1,
             )
-            path.write_text(text)
-            print(f"OK buildGradioArgs dcw from params in {path}")
-        elif "params.dcwEnabled" in text:
-            print(f"acestep.ts already uses params.dcwEnabled: {path}")
+            sp.write_text(t)
+            print(f"OK acestep.ts DCW from params: {sp}")
 
-
-def main() -> None:
-    patch_create_panel(find_create_panel())
-    patch_types()
-    patch_acestep_service()
     print("createpanel-dcw complete")
 
 
