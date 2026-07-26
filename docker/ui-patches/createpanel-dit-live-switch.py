@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""Live-switch DiT when user picks a model in Create panel (incl. XL).
+"""Live-switch DiT when user picks a model in Create panel (incl. mobile + XL).
 
-Problem: Generate was still running turbo even when the dropdown showed XL.
-Upstream only calls switchModelIfNeeded at generate time, and getActiveModel()
-used models[0] which can disagree with the real loaded DiT.
+Problems fixed:
+1. refreshModels() always set selectedModel = backend is_active → snapped back to 1.5T
+2. Mobile taps often never fired menu onClick → no switch-dit / no console log
+3. Only mousedown outside-close; touch path incomplete
 
-This patch:
-1. Adds POST /api/generate/switch-dit -> Gradio /v1/init {model}
-2. CreatePanel model-menu onClick calls switch-dit right away
-3. Hardens getActiveModel + switchModelIfNeeded in acestep.ts
+Approach:
+- POST /api/generate/switch-dit still in generate.ts
+- CreatePanel: selectModel() + useEffect on selectedModel → switch-dit
+- refreshModels only updates badges, does not overwrite user selection
+- Menu items: onPointerUp + onClick; outside: mousedown + touchstart
 """
 from __future__ import annotations
 
@@ -38,7 +40,6 @@ def patch_generate_ts() -> None:
 
     endpoint = r'''
 // POST /api/generate/switch-dit — live-switch DiT via Gradio /v1/init
-// Body: { model: "acestep-v15-xl-turbo" | "acestep-v15-turbo" | ... }
 router.post('/switch-dit', authMiddleware, async (req: AuthenticatedRequest, res: Response) => {
   try {
     const body = req.body || {};
@@ -116,95 +117,199 @@ def patch_create_panel() -> None:
         print("CreatePanel.tsx not found", file=sys.stderr)
         sys.exit(1)
     text = p.read_text()
-    if "/api/generate/switch-dit" in text:
-        print("CreatePanel DiT live switch already wired")
-        return
+    original = text
 
-    # Typical upstream onClick for model menu items
-    old = """            onClick={() => {
-              setSelectedModel(model.id);
-              localStorage.setItem('ace-model', model.id);
-              // Auto-adjust parameters for non-turbo models
-              if (!isTurboModel(model.id)) {
-                setInferenceSteps(20);
-                setUseAdg(true);
-              }
-              setShowModelMenu(false);
-            }}"""
+    # --- XL display names ---
+    if "'acestep-v15-xl-turbo'" not in text or "1.5XL" not in text:
+        old_map = """    const mapping: Record<string, string> = {
+      'acestep-v15-base': '1.5B',
+      'acestep-v15-sft': '1.5S',
+      'acestep-v15-turbo-shift1': '1.5TS1',
+      'acestep-v15-turbo-shift3': '1.5TS3',
+      'acestep-v15-turbo-continuous': '1.5TC',
+      'acestep-v15-turbo': '1.5T',
+    };"""
+        new_map = """    const mapping: Record<string, string> = {
+      'acestep-v15-base': '1.5B',
+      'acestep-v15-sft': '1.5S',
+      'acestep-v15-turbo-shift1': '1.5TS1',
+      'acestep-v15-turbo-shift3': '1.5TS3',
+      'acestep-v15-turbo-continuous': '1.5TC',
+      'acestep-v15-turbo': '1.5T',
+      'acestep-v15-xl-turbo': '1.5XL-T',
+      'acestep-v15-xl-sft': '1.5XL-S',
+      'acestep-v15-xl-base': '1.5XL-B',
+    };"""
+        if old_map in text:
+            text = text.replace(old_map, new_map, 1)
+            print("OK XL display names")
 
-    new = """            onClick={async () => {
-              setSelectedModel(model.id);
-              localStorage.setItem('ace-model', model.id);
-              // Auto-adjust parameters for non-turbo models
-              if (!isTurboModel(model.id)) {
-                setInferenceSteps(20);
-                setUseAdg(true);
-              } else {
-                // turbo family prefers low steps / no ADG
-                setInferenceSteps((s) => (s > 8 ? 8 : s));
-              }
-              setShowModelMenu(false);
-              // Live DiT switch (same path as curl /v1/init) so Generate
-              // does not stay on turbo when XL is selected.
-              try {
-                const r = await fetch('/api/generate/switch-dit', {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ model: model.id }),
-                });
-                const d = await r.json();
-                if (!r.ok || d.success === false) {
-                  console.error('[DiT switch]', d.error || d);
-                  alert('Model switch failed: ' + (d.error || r.status));
-                } else {
-                  console.log('[DiT switch]', d.message || d.loaded_model || model.id);
-                }
-              } catch (err: any) {
-                console.error('[DiT switch]', err);
-                alert('Model switch failed: ' + (err?.message || String(err)));
-              }
-            }}"""
+    # --- refreshModels: do NOT overwrite user selection ---
+    old_refresh_sync = """          setFetchedModels(models);
+          // Always sync to the backend's active model
+          const active = models.find((m: any) => m.is_active);
+          if (active) {
+            setSelectedModel(active.name);
+            localStorage.setItem('ace-model', active.name);
+          }"""
+    new_refresh_sync = """          setFetchedModels(models);
+          // Do NOT force selectedModel to backend is_active — that snapped
+          // mobile (and desktop) back to 1.5T after every refresh/generate.
+          // Keep localStorage / user pick; badges still show Active/Ready."""
+    if old_refresh_sync in text:
+        text = text.replace(old_refresh_sync, new_refresh_sync, 1)
+        print("OK refreshModels no longer overwrites selection")
+    elif "Always sync to the backend's active model" in text:
+        text = re.sub(
+            r"// Always sync to the backend's active model\s*"
+            r"const active = models\.find\(\(m: any\) => m\.is_active\);\s*"
+            r"if \(active\) \{\s*"
+            r"setSelectedModel\(active\.name\);\s*"
+            r"localStorage\.setItem\('ace-model', active\.name\);\s*"
+            r"\}",
+            "// [XPU] keep user selection; badges come from fetchedModels",
+            text,
+            count=1,
+        )
+        print("OK refreshModels overwrite removed (regex)")
 
-    if old in text:
-        text = text.replace(old, new, 1)
+    # --- click-outside: also touchstart (mobile) ---
+    old_outside = """    const handleClickOutside = (event: MouseEvent) => {
+      if (modelMenuRef.current && !modelMenuRef.current.contains(event.target as Node)) {
+        setShowModelMenu(false);
+      }
+    };
+
+    if (showModelMenu) {
+      document.addEventListener('mousedown', handleClickOutside);
+      return () => document.removeEventListener('mousedown', handleClickOutside);
+    }"""
+    new_outside = """    const handleClickOutside = (event: Event) => {
+      if (modelMenuRef.current && !modelMenuRef.current.contains(event.target as Node)) {
+        setShowModelMenu(false);
+      }
+    };
+
+    if (showModelMenu) {
+      document.addEventListener('mousedown', handleClickOutside);
+      document.addEventListener('touchstart', handleClickOutside, { passive: true });
+      return () => {
+        document.removeEventListener('mousedown', handleClickOutside);
+        document.removeEventListener('touchstart', handleClickOutside);
+      };
+    }"""
+    if old_outside in text:
+        text = text.replace(old_outside, new_outside, 1)
+        print("OK mobile touch outside-close")
+
+    # --- selectModel helper + useEffect switch (idempotent markers) ---
+    if "[XPU-DIT-SELECT]" not in text:
+        # Insert after isTurboModel definition
+        turbo_fn = "  const isTurboModel = (modelId: string): boolean => {\n    return modelId.includes('turbo');\n  };"
+        helper = '''  const isTurboModel = (modelId: string): boolean => {
+    return modelId.includes('turbo');
+  };
+
+  // [XPU-DIT-SELECT] single path for desktop click + mobile pointer/touch
+  const selectDitModel = useCallback((modelId: string) => {
+    if (!modelId) return;
+    setSelectedModel(modelId);
+    localStorage.setItem('ace-model', modelId);
+    if (!isTurboModel(modelId)) {
+      setInferenceSteps(20);
+      setUseAdg(true);
+    }
+    setShowModelMenu(false);
+  }, []);
+
+  // Live DiT switch whenever selection changes (works even if menu onClick fails on mobile)
+  const ditSwitchInitRef = useRef(true);
+  useEffect(() => {
+    if (ditSwitchInitRef.current) {
+      ditSwitchInitRef.current = false;
+      return;
+    }
+    const modelId = selectedModel;
+    if (!modelId || !modelId.startsWith('acestep-v15-')) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        console.log('[DiT switch] requesting', modelId);
+        const r = await fetch('/api/generate/switch-dit', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model: modelId }),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (cancelled) return;
+        if (!r.ok || d.success === false) {
+          console.error('[DiT switch]', d.error || d);
+        } else {
+          console.log('[DiT switch]', d.message || d.loaded_model || modelId);
+        }
+      } catch (err: any) {
+        if (!cancelled) console.error('[DiT switch]', err);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [selectedModel]);'''
+        if turbo_fn in text:
+            text = text.replace(turbo_fn, helper, 1)
+            print("OK selectDitModel + useEffect switch")
+        else:
+            print("WARN: isTurboModel block not found for helper insert", file=sys.stderr)
+
+    # --- Replace menu item handlers to use selectDitModel + pointer ---
+    old_onclick = """                        onClick={() => {
+                          setSelectedModel(model.id);
+                          localStorage.setItem('ace-model', model.id);
+                          // Auto-adjust parameters for non-turbo models
+                          if (!isTurboModel(model.id)) {
+                            setInferenceSteps(20);
+                            setUseAdg(true);
+                          }
+                          setShowModelMenu(false);
+                        }}"""
+    new_onclick = """                        onPointerUp={(e) => {
+                          // Mobile Safari often skips click on absolute menus; pointerup is reliable
+                          e.preventDefault();
+                          selectDitModel(model.id);
+                        }}
+                        onClick={(e) => {
+                          e.preventDefault();
+                          selectDitModel(model.id);
+                        }}"""
+
+    if old_onclick in text:
+        text = text.replace(old_onclick, new_onclick, 1)
+        print("OK model menu onPointerUp/onClick")
+    elif "selectDitModel(model.id)" in text:
+        print("model menu already uses selectDitModel")
+    else:
+        # Try already-patched async onClick from older patch
+        if "/api/generate/switch-dit" in text and "setSelectedModel(model.id)" in text:
+            # replace any remaining simple onClick that only sets state
+            pat = re.compile(
+                r"onClick=\{\(\)\s*=>\s*\{\s*setSelectedModel\(model\.id\);\s*"
+                r"localStorage\.setItem\('ace-model', model\.id\);[\s\S]*?setShowModelMenu\(false\);\s*\}\}",
+                re.M,
+            )
+            if pat.search(text):
+                text = pat.sub(
+                    "onPointerUp={(e) => { e.preventDefault(); selectDitModel(model.id); }}\n"
+                    "                        onClick={(e) => { e.preventDefault(); selectDitModel(model.id); }}",
+                    text,
+                    count=1,
+                )
+                print("OK replaced residual onClick with selectDitModel")
+            else:
+                print("WARN: could not locate model menu onClick", file=sys.stderr)
+
+    if text != original:
         p.write_text(text)
-        print(f"OK CreatePanel DiT onClick live switch -> {p}")
-        return
-
-    # Fallback: any setSelectedModel(model.id) block inside model map onClick
-    pat = re.compile(
-        r"onClick=\{\(\)\s*=>\s*\{\s*setSelectedModel\(model\.id\);\s*localStorage\.setItem\('ace-model', model\.id\);",
-        re.S,
-    )
-    m = pat.search(text)
-    if not m:
-        print("WARN: could not find DiT model onClick in CreatePanel", file=sys.stderr)
-        return
-
-    # Expand to async + switch-dit after localStorage line
-    repl = """onClick={async () => {
-              setSelectedModel(model.id);
-              localStorage.setItem('ace-model', model.id);
-              try {
-                const r = await fetch('/api/generate/switch-dit', {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ model: model.id }),
-                });
-                const d = await r.json();
-                if (!r.ok || d.success === false) {
-                  console.error('[DiT switch]', d.error || d);
-                  alert('Model switch failed: ' + (d.error || r.status));
-                } else {
-                  console.log('[DiT switch]', d.message || d.loaded_model || model.id);
-                }
-              } catch (err: any) {
-                console.error('[DiT switch]', err);
-                alert('Model switch failed: ' + (err?.message || String(err)));
-              }"""
-    text = text[: m.start()] + repl + text[m.end() :]
-    p.write_text(text)
-    print(f"OK CreatePanel DiT onClick (fallback) -> {p}")
+        print(f"Wrote {p}")
+    else:
+        print(f"No CreatePanel text changes needed (or already patched): {p}")
 
 
 def patch_acestep_service() -> None:
@@ -221,7 +326,6 @@ async function getActiveModel(): Promise<string | null> {
     if (!res.ok) return null;
     const data = await res.json() as any;
     const payload = data?.data || data || {};
-    // Prefer explicit fields from our Gradio /v1/models patch
     if (payload.default_model) return String(payload.default_model);
     if (payload.loaded_model) return String(payload.loaded_model);
     const models = payload.models || [];
@@ -267,10 +371,9 @@ async function switchModelIfNeeded(ditModel: string): Promise<void> {
 }
 '''
 
-    if "Prefer explicit fields from our Gradio" in text:
+    if "Prefer explicit fields from our Gradio" in text or "payload.default_model" in text:
         print("getActiveModel already hardened")
     else:
-        # Replace existing getActiveModel function body
         pat = re.compile(
             r"async function getActiveModel\(\): Promise<string \| null> \{[\s\S]*?\n\}",
             re.M,
@@ -293,22 +396,8 @@ async function switchModelIfNeeded(ditModel: string): Promise<void> {
             text = pat.sub(new_switch.strip(), text, count=1)
             print("OK replaced switchModelIfNeeded")
         else:
-            # insert after getActiveModel
-            if "async function getActiveModel" in text:
-                text = text.replace(
-                    new_get.strip(),
-                    new_get.strip() + "\n\n" + new_switch.strip(),
-                    1,
-                )
-            else:
-                text = new_switch + "\n" + text
+            text = new_switch + "\n" + text
             print("OK inserted switchModelIfNeeded")
-
-    # Ensure generation always attempts switch when ditModel present
-    if "if (params.ditModel)" in text and "await switchModelIfNeeded(params.ditModel)" in text:
-        print("generation-time DiT switch call present")
-    elif "processGenerationViaGradio" in text and "switchModelIfNeeded" in text:
-        print("switchModelIfNeeded referenced — leave call sites")
 
     p.write_text(text)
     print(f"Wrote {p}")
