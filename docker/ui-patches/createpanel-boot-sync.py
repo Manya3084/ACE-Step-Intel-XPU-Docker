@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""On CreatePanel mount: sync backend LM/DiT to localStorage selection.
-
-UI may show 4B while server booted 1.7B. After load, POST switch-lm / switch-dit
-once so Format and generation see the same models.
-"""
+"""On CreatePanel mount: sync backend LM/DiT to localStorage selection."""
 from __future__ import annotations
 
 import re
@@ -18,9 +14,15 @@ BOOT_EFFECT = '''
     let cancelled = false;
     (async () => {
       try {
-        const lm = (typeof localStorage !== 'undefined' && localStorage.getItem('ace-lmModel')) || lmModel;
-        const dit = (typeof localStorage !== 'undefined' && localStorage.getItem('ace-model')) || selectedModel;
-        if (lm && String(lm).includes('4B') || (lm && String(lm).includes('5Hz-lm'))) {
+        const lm =
+          (typeof localStorage !== 'undefined' && localStorage.getItem('ace-lmModel')) ||
+          lmModel ||
+          '';
+        const dit =
+          (typeof localStorage !== 'undefined' && localStorage.getItem('ace-model')) ||
+          selectedModel ||
+          '';
+        if (lm) {
           const r = await fetch('/api/generate/switch-lm', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -49,8 +51,7 @@ BOOT_EFFECT = '''
 
 
 def main() -> None:
-    hits = list(Path(".").rglob("CreatePanel.tsx"))
-    hits = [p for p in hits if "node_modules" not in str(p)]
+    hits = [p for p in Path(".").rglob("CreatePanel.tsx") if "node_modules" not in str(p)]
     if not hits:
         print("CreatePanel.tsx not found", file=sys.stderr)
         sys.exit(1)
@@ -58,11 +59,7 @@ def main() -> None:
     text = path.read_text()
     if MARKER in text:
         print("boot-sync already present")
-        return
-
-    # Insert after first useEffect or after lmModel state
-    if "const [lmModel" in text:
-        # find a good spot: after all useState, before first useEffect
+    else:
         m = re.search(r"\n  useEffect\(", text)
         if m:
             text = text[: m.start()] + "\n" + BOOT_EFFECT + text[m.start() :]
@@ -70,25 +67,12 @@ def main() -> None:
             text = text + "\n" + BOOT_EFFECT
         path.write_text(text)
         print(f"OK boot-sync in {path}")
-    else:
-        print("WARN: lmModel state not found", file=sys.stderr)
 
-    # Default LM dropdown to 1.7B if upstream hardcodes 4B without localStorage
     text = path.read_text()
-    for old in (
-        "useState('acestep-5Hz-lm-4B')",
-        'useState("acestep-5Hz-lm-4B")',
-        "useState('4B')",
-    ):
-        if old in text and "ace-lmModel" not in text[text.find(old) - 80 : text.find(old)]:
-            # only if not already reading localStorage
-            pass
-    # Prefer localStorage with 1.7B fallback
-    if "localStorage.getItem('ace-lmModel')" not in text and "ace-lmModel" in text:
-        pass  # already sticky
-    elif "const [lmModel, setLmModel] = useState(" in text:
+    # Sticky LM default: localStorage or 1.7B (matches docker default)
+    if "const [lmModel, setLmModel] = useState(" in text:
         text2 = re.sub(
-            r"const \[lmModel, setLmModel\] = useState\(([^)]+)\)",
+            r"const \[lmModel, setLmModel\] = useState\([^)]*\)",
             "const [lmModel, setLmModel] = useState(() => "
             "(typeof localStorage !== 'undefined' && localStorage.getItem('ace-lmModel')) "
             "|| 'acestep-5Hz-lm-1.7B')",
@@ -97,7 +81,7 @@ def main() -> None:
         )
         if text2 != text:
             path.write_text(text2)
-            print("OK lmModel default 1.7B with localStorage")
+            print("OK lmModel default localStorage || 1.7B")
 
     print("createpanel-boot-sync complete")
 
