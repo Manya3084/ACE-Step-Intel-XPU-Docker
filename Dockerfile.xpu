@@ -3,6 +3,7 @@
 # =============================================================================
 # DiT live switch (all 1.5 + 1.5XL) + dual CPU offload: live-dit-switch.py
 # DiT UI sync: live-dit-ui-config.py + gradio-dit-ui-sync.py (steps max 200)
+# APG FP64: apg-xpu-fp64-fallback.py (Arc has no FP64 — CPU project like MPS)
 # LM live switch layered on top: live-lm-reinit.py
 # Format routes: standalone acestep/xpu_format_routes.py (wire-format-routes.py)
 # Turbo steps: no hard clamp to 8 (ACESTEP_TURBO_MAX_INFER_STEPS=0)
@@ -67,6 +68,7 @@ RUN python3 /app/docker/ui-patches/live-dit-ui-config.py
 RUN python3 /app/docker/ui-patches/gradio-dit-ui-sync.py
 RUN python3 /app/docker/ui-patches/live-lm-reinit.py
 RUN python3 /app/docker/ui-patches/turbo-steps-unclamp.py
+RUN python3 /app/docker/ui-patches/apg-xpu-fp64-fallback.py
 
 RUN python3 /app/docker/ui-patches/wire-format-routes.py
 RUN python3 /app/docker/ui-patches/fix-pipeline-imports.py
@@ -184,6 +186,11 @@ else
     echo "XPU       : NOT DETECTED"
 fi
 echo "==========================================="
+
+# Re-apply APG XPU FP64 fallback (HF model sync can drop apg_guidance copies)
+if [ -f /app/docker/ui-patches/apg-xpu-fp64-fallback.py ]; then
+  python3 /app/docker/ui-patches/apg-xpu-fp64-fallback.py || true
+fi
 
 if [ -f /tmp/preprocess_dataset_xpu.py ]; then
   mkdir -p /app/datasets/_tools
