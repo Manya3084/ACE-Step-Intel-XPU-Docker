@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Give /format_input and /format_lyrics the same headroom as generation.
+"""/format_input + /format_lyrics with XPU headroom and LM ensure-init.
 
-IMPORTANT: When replacing an existing _xpu_register_format_input, end the
-function by *indentation* (column-0 content). Never use "next def" as the
-end marker — that deleted all imports between a prepended helper and main()
-(including get_gpu_config) and crash-looped the container.
+ace-step-ui Format button hits POST /format_input. Upstream often returns
+"LLM not initialized" when the handler closed over a stale/None llm or
+llm_initialized is False after offload/switch. This route resolves the
+live handler from app.state and initializes if needed.
 """
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from pathlib import Path
 
 NEW_HELPER = r'''
 def _xpu_register_format_input(demo, llm_handler):
-    """POST /format_input + /format_lyrics with A770 RAM/VRAM headroom."""
+    """POST /format_input + /format_lyrics with A770 RAM/VRAM headroom + LM ensure."""
     import asyncio
     import gc
     import json
@@ -50,7 +50,6 @@ def _xpu_register_format_input(demo, llm_handler):
             pass
 
     def _park_dit_cpu() -> None:
-        """Best-effort: free VRAM by parking DiT on CPU during Format."""
         try:
             dit = getattr(getattr(app, "state", None), "dit_handler", None)
             if dit is None:
@@ -75,8 +74,62 @@ def _xpu_register_format_input(demo, llm_handler):
         except Exception as exc:
             print(f"[XPU-format] DiT park warning: {exc}")
 
-    def _ensure_lm_offload() -> None:
-        if llm_handler is None:
+    def _resolve_llm():
+        """Prefer live app.state handler over closure (survives re-init)."""
+        st = getattr(app, "state", None)
+        for attr in ("llm_handler", "_llm_handler", "lm_handler"):
+            h = getattr(st, attr, None) if st is not None else None
+            if h is not None:
+                return h
+        return llm_handler
+
+    def _ensure_llm_ready(handler):
+        if handler is None:
+            return None, "LLM handler is None — start acestep-xpu with init_llm / ACESTEP_LM_MODEL_PATH"
+        initialized = bool(
+            getattr(handler, "llm_initialized", False)
+            or getattr(handler, "is_initialized", False)
+            or getattr(handler, "initialized", False)
+        )
+        if initialized:
+            return handler, None
+        # Try common init entry points
+        for name in ("initialize", "init_llm", "load_model", "ensure_initialized"):
+            fn = getattr(handler, name, None)
+            if not callable(fn):
+                continue
+            try:
+                print(f"[XPU-format] calling handler.{name}() to init LM")
+                fn()
+                initialized = bool(
+                    getattr(handler, "llm_initialized", False)
+                    or getattr(handler, "is_initialized", False)
+                    or getattr(handler, "initialized", False)
+                )
+                if initialized:
+                    return handler, None
+            except TypeError:
+                # maybe needs kwargs — try with env model path
+                try:
+                    mp = os.environ.get("ACESTEP_LM_MODEL_PATH") or "acestep-5Hz-lm-1.7B"
+                    fn(lm_model_path=mp)
+                    return handler, None
+                except Exception as exc:
+                    print(f"[XPU-format] {name}() failed: {exc}")
+            except Exception as exc:
+                print(f"[XPU-format] {name}() failed: {exc}")
+        if not (
+            getattr(handler, "llm_initialized", False)
+            or getattr(handler, "is_initialized", False)
+        ):
+            return handler, (
+                "LLM not initialized — wait for Auto-init LM to finish, "
+                "or switch LM once in the UI, then Format again"
+            )
+        return handler, None
+
+    def _ensure_lm_offload(handler) -> None:
+        if handler is None:
             return
         want = _env_bool("ACESTEP_LM_OFFLOAD_TO_CPU", True) or _env_bool(
             "ACESTEP_OFFLOAD_TO_CPU", True
@@ -84,8 +137,8 @@ def _xpu_register_format_input(demo, llm_handler):
         if not want:
             return
         try:
-            if hasattr(llm_handler, "offload_to_cpu"):
-                setattr(llm_handler, "offload_to_cpu", True)
+            if hasattr(handler, "offload_to_cpu"):
+                setattr(handler, "offload_to_cpu", True)
                 print("[XPU-format] llm_handler.offload_to_cpu = True")
         except Exception as exc:
             print(f"[XPU-format] LM offload flag warning: {exc}")
@@ -148,16 +201,20 @@ def _xpu_register_format_input(demo, llm_handler):
             user_metadata["language"] = str(language)
 
         def _run():
+            handler = _resolve_llm()
+            handler, err = _ensure_llm_ready(handler)
+            if err:
+                raise RuntimeError(err)
             print("[XPU-format] preparing headroom before format_sample")
             _empty_cache("(before format)")
             _park_dit_cpu()
-            _ensure_lm_offload()
+            _ensure_lm_offload(handler)
             _empty_cache("(after park)")
             from acestep.inference import format_sample
 
             try:
                 result = format_sample(
-                    llm_handler=llm_handler,
+                    llm_handler=handler,
                     caption=prompt,
                     lyrics=lyrics,
                     user_metadata=user_metadata or None,
@@ -224,25 +281,17 @@ def _xpu_register_format_input(demo, llm_handler):
 
     app.add_api_route("/format_input", format_input_endpoint, methods=["POST"])
     app.add_api_route("/format_lyrics", format_input_endpoint, methods=["POST"])
-    print("[XPU] Registered working /format_input and /format_lyrics (threaded + RAM headroom)")
+    print("[XPU] Registered /format_input and /format_lyrics (standalone + RAM headroom + LM ensure)")
 '''
 
 
 def _function_end_by_indent(text: str, start: int) -> int:
-    """Return index just past a top-level function starting at start.
-
-    A top-level function ends at the first non-empty line that has no indent
-    (column 0) after the def line, excluding blank lines and comments that
-    may sit between nested blocks — we only stop on real column-0 code.
-    """
-    # start at the end of the def line
     nl = text.find("\n", start)
     if nl < 0:
         return len(text)
     i = nl + 1
     n = len(text)
     while i < n:
-        # find end of this line
         nl = text.find("\n", i)
         if nl < 0:
             line = text[i:]
@@ -254,11 +303,9 @@ def _function_end_by_indent(text: str, start: int) -> int:
         if stripped.strip() == "" or stripped.lstrip().startswith("#"):
             i = line_end
             continue
-        # Indented body continues the function
         if line.startswith(" ") or line.startswith("\t"):
             i = line_end
             continue
-        # Column-0 content → end of function
         return i
     return n
 
@@ -273,18 +320,17 @@ def main() -> None:
 
     for path in paths:
         text = path.read_text()
-        if "[XPU-format] preparing headroom before format_sample" in text:
-            print(f"format headroom already present: {path}")
-            continue
+        if "[XPU-format] calling handler" in text or "_ensure_llm_ready" in text:
+            # replace whole helper to latest
+            pass
 
         if "def _xpu_register_format_input" in text:
             start = text.find("def _xpu_register_format_input")
             end = _function_end_by_indent(text, start)
             text = text[:start] + NEW_HELPER.strip() + "\n\n" + text[end:]
             path.write_text(text)
-            print(f"Replaced _xpu_register_format_input (indent-safe) in {path}")
+            print(f"Replaced _xpu_register_format_input in {path}")
         else:
-            # Prefer insert *after* imports: before first top-level def that is not ours
             m = re.search(r"^(def |class )", text, flags=re.M)
             if m:
                 insert_at = m.start()
@@ -302,7 +348,7 @@ def main() -> None:
                         count=1,
                     )
             path.write_text(text)
-            print(f"Inserted format headroom helper into {path}")
+            print(f"Inserted format helper into {path}")
 
     print("format-ram-headroom patch complete")
 
