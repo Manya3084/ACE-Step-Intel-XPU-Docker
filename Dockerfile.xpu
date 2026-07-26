@@ -2,6 +2,7 @@
 # ACE-Step 1.5 — Intel XPU / Arc GPU Dockerfile
 # =============================================================================
 # DiT live switch (all 1.5 + 1.5XL) + dual CPU offload: live-dit-switch.py
+# DiT UI sync: live-dit-ui-config.py + gradio-dit-ui-sync.py (steps max 200)
 # LM live switch layered on top: live-lm-reinit.py
 # Format routes: standalone acestep/xpu_format_routes.py (wire-format-routes.py)
 # Turbo steps: no hard clamp to 8 (ACESTEP_TURBO_MAX_INFER_STEPS=0)
@@ -62,6 +63,8 @@ RUN python3 /app/docker/ui-patches/trainer_xpu_fabric.py
 RUN python3 /app/docker/ui-patches/preprocess_audio_soundfile.py
 RUN python3 /app/docker/ui-patches/lm-ram-offload.py
 RUN python3 /app/docker/ui-patches/live-dit-switch.py
+RUN python3 /app/docker/ui-patches/live-dit-ui-config.py
+RUN python3 /app/docker/ui-patches/gradio-dit-ui-sync.py
 RUN python3 /app/docker/ui-patches/live-lm-reinit.py
 RUN python3 /app/docker/ui-patches/turbo-steps-unclamp.py
 
