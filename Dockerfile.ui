@@ -1,9 +1,7 @@
 # =============================================================================
 # ACE-Step UI — Docker image (fspecii/ace-step-ui)
 # =============================================================================
-# XPU defaults: FLAC output, ADG never auto-on for base (createpanel-xpu-defaults.py)
-# DCW checkbox + default ON (createpanel-dcw.py) — DWT CPU fallback on acestep-xpu
-# No UI "Restart acestep-xpu" button — compose restart + autoheal
+# XPU defaults: FLAC, ADG off, DCW on, boot-sync LM/DiT to localStorage
 # =============================================================================
 
 FROM node:20-bookworm-slim
@@ -78,7 +76,6 @@ async function buildGradioArgs(params: GenerationParams): Promise<unknown[]> {
     params.audioCoverStrength ?? 1.0, 0.0, params.useAdg ?? false, false,
     params.cfgIntervalStart ?? 0.0, params.cfgIntervalEnd ?? 1.0, params.shift ?? 3.0,
     params.inferMethod || 'ode', 'euler', 0.0, 0.0,
-    // [XPU-DCW] default ON — DWT/IDWT on CPU via dcw-xpu-cpu-fallback
     params.dcwEnabled ?? true, 'double', 0.02, 0.06, 'haar',
     params.customTimesteps || '', params.audioFormat || 'flac', '128k', 48000,
     params.lmTemperature ?? 0.85, isThinking, params.lmCfgScale ?? 2.0,
@@ -98,7 +95,7 @@ pat = re.compile(r"async function buildGradioArgs\(params: GenerationParams\): P
 if not pat.search(text):
     raise SystemExit("Could not find buildGradioArgs function")
 p.write_text(pat.sub(new_fn.strip(), text, count=1))
-print("buildGradioArgs patched OK (DCW default true)")
+print("buildGradioArgs patched OK")
 PY
 
 RUN python3 - <<'PY'
@@ -133,6 +130,7 @@ COPY docker/ui-patches/createpanel-dit-live-switch.py /tmp/createpanel-dit-live-
 COPY docker/ui-patches/createpanel-generate-cancel.py /tmp/createpanel-generate-cancel.py
 COPY docker/ui-patches/createpanel-xpu-defaults.py /tmp/createpanel-xpu-defaults.py
 COPY docker/ui-patches/createpanel-dcw.py /tmp/createpanel-dcw.py
+COPY docker/ui-patches/createpanel-boot-sync.py /tmp/createpanel-boot-sync.py
 COPY docker/ui-patches/format-ui-timeout.py /tmp/format-ui-timeout.py
 
 RUN python3 - <<'PY'
@@ -230,6 +228,7 @@ RUN python3 /tmp/createpanel-dit-live-switch.py
 RUN python3 /tmp/createpanel-generate-cancel.py
 RUN python3 /tmp/createpanel-xpu-defaults.py
 RUN python3 /tmp/createpanel-dcw.py
+RUN python3 /tmp/createpanel-boot-sync.py
 RUN python3 /tmp/format-ui-timeout.py
 
 RUN python3 - <<'PY'
