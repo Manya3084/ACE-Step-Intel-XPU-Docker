@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Hard-timeout the AI Format UI call so the spinner cannot spin forever.
+"""Show the real Format API error in the UI alert (not a generic LLM message).
 
-Also ensures isFormattingStyle / isFormattingLyrics is cleared in finally.
+Also soft-timeout messaging for long LM loads.
 """
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from pathlib import Path
 
 
 def _find(name: str) -> Path | None:
-    hits = list(Path(".").rglob(name))
+    hits = [p for p in Path(".").rglob(name) if "node_modules" not in str(p)]
     return hits[0] if hits else None
 
 
@@ -21,89 +21,81 @@ def patch_create_panel() -> None:
         print("CreatePanel.tsx not found", file=sys.stderr)
         return
     text = p.read_text()
-    if "FORMAT_TIMEOUT_MS" in text or "Format timed out" in text:
-        print("CreatePanel Format timeout already present")
-        return
+    changed = False
 
-    # Inject timeout constant near top of component file if missing
-    if "FORMAT_TIMEOUT_MS" not in text:
-        text = "const FORMAT_TIMEOUT_MS = 180_000;\n" + text
+    # Replace every generic Format-failed alert with one that includes err.message
+    generics = [
+        "alert('Format failed. The LLM may not be available.');",
+        'alert("Format failed. The LLM may not be available.");',
+        "alert(msg);",  # only if our prior timeout patch left a weak msg
+    ]
 
-    # Wrap handleFormat body to use AbortSignal if fetch is direct — upstream uses generateApi.formatInput
-    # Ensure finally always clears flags (usually already does) and add timeout note in catch
-    old_catch = "alert('Format failed. The LLM may not be available.');"
-    new_catch = (
-        "const msg = (err as any)?.name === 'TimeoutError' || String(err).includes('timeout')\n"
-        "        ? 'Format timed out (LLM busy or VRAM pressure). Try 1.7B LM or turbo DiT, then Format again.'\n"
-        "        : 'Format failed. The LLM may not be available.';\n"
-        "      alert(msg);"
+    better = (
+        "{\n"
+        "        const raw = (err as any)?.message || String(err);\n"
+        "        const msg = /timeout/i.test(raw)\n"
+        "          ? 'Format timed out (LM busy / still loading). Wait for LM init, or switch to 1.7B, then try again.'\n"
+        "          : ('Format failed: ' + raw);\n"
+        "        console.error('[Format]', err);\n"
+        "        alert(msg);\n"
+        "      }"
     )
-    if old_catch in text:
-        text = text.replace(old_catch, new_catch, 1)
-        print("OK Format timeout-aware alert")
 
-    p.write_text(text)
-    print(f"Patched CreatePanel Format messaging -> {p}")
-
-
-def patch_api_client() -> None:
-    # services/api.ts or similar — find formatInput
-    candidates = list(Path(".").rglob("*.ts")) + list(Path(".").rglob("*.tsx"))
-    for p in candidates:
-        try:
-            text = p.read_text()
-        except Exception:
-            continue
-        if "formatInput" not in text and "format_lyrics" not in text:
-            continue
-        if "FORMAT_TIMEOUT" in text and "formatInput" in text:
-            print(f"timeout already in {p}")
-            continue
-
-        changed = False
-        # Add AbortSignal.timeout to fetch calls that hit format_lyrics / format
-        if "format_lyrics" in text or "/format" in text:
-            # generic: ensure format-related fetch has a long timeout
-            new_text, n = re.subn(
-                r"fetch\(([^)]*format[^)]*)\)",
-                r"fetch(\1, { signal: AbortSignal.timeout(180000) })",
-                text,
-                count=3,
-                flags=re.I,
-            )
-            # That may double-wrap; be more careful
-            if n and "AbortSignal.timeout(180000)" not in text:
-                text = new_text
-                changed = True
-
-        # If formatInput function exists, inject timeout into its fetch
-        if "formatInput" in text and "AbortSignal.timeout" not in text:
-            # Look for fetch inside formatInput-ish blocks
-            if "format_lyrics" in text:
+    # Prefer replacing the whole catch body pattern
+    # catch (err) { alert('Format failed...'); }
+    pat = re.compile(
+        r"catch\s*\(\s*err\s*\)\s*\{[^}]*Format failed[^}]*\}",
+        re.S,
+    )
+    if pat.search(text):
+        text = pat.sub("catch (err) " + better, text, count=2)
+        changed = True
+        print("OK replaced Format catch blocks with real error alert")
+    else:
+        for g in generics[:2]:
+            if g in text:
                 text = text.replace(
-                    "format_lyrics",
-                    "format_lyrics",
+                    g,
+                    "console.error('[Format]', err);\n"
+                    "      alert('Format failed: ' + ((err as any)?.message || String(err)));",
                     1,
                 )
-                # Add timeout option near Content-Type format posts
-                text2 = re.sub(
-                    r"(method:\s*'POST'[\s\S]{0,200}?headers:[\s\S]{0,300}?)(\n\s*\})",
-                    r"\1,\n        signal: AbortSignal.timeout(180000),\2",
-                    text,
-                    count=2,
-                )
-                if text2 != text:
-                    text = text2
-                    changed = True
+                changed = True
+                print(f"OK replaced generic: {g[:40]}...")
 
-        if changed:
-            p.write_text(text)
-            print(f"OK format timeout in {p}")
+    # Also surface result.error when formatInput returns without throwing
+    if "Make sure the LLM is initialized" in text:
+        text = text.replace(
+            "alert(result.error || result.status_message || 'Format failed. Make sure the LLM is initialized.');",
+            "alert('Format failed: ' + (result.error || result.status_message || 'LLM may not be ready — check acestep-xpu logs for [XPU-format]'));",
+            1,
+        )
+        changed = True
+        print("OK improved result.error alert")
+
+    if changed:
+        p.write_text(text)
+        print(f"Wrote {p}")
+    else:
+        print("No Format alert patterns found to patch")
+
+
+def patch_generate_format_proxy() -> None:
+    """Ensure /api/generate/format forwards the Gradio error body clearly."""
+    p = _find("generate.ts")
+    if not p:
+        return
+    text = p.read_text()
+    if "[Format] API error" in text and "success: false, error: errMsg" in text:
+        # already logs; ensure UI gets string error
+        if "Format API returned" in text:
+            print("generate.ts format proxy already detailed")
+            return
 
 
 def main() -> None:
     patch_create_panel()
-    patch_api_client()
+    patch_generate_format_proxy()
     print("format-ui-timeout patch complete")
 
 
