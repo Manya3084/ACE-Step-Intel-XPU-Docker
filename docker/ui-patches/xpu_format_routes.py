@@ -1,7 +1,11 @@
-"""Standalone /format_input + /format_lyrics with A770 RAM/VRAM headroom.
+"""Standalone /format_input + /format_lyrics with A770 headroom + LM ensure.
 
-Imported by acestep_v15_pipeline after setup_api_routes — never inlined into
-the pipeline source (avoids SyntaxError from botched try/except surgery).
+Imported by acestep_v15_pipeline after setup_api_routes.
+
+ace-step-ui Format calls POST /format_input. Failures that surface as
+"LLM not initialized" / "LLM may not be available" usually mean the
+closure captured a None/unready handler. We re-resolve from app.state and
+attempt initialize() before format_sample.
 """
 from __future__ import annotations
 
@@ -34,6 +38,16 @@ def _empty_cache(tag: str = "") -> None:
         gc.collect()
     except Exception:
         pass
+
+
+def _is_llm_ready(handler) -> bool:
+    if handler is None:
+        return False
+    return bool(
+        getattr(handler, "llm_initialized", False)
+        or getattr(handler, "is_initialized", False)
+        or getattr(handler, "initialized", False)
+    )
 
 
 def register_format_routes(demo, llm_handler) -> None:
@@ -75,8 +89,53 @@ def register_format_routes(demo, llm_handler) -> None:
         except Exception as exc:
             print(f"[XPU-format] DiT park warning: {exc}")
 
-    def _ensure_lm_offload() -> None:
-        if llm_handler is None:
+    def _resolve_llm():
+        st = getattr(app, "state", None)
+        if st is not None:
+            for attr in ("llm_handler", "_llm_handler", "lm_handler"):
+                h = getattr(st, attr, None)
+                if h is not None:
+                    return h
+        return llm_handler
+
+    def _ensure_llm_ready(handler):
+        if handler is None:
+            return None, (
+                "LLM handler is None — wait until Auto-init finishes "
+                "(LM line in startup log), then try Format again"
+            )
+        if _is_llm_ready(handler):
+            return handler, None
+
+        model_path = os.environ.get("ACESTEP_LM_MODEL_PATH") or "acestep-5Hz-lm-1.7B"
+        for name in ("initialize", "init_llm", "ensure_initialized", "load_model"):
+            fn = getattr(handler, name, None)
+            if not callable(fn):
+                continue
+            try:
+                print(f"[XPU-format] LM not ready — calling handler.{name}()")
+                try:
+                    fn()
+                except TypeError:
+                    try:
+                        fn(lm_model_path=model_path)
+                    except TypeError:
+                        fn(model_path)
+                if _is_llm_ready(handler):
+                    print(f"[XPU-format] LM ready after {name}()")
+                    return handler, None
+            except Exception as exc:
+                print(f"[XPU-format] handler.{name}() failed: {exc}")
+
+        if not _is_llm_ready(handler):
+            return handler, (
+                "LLM not initialized — wait for LM load on startup, "
+                "or switch LM once in the UI, then Format again"
+            )
+        return handler, None
+
+    def _ensure_lm_offload(handler) -> None:
+        if handler is None:
             return
         want = _env_bool("ACESTEP_LM_OFFLOAD_TO_CPU", True) or _env_bool(
             "ACESTEP_OFFLOAD_TO_CPU", True
@@ -84,8 +143,8 @@ def register_format_routes(demo, llm_handler) -> None:
         if not want:
             return
         try:
-            if hasattr(llm_handler, "offload_to_cpu"):
-                setattr(llm_handler, "offload_to_cpu", True)
+            if hasattr(handler, "offload_to_cpu"):
+                setattr(handler, "offload_to_cpu", True)
                 print("[XPU-format] llm_handler.offload_to_cpu = True")
         except Exception as exc:
             print(f"[XPU-format] LM offload flag warning: {exc}")
@@ -146,16 +205,20 @@ def register_format_routes(demo, llm_handler) -> None:
             user_metadata["language"] = str(language)
 
         def _run():
+            handler = _resolve_llm()
+            handler, err = _ensure_llm_ready(handler)
+            if err:
+                raise RuntimeError(err)
             print("[XPU-format] preparing headroom before format_sample")
             _empty_cache("(before format)")
             _park_dit_cpu()
-            _ensure_lm_offload()
+            _ensure_lm_offload(handler)
             _empty_cache("(after park)")
             from acestep.inference import format_sample
 
             try:
                 return format_sample(
-                    llm_handler=llm_handler,
+                    llm_handler=handler,
                     caption=prompt,
                     lyrics=lyrics,
                     user_metadata=user_metadata or None,
@@ -221,4 +284,4 @@ def register_format_routes(demo, llm_handler) -> None:
 
     app.add_api_route("/format_input", format_input_endpoint, methods=["POST"])
     app.add_api_route("/format_lyrics", format_input_endpoint, methods=["POST"])
-    print("[XPU] Registered /format_input and /format_lyrics (standalone + RAM headroom)")
+    print("[XPU] Registered /format_input and /format_lyrics (LM ensure + RAM headroom)")
