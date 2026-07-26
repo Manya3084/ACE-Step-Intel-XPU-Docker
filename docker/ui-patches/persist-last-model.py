@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Persist last DiT/LM to /app/checkpoints/.last_* after every successful switch.
 
-Entrypoint reads these and sets ACESTEP_CONFIG_PATH / ACESTEP_LM_MODEL_PATH.
+CRITICAL: never embed a real newline inside a Python string in the injected
+helper (that caused SyntaxError: unterminated string in api_routes.py).
+Use chr(10) for the trailing newline in the file.
 """
 from __future__ import annotations
 
@@ -11,7 +13,9 @@ from pathlib import Path
 
 MARKER = "[XPU-LAST-MODEL]"
 
-HELPER = r'''
+# Use chr(10) — do NOT put \\n or real newlines inside quoted string literals
+# that will be written into api_routes.py.
+HELPER = '''
 def _xpu_persist_last_model(dit_name: str = "", lm_name: str = "") -> None:
     """[XPU-LAST-MODEL] Save last DiT/LM into /app/checkpoints (host volume)."""
     try:
@@ -20,7 +24,6 @@ def _xpu_persist_last_model(dit_name: str = "", lm_name: str = "") -> None:
         base.mkdir(parents=True, exist_ok=True)
         if dit_name and str(dit_name).strip():
             name = str(dit_name).strip()
-            # normalize aliases
             aliases = {
                 "1.5xl soft": "acestep-v15-xl-sft",
                 "1.5xl-soft": "acestep-v15-xl-sft",
@@ -31,34 +34,65 @@ def _xpu_persist_last_model(dit_name: str = "", lm_name: str = "") -> None:
             }
             key = name.lower()
             name = aliases.get(key, name)
-            (base / ".last_dit_model").write_text(name + "\n")
-            print(f"[XPU-LAST-MODEL] wrote .last_dit_model={name}")
+            (base / ".last_dit_model").write_text(name + chr(10))
+            print("[XPU-LAST-MODEL] wrote .last_dit_model=" + name)
         if lm_name and str(lm_name).strip():
             name = str(lm_name).strip()
-            (base / ".last_lm_model").write_text(name + "\n")
-            print(f"[XPU-LAST-MODEL] wrote .last_lm_model={name}")
+            (base / ".last_lm_model").write_text(name + chr(10))
+            print("[XPU-LAST-MODEL] wrote .last_lm_model=" + name)
     except Exception as _e:
-        print(f"[XPU-LAST-MODEL] persist failed: {_e}")
+        print("[XPU-LAST-MODEL] persist failed: " + str(_e))
 '''
+
+
+def _repair_broken_helper(text: str) -> str:
+    """Remove any previous broken _xpu_persist_last_model (unterminated strings)."""
+    # Nuke from def _xpu_persist_last_model through the next top-level def/class
+    # or until we have a balanced function — prefer regex from def to print persist failed
+    patterns = [
+        # Broken form with unterminated quote
+        re.compile(
+            r"\ndef _xpu_persist_last_model\([\s\S]*?(?=\n(?:def |class |async def ))",
+            re.M,
+        ),
+        re.compile(
+            r"def _xpu_persist_last_model\([\s\S]*?persist failed[\s\S]*?\n",
+            re.M,
+        ),
+    ]
+    for pat in patterns:
+        if pat.search(text):
+            text = pat.sub("\n", text, count=1)
+            print("Removed old/broken _xpu_persist_last_model block")
+            break
+    # Also fix any standalone broken write_text lines left over
+    text = re.sub(
+        r'\(base / "\.last_dit_model"\)\.write_text\(name \+\s*\n\s*""\)',
+        '(base / ".last_dit_model").write_text(name + chr(10))',
+        text,
+    )
+    text = re.sub(
+        r'\(base / "\.last_lm_model"\)\.write_text\(name \+\s*\n\s*""\)',
+        '(base / ".last_lm_model").write_text(name + chr(10))',
+        text,
+    )
+    return text
 
 
 def patch_api_routes(path: Path) -> bool:
     text = path.read_text()
-    changed = False
+    text = _repair_broken_helper(text)
+    changed = True  # always re-apply clean helper after repair attempt
 
-    # Always refresh helper body so alias fixes land on restart
-    if "_xpu_persist_last_model" in text:
-        text2 = re.sub(
-            r"\ndef _xpu_persist_last_model\([\s\S]*?\n    except Exception as _e:[\s\S]*?print\(f\"\[XPU-LAST-MODEL\] persist failed:[\s\S]*?\)\n",
-            "\n" + HELPER.strip() + "\n",
-            text,
-            count=1,
-        )
-        if text2 != text:
-            text = text2
-            changed = True
-            print("OK refreshed _xpu_persist_last_model helper")
-    else:
+    if "_xpu_persist_last_model" in text and "chr(10)" in text and "[XPU-LAST-MODEL]" in text:
+        # helper already good
+        if "write_text(name +" in text and "chr(10)" not in text.split("_xpu_persist_last_model")[1][:800]:
+            pass  # still need refresh
+        else:
+            # Ensure call sites exist; helper ok
+            changed = False
+
+    if "def _xpu_persist_last_model" not in text or "chr(10)" not in text:
         if "from loguru import logger" in text:
             text = text.replace(
                 "from loguru import logger",
@@ -68,73 +102,46 @@ def patch_api_routes(path: Path) -> bool:
         else:
             text = HELPER + "\n" + text
         changed = True
-        print(f"OK helper in {path}")
+        print(f"OK inserted clean helper in {path}")
+    elif "chr(10)" not in text:
+        # replace body only
+        text = re.sub(
+            r"def _xpu_persist_last_model\([\s\S]*?print\(\[XPU-LAST-MODEL\] persist failed[\s\S]*?\)\n",
+            HELPER.strip() + "\n",
+            text,
+            count=1,
+        )
+        changed = True
+        print("OK replaced helper with chr(10) version")
 
-    # DiT: persist after "DiT loaded" using loaded or model variable
-    if "_xpu_persist_last_model(dit_name=" not in text or text.count("_xpu_persist_last_model(dit_name=") < 1:
-        # Prefer explicit injection after DiT loaded log
-        if "DiT loaded" in text and "_xpu_persist_last_model(dit_name=" not in text:
+    # DiT persist call sites
+    if "_xpu_persist_last_model(dit_name=" not in text:
+        if "DiT loaded" in text:
             lines = text.splitlines(keepends=True)
             out = []
             done = False
             for line in lines:
                 out.append(line)
-                if (
-                    not done
-                    and "DiT loaded" in line
-                    and "logger" in line
-                ):
+                if not done and "DiT loaded" in line and "logger" in line:
                     indent = re.match(r"^(\s*)", line).group(1)
                     out.append(
-                        f"{indent}try:\n"
-                        f"{indent}    _xpu_persist_last_model(dit_name=str(loaded if 'loaded' in dir() else model))  # {MARKER}\n"
-                        f"{indent}except Exception:\n"
-                        f"{indent}    pass\n"
+                        f"{indent}_xpu_persist_last_model(dit_name=str(loaded))  # {MARKER}\n"
                     )
                     done = True
                     changed = True
                     print("OK DiT persist after DiT loaded")
             text = "".join(out)
-
-    # Also persist when switch starts with target model name (more reliable)
-    if "_xpu_persist_last_model(dit_name=str(model)" not in text:
-        # common pattern in _switch_dit_model_sync
-        for needle in (
-            "Switching DiT:",
-            "[v1/init] Switching DiT",
-        ):
-            if needle in text:
-                # insert after the log line that mentions Switching DiT
-                lines = text.splitlines(keepends=True)
-                out = []
-                done = False
-                for line in lines:
-                    out.append(line)
-                    if not done and needle in line and "logger" in line:
-                        indent = re.match(r"^(\s*)", line).group(1)
-                        # try to persist `model` or `config_path` if in scope later on success only
-                        # skip start-of-switch write — wait for success
-                        done = True
-                    out  # keep
-                text = "".join(out)
-                break
-
-    # Success return path: loaded_model key
-    if '"loaded_model"' in text and "_xpu_persist_last_model(dit_name=str(loaded)" not in text:
-        text2, n = re.subn(
-            r'("loaded_model"\s*:\s*loaded)',
-            r'_xpu_persist_last_model(dit_name=str(loaded))  # '
-            + MARKER
-            + r'\n        \1',
-            text,
-            count=1,
-        )
-        if n:
-            text = text2
+        if "_xpu_persist_last_model(dit_name=" not in text and '"loaded_model"' in text:
+            text = text.replace(
+                '"loaded_model": loaded',
+                '_xpu_persist_last_model(dit_name=str(loaded))  # '
+                + MARKER
+                + '\n        "loaded_model": loaded',
+                1,
+            )
             changed = True
             print("OK DiT persist near loaded_model")
 
-    # LM persist
     if "_xpu_persist_last_model(lm_name=" not in text:
         if "LM loaded" in text:
             lines = text.splitlines(keepends=True)
@@ -162,12 +169,37 @@ def patch_api_routes(path: Path) -> bool:
             changed = True
             print("OK LM persist near loaded_lm_model")
 
-    if changed:
-        path.write_text(text)
-        print(f"Wrote {path}")
-        return True
-    print(f"No change: {path}")
-    return False
+    # Validate syntax before writing
+    try:
+        compile(text, str(path), "exec")
+    except SyntaxError as e:
+        print(f"ERROR: patched api_routes still invalid: {e}", file=sys.stderr)
+        # last resort: strip helper and call sites entirely so Gradio can start
+        text2 = path.read_text() if path.is_file() else text
+        text2 = re.sub(
+            r"\ndef _xpu_persist_last_model\([\s\S]*?(?=\n(?:def |class |async def ))",
+            "\n",
+            text2,
+            count=1,
+        )
+        text2 = text2.replace(
+            f"_xpu_persist_last_model(dit_name=str(loaded))  # {MARKER}\n", ""
+        )
+        text2 = text2.replace(
+            f"_xpu_persist_last_model(lm_name=str(loaded))  # {MARKER}\n", ""
+        )
+        try:
+            compile(text2, str(path), "exec")
+            path.write_text(text2)
+            print("RECOVERY: removed broken persist helper so API can import")
+            return True
+        except SyntaxError as e2:
+            print(f"RECOVERY failed: {e2}", file=sys.stderr)
+            sys.exit(1)
+
+    path.write_text(text)
+    print(f"Wrote {path}")
+    return True
 
 
 def main() -> None:
