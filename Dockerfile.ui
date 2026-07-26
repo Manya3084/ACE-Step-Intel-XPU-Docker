@@ -1,19 +1,8 @@
 # =============================================================================
 # ACE-Step UI — Docker image (fspecii/ace-step-ui)
 # =============================================================================
-# Frontend 3003, Express 3001. Training uses shared /app/datasets + docker exec XPU.
-# OPEN_LOCAL_AUTH=true (default): no JWT required for generate / training / LoRA / etc.
-# Create panel: LoRA section has trained-adapter dropdown (createpanel-lora.py)
-# Training panel: dataset JSON dropdown scans /app/datasets/*.json
-# Per-dataset LoRA folders: training-panel-lora-output.py (must not clobber trainingParams)
-# XL 4B DiT models always listed in Create advanced dropdown (generate-models-xl.py)
-# Song row badges: 1.5XL for XL models (songlist-xl-badge.py)
-# Sticky DiT selection: createpanel-model-sticky.py (no snap-back to turbo)
-# LM Model dropdown: live switch via /api/generate/switch-lm -> Gradio /v1/init
-# DiT model menu: live switch via /api/generate/switch-dit -> Gradio /v1/init (XL)
-# Generate button: second click cancels active jobs (createpanel-generate-cancel.py)
-# AI Format: timeout-aware error messaging (format-ui-timeout.py)
-# No UI "Restart acestep-xpu" button — use compose restart + autoheal instead
+# XPU defaults: FLAC output, ADG never auto-on for base (createpanel-xpu-defaults.py)
+# No UI "Restart acestep-xpu" button — compose restart + autoheal
 # =============================================================================
 
 FROM node:20-bookworm-slim
@@ -88,7 +77,7 @@ async function buildGradioArgs(params: GenerationParams): Promise<unknown[]> {
     params.audioCoverStrength ?? 1.0, 0.0, params.useAdg ?? false, false,
     params.cfgIntervalStart ?? 0.0, params.cfgIntervalEnd ?? 1.0, params.shift ?? 3.0,
     params.inferMethod || 'ode', 'euler', 0.0, 0.0, true, 'double', 0.02, 0.06, 'haar',
-    params.customTimesteps || '', params.audioFormat || 'mp3', '128k', 48000,
+    params.customTimesteps || '', params.audioFormat || 'flac', '128k', 48000,
     params.lmTemperature ?? 0.85, isThinking, params.lmCfgScale ?? 2.0,
     params.lmTopK ?? 0, params.lmTopP ?? 0.9, params.lmNegativePrompt || 'NO USER INPUT',
     useCot ? (params.useCotMetas ?? true) : true,
@@ -139,6 +128,7 @@ COPY docker/ui-patches/createpanel-model-sticky.py /tmp/createpanel-model-sticky
 COPY docker/ui-patches/createpanel-lm-switch.py /tmp/createpanel-lm-switch.py
 COPY docker/ui-patches/createpanel-dit-live-switch.py /tmp/createpanel-dit-live-switch.py
 COPY docker/ui-patches/createpanel-generate-cancel.py /tmp/createpanel-generate-cancel.py
+COPY docker/ui-patches/createpanel-xpu-defaults.py /tmp/createpanel-xpu-defaults.py
 COPY docker/ui-patches/format-ui-timeout.py /tmp/format-ui-timeout.py
 
 RUN python3 - <<'PY'
@@ -162,7 +152,7 @@ import { Router, Response } from \'express\';
 import { pool } from \'../db/pool.js\';
 import { authMiddleware, AuthenticatedRequest } from \'../middleware/auth.js\';
 const router = Router();
-const DEFAULT_SETTINGS: Record<string, unknown> = { batchSize: 1, inferenceSteps: 8, guidanceScale: 7.0, audioFormat: \'mp3\', vocalLanguage: \'en\' };
+const DEFAULT_SETTINGS: Record<string, unknown> = { batchSize: 1, inferenceSteps: 8, guidanceScale: 7.0, audioFormat: \'flac\', vocalLanguage: \'en\' };
 function parseSettings(raw: unknown): Record<string, unknown> {
   if (raw == null) return { ...DEFAULT_SETTINGS };
   if (typeof raw === \'object\') return { ...DEFAULT_SETTINGS, ...(raw as object) };
@@ -194,13 +184,10 @@ router.delete(\'/\', authMiddleware, async (req: AuthenticatedRequest, res: Resp
 export default router;
 '''.replace("\\'", "'"))
 
-# system routes kept minimal — no UI restart button; API disabled by default
 Path("server/src/routes/system.ts").write_text('''
 import { Router, Response } from \'express\';
 import { authMiddleware, AuthenticatedRequest } from \'../middleware/auth.js\';
 const router = Router();
-// Restart-from-UI removed. Use: docker restart acestep-xpu
-// or compose restart: unless-stopped + autoheal on failed healthcheck.
 router.post(\'/restart-xpu\', authMiddleware, async (_req: AuthenticatedRequest, res: Response) => {
   res.status(410).json({
     error: \'UI restart removed\',
@@ -220,7 +207,7 @@ if "/api/settings" not in it:
     if "app.use('/api/settings'" not in it:
         it = it.replace("app.use('/api/auth', authRoutes);", "app.use('/api/auth', authRoutes);\napp.use('/api/settings', settingsRoutes);\napp.use('/api/system', systemRoutes);")
     idx.write_text(it)
-print("settings/system routes wired (no UI restart button)")
+print("settings/system routes wired")
 PY
 
 RUN python3 /tmp/training-docker.py
@@ -237,6 +224,7 @@ RUN python3 /tmp/createpanel-model-sticky.py
 RUN python3 /tmp/createpanel-lm-switch.py
 RUN python3 /tmp/createpanel-dit-live-switch.py
 RUN python3 /tmp/createpanel-generate-cancel.py
+RUN python3 /tmp/createpanel-xpu-defaults.py
 RUN python3 /tmp/format-ui-timeout.py
 
 RUN python3 - <<'PY'
@@ -255,7 +243,6 @@ process.on('uncaughtException', (err) => {
     p.write_text(t)
 PY
 
-# Explicitly do NOT inject ace-xpu-restart.js (green Restart button removed)
 RUN python3 - <<'PY'
 from pathlib import Path
 for hp in ["index.html", "public/index.html"]:
@@ -266,9 +253,7 @@ for hp in ["index.html", "public/index.html"]:
     if "ace-xpu-restart" in h:
         h = h.replace('<script src="/ace-xpu-restart.js"></script>', '')
         p.write_text(h)
-        print(f"stripped restart script tag from {hp}")
 Path("public").mkdir(exist_ok=True)
-# leave no restart widget file
 r = Path("public/ace-xpu-restart.js")
 if r.exists():
     r.unlink()
@@ -312,7 +297,6 @@ ln -sfn /app/datasets /app/ACE-Step-1.5/datasets || true
 ln -sfn /app/checkpoints /app/ACE-Step-1.5/checkpoints || true
 ln -sfn /app/lora_output /app/server/lora_output || true
 mkdir -p /app/server/public /app/public
-# Do not ship ace-xpu-restart.js
 for f in ace-xpu-console.js ace-xpu-draft.js ace-xpu-lora-picker.js; do
   if [ -f /app/public/$f ]; then cp -f /app/public/$f /app/server/public/ 2>/dev/null || true; fi
 done
