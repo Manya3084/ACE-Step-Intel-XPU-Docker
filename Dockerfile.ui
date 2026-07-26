@@ -13,6 +13,7 @@
 # DiT model menu: live switch via /api/generate/switch-dit -> Gradio /v1/init (XL)
 # Generate button: second click cancels active jobs (createpanel-generate-cancel.py)
 # AI Format: timeout-aware error messaging (format-ui-timeout.py)
+# No UI "Restart acestep-xpu" button — use compose restart + autoheal instead
 # =============================================================================
 
 FROM node:20-bookworm-slim
@@ -193,24 +194,18 @@ router.delete(\'/\', authMiddleware, async (req: AuthenticatedRequest, res: Resp
 export default router;
 '''.replace("\\'", "'"))
 
+# system routes kept minimal — no UI restart button; API disabled by default
 Path("server/src/routes/system.ts").write_text('''
 import { Router, Response } from \'express\';
-import { execFile } from \'child_process\';
-import { promisify } from \'util\';
 import { authMiddleware, AuthenticatedRequest } from \'../middleware/auth.js\';
-const execFileAsync = promisify(execFile);
 const router = Router();
+// Restart-from-UI removed. Use: docker restart acestep-xpu
+// or compose restart: unless-stopped + autoheal on failed healthcheck.
 router.post(\'/restart-xpu\', authMiddleware, async (_req: AuthenticatedRequest, res: Response) => {
-  if ((process.env.ENABLE_DOCKER_RESTART || \'true\').toLowerCase() === \'false\') {
-    return res.status(403).json({ error: \'Docker restart disabled\' });
-  }
-  const name = process.env.XPU_CONTAINER_NAME || \'acestep-xpu\';
-  try {
-    await execFileAsync(\'docker\', [\'restart\', name], { timeout: 120000 });
-    res.json({ ok: true, container: name, message: \'Restart issued. Wait 1-3 minutes for models to reload.\' });
-  } catch (err: any) {
-    res.status(500).json({ error: \'Failed to restart container\', detail: String(err?.stderr || err?.message || err) });
-  }
+  res.status(410).json({
+    error: \'UI restart removed\',
+    message: \'Use docker restart acestep-xpu, or rely on autoheal / restart: unless-stopped.\',
+  });
 });
 export default router;
 '''.replace("\\'", "'"))
@@ -225,7 +220,7 @@ if "/api/settings" not in it:
     if "app.use('/api/settings'" not in it:
         it = it.replace("app.use('/api/auth', authRoutes);", "app.use('/api/auth', authRoutes);\napp.use('/api/settings', settingsRoutes);\napp.use('/api/system', systemRoutes);")
     idx.write_text(it)
-print("settings/system routes wired")
+print("settings/system routes wired (no UI restart button)")
 PY
 
 RUN python3 /tmp/training-docker.py
@@ -260,40 +255,24 @@ process.on('uncaughtException', (err) => {
     p.write_text(t)
 PY
 
+# Explicitly do NOT inject ace-xpu-restart.js (green Restart button removed)
 RUN python3 - <<'PY'
 from pathlib import Path
-js = r'''(function(){
-  function ensure(){
-    if(document.getElementById("ace-xpu-restart-btn"))return;
-    var w=document.createElement("div");
-    w.style.cssText="position:fixed;bottom:16px;right:16px;z-index:99999";
-    var b=document.createElement("button");
-    b.id="ace-xpu-restart-btn";
-    b.textContent="Restart acestep-xpu";
-    b.style.cssText="background:#1db954;color:#000;border:none;border-radius:999px;padding:10px 16px;font-weight:700;cursor:pointer";
-    b.onclick=async function(){
-      if(!confirm("Restart acestep-xpu?"))return;
-      b.disabled=true;
-      try{
-        var r=await fetch("/api/system/restart-xpu",{method:"POST",headers:{"Content-Type":"application/json"}});
-        var d=await r.json();
-        alert(d.message||d.error||"done");
-      }catch(e){alert(String(e));}
-      b.disabled=false;
-    };
-    w.appendChild(b);
-    document.body.appendChild(w);
-  }
-  setTimeout(ensure,1500);
-})();'''
-Path("public").mkdir(exist_ok=True)
-Path("public/ace-xpu-restart.js").write_text(js)
 for hp in ["index.html", "public/index.html"]:
     p = Path(hp)
-    if p.exists() and "ace-xpu-restart" not in p.read_text():
-        h = p.read_text()
-        p.write_text(h.replace("</body>", '<script src="/ace-xpu-restart.js"></script></body>') if "</body>" in h else h + '<script src="/ace-xpu-restart.js"></script>')
-print("restart button ok")
+    if not p.exists():
+        continue
+    h = p.read_text()
+    if "ace-xpu-restart" in h:
+        h = h.replace('<script src="/ace-xpu-restart.js"></script>', '')
+        p.write_text(h)
+        print(f"stripped restart script tag from {hp}")
+Path("public").mkdir(exist_ok=True)
+# leave no restart widget file
+r = Path("public/ace-xpu-restart.js")
+if r.exists():
+    r.unlink()
+print("UI restart button disabled")
 PY
 
 RUN npm install && cd server && npm install && cd ..
@@ -306,7 +285,7 @@ ENV DATASETS_DIR=/app/datasets
 ENV DATASETS_UPLOADS_DIR=/app/datasets/uploads
 ENV ACESTEP_PATH=/app
 ENV LORA_OUTPUT_DIR=/app/lora_output
-ENV ENABLE_DOCKER_RESTART=true
+ENV ENABLE_DOCKER_RESTART=false
 ENV ENABLE_LOG_STREAM=true
 ENV XPU_CONTAINER_NAME=acestep-xpu
 ENV UI_CONTAINER_NAME=acestep-ui
@@ -333,9 +312,11 @@ ln -sfn /app/datasets /app/ACE-Step-1.5/datasets || true
 ln -sfn /app/checkpoints /app/ACE-Step-1.5/checkpoints || true
 ln -sfn /app/lora_output /app/server/lora_output || true
 mkdir -p /app/server/public /app/public
-for f in ace-xpu-restart.js ace-xpu-console.js ace-xpu-draft.js ace-xpu-lora-picker.js; do
+# Do not ship ace-xpu-restart.js
+for f in ace-xpu-console.js ace-xpu-draft.js ace-xpu-lora-picker.js; do
   if [ -f /app/public/$f ]; then cp -f /app/public/$f /app/server/public/ 2>/dev/null || true; fi
 done
+rm -f /app/public/ace-xpu-restart.js /app/server/public/ace-xpu-restart.js 2>/dev/null || true
 cat > /app/server/.env <<ENVEOF
 PORT=${PORT:-3001}
 NODE_ENV=development
@@ -349,7 +330,7 @@ DATASETS_DIR=${DATASETS_DIR:-/app/datasets}
 DATASETS_UPLOADS_DIR=${DATASETS_UPLOADS_DIR:-/app/datasets/uploads}
 ACESTEP_PATH=${ACESTEP_PATH:-/app}
 LORA_OUTPUT_DIR=${LORA_OUTPUT_DIR:-/app/lora_output}
-ENABLE_DOCKER_RESTART=${ENABLE_DOCKER_RESTART:-true}
+ENABLE_DOCKER_RESTART=false
 ENABLE_LOG_STREAM=${ENABLE_LOG_STREAM:-true}
 XPU_CONTAINER_NAME=${XPU_CONTAINER_NAME:-acestep-xpu}
 UI_CONTAINER_NAME=${UI_CONTAINER_NAME:-acestep-ui}
