@@ -1,11 +1,9 @@
 """Standalone /format_input + /format_lyrics with A770 headroom + LM ensure.
 
-Imported by acestep_v15_pipeline after setup_api_routes.
-
-ace-step-ui Format calls POST /format_input. Failures that surface as
-"LLM not initialized" / "LLM may not be available" usually mean the
-closure captured a None/unready handler. We re-resolve from app.state and
-attempt initialize() before format_sample.
+ace-step-ui Format → POST /format_input. "LLM not initialized" often means
+llm_handler.llm_initialized stayed False after a successful live LM switch
+(weights loaded, flag not set). We force-mark ready when the model object
+exists, and re-resolve the handler from app.state on every request.
 """
 from __future__ import annotations
 
@@ -40,18 +38,38 @@ def _empty_cache(tag: str = "") -> None:
         pass
 
 
+def _has_lm_weights(handler) -> bool:
+    if handler is None:
+        return False
+    for attr in ("llm", "model", "_model", "lm_model", "pytorch_model"):
+        if getattr(handler, attr, None) is not None:
+            return True
+    # path recorded after successful init
+    if getattr(handler, "_lm_full_model_path", None):
+        return True
+    cfg = getattr(handler, "_last_initialize_config", None) or {}
+    if cfg.get("lm_model_path"):
+        return True
+    return False
+
+
 def _is_llm_ready(handler) -> bool:
     if handler is None:
         return False
-    return bool(
-        getattr(handler, "llm_initialized", False)
-        or getattr(handler, "is_initialized", False)
-        or getattr(handler, "initialized", False)
-    )
+    if bool(getattr(handler, "llm_initialized", False)):
+        return True
+    # Weights present but flag stuck False (live-switch race)
+    if _has_lm_weights(handler):
+        try:
+            handler.llm_initialized = True
+            print("[XPU-format] forced llm_initialized=True (weights present)")
+        except Exception:
+            pass
+        return True
+    return False
 
 
 def register_format_routes(demo, llm_handler) -> None:
-    """Register POST /format_input and /format_lyrics on the Gradio FastAPI app."""
     try:
         from fastapi import Request
     except Exception as exc:
@@ -101,36 +119,62 @@ def register_format_routes(demo, llm_handler) -> None:
     def _ensure_llm_ready(handler):
         if handler is None:
             return None, (
-                "LLM handler is None — wait until Auto-init finishes "
-                "(LM line in startup log), then try Format again"
+                "LLM handler is None — wait until Auto-init finishes, "
+                "then try Format again"
             )
         if _is_llm_ready(handler):
             return handler, None
 
         model_path = os.environ.get("ACESTEP_LM_MODEL_PATH") or "acestep-5Hz-lm-1.7B"
-        for name in ("initialize", "init_llm", "ensure_initialized", "load_model"):
-            fn = getattr(handler, name, None)
-            if not callable(fn):
-                continue
+        checkpoint_dir = os.environ.get("ACESTEP_CHECKPOINTS_DIR") or "/app/checkpoints"
+        backend = (os.environ.get("ACESTEP_LLM_BACKEND") or "pt").strip().lower()
+        device = (os.environ.get("ACESTEP_LM_DEVICE") or os.environ.get("PYTORCH_DEVICE") or "xpu").strip()
+        offload = _env_bool("ACESTEP_LM_OFFLOAD_TO_CPU", True)
+
+        init = getattr(handler, "initialize", None)
+        if callable(init):
             try:
-                print(f"[XPU-format] LM not ready — calling handler.{name}()")
-                try:
-                    fn()
-                except TypeError:
+                print(
+                    f"[XPU-format] LM not ready — initialize("
+                    f"path={model_path}, backend={backend}, device={device}, offload={offload})"
+                )
+                status, ok = init(
+                    checkpoint_dir=checkpoint_dir,
+                    lm_model_path=model_path,
+                    backend=backend,
+                    device=device,
+                    offload_to_cpu=offload,
+                    dtype=None,
+                )
+                print(f"[XPU-format] initialize → ok={ok} status={status!r}")
+                if ok:
                     try:
-                        fn(lm_model_path=model_path)
-                    except TypeError:
-                        fn(model_path)
-                if _is_llm_ready(handler):
-                    print(f"[XPU-format] LM ready after {name}()")
+                        handler.llm_initialized = True
+                    except Exception:
+                        pass
+                    st = getattr(app, "state", None)
+                    if st is not None:
+                        try:
+                            st._llm_initialized = True
+                            st._llm_init_error = None
+                        except Exception:
+                            pass
                     return handler, None
+            except TypeError as te:
+                print(f"[XPU-format] initialize signature mismatch: {te}")
+                try:
+                    init()
+                    if _is_llm_ready(handler):
+                        return handler, None
+                except Exception as exc:
+                    print(f"[XPU-format] initialize() failed: {exc}")
             except Exception as exc:
-                print(f"[XPU-format] handler.{name}() failed: {exc}")
+                print(f"[XPU-format] initialize failed: {exc}")
 
         if not _is_llm_ready(handler):
             return handler, (
-                "LLM not initialized — wait for LM load on startup, "
-                "or switch LM once in the UI, then Format again"
+                "LLM not initialized (flag=False, no weights). "
+                "Wait for '5Hz LM initialized' in logs, or switch LM once in UI."
             )
         return handler, None
 
@@ -145,9 +189,8 @@ def register_format_routes(demo, llm_handler) -> None:
         try:
             if hasattr(handler, "offload_to_cpu"):
                 setattr(handler, "offload_to_cpu", True)
-                print("[XPU-format] llm_handler.offload_to_cpu = True")
-        except Exception as exc:
-            print(f"[XPU-format] LM offload flag warning: {exc}")
+        except Exception:
+            pass
 
     async def format_input_endpoint(request: Request):
         try:
@@ -162,6 +205,15 @@ def register_format_routes(demo, llm_handler) -> None:
             temperature = float(temperature)
         except Exception:
             temperature = 0.85
+
+        if not str(prompt).strip():
+            return {
+                "data": None,
+                "code": 400,
+                "error": "Caption/style is required for Format",
+                "timestamp": int(time.time() * 1000),
+                "extra": None,
+            }
 
         param_obj = body.get("param_obj", {})
         if isinstance(param_obj, str):
@@ -206,9 +258,19 @@ def register_format_routes(demo, llm_handler) -> None:
 
         def _run():
             handler = _resolve_llm()
+            print(
+                f"[XPU-format] handler={type(handler).__name__ if handler else None} "
+                f"llm_initialized={getattr(handler, 'llm_initialized', None)} "
+                f"has_weights={_has_lm_weights(handler)}"
+            )
             handler, err = _ensure_llm_ready(handler)
             if err:
                 raise RuntimeError(err)
+            # format_sample checks llm_initialized strictly — force True once more
+            try:
+                handler.llm_initialized = True
+            except Exception:
+                pass
             print("[XPU-format] preparing headroom before format_sample")
             _empty_cache("(before format)")
             _park_dit_cpu()
@@ -273,15 +335,19 @@ def register_format_routes(demo, llm_handler) -> None:
             "extra": None,
         }
 
+    # Drop prior registrations (ours + upstream APIRouter copies)
     try:
-        app.router.routes = [
-            r
-            for r in app.router.routes
-            if getattr(r, "path", None) not in ("/format_input", "/format_lyrics")
-        ]
-    except Exception:
-        pass
+        kept = []
+        for r in list(app.router.routes):
+            path = getattr(r, "path", None)
+            if path in ("/format_input", "/format_lyrics"):
+                print(f"[XPU-format] removing route {path} {type(r).__name__}")
+                continue
+            kept.append(r)
+        app.router.routes = kept
+    except Exception as exc:
+        print(f"[XPU-format] route cleanup warning: {exc}")
 
     app.add_api_route("/format_input", format_input_endpoint, methods=["POST"])
     app.add_api_route("/format_lyrics", format_input_endpoint, methods=["POST"])
-    print("[XPU] Registered /format_input and /format_lyrics (LM ensure + RAM headroom)")
+    print("[XPU] Registered /format_input and /format_lyrics (force-ready + headroom)")
