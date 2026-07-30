@@ -5,7 +5,9 @@
 # Dual-GPU hosts (e.g. A750 + A770):
 #   ZE_AFFINITY_MASK selects which Level Zero device(s) are visible.
 #   On a host where [0]=A750 and [1]=A770, set ZE_AFFINITY_MASK=1 so only the
-#   A770 is seen (renumbered as xpu:0). Leave empty to use all devices.
+#   A770 is seen (renumbered as xpu:0).
+#   Do NOT also set ONEAPI_DEVICE_SELECTOR=level_zero:1 — after affinity the
+#   surviving GPU is index 0; selecting :1 yields "No XPU devices".
 #
 # Usage:
 #   mkdir -p datasets/uploads lora_output checkpoints
@@ -48,10 +50,8 @@ services:
       - SYCL_CACHE_PERSISTENT=1
       - SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS=1
       - ZE_FLAT_DEVICE_HIERARCHY=COMPOSITE
-      # Hide non-compute GPUs (e.g. A750 for transcode). Default 1 = second device
-      # when host enumerates [0]=A750 [1]=A770. Override in .env if order differs.
+      # Only expose A770 when host is [0]=A750 [1]=A770. Override in .env if needed.
       - ZE_AFFINITY_MASK=${ZE_AFFINITY_MASK:-1}
-      - ONEAPI_DEVICE_SELECTOR=${ONEAPI_DEVICE_SELECTOR:-level_zero:1}
       - DATASETS_DIR=/app/datasets
       - LORA_OUTPUT_DIR=/app/lora_output
 
