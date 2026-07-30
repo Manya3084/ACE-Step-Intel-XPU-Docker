@@ -2,23 +2,10 @@
 # ACE-Step 1.5 + ace-step-ui — Full stack for Intel XPU / Arc GPUs
 # =============================================================================
 #
-# Services:
-#   acestep-xpu  — Gradio + API on port 8001 (Intel XPU)
-#   acestep-ui   — Spotify-style web UI
-#                   host 3003 = frontend
-#                   host 3004 = UI backend
-#   autoheal     — restarts containers that stay unhealthy (hangs / dead API)
-#
-# Crash recovery:
-#   - restart: unless-stopped  → Docker restarts if the process exits (OOM kill,
-#     Python fatal, segfault). This is the main self-heal path.
-#   - autoheal                 → if the process is stuck but still "running",
-#     healthcheck fails → autoheal issues docker restart.
-#
-# Shared host dirs (Training / LoRA):
-#   ./datasets      — audio, JSON, uploads, preprocessed tensors
-#   ./lora_output   — trained adapters / checkpoints
-#   ./checkpoints   — DiT/LM weights
+# Dual-GPU hosts (e.g. A750 + A770):
+#   ZE_AFFINITY_MASK selects which Level Zero device(s) are visible.
+#   On a host where [0]=A750 and [1]=A770, set ZE_AFFINITY_MASK=1 so only the
+#   A770 is seen (renumbered as xpu:0). Leave empty to use all devices.
 #
 # Usage:
 #   mkdir -p datasets/uploads lora_output checkpoints
@@ -61,6 +48,10 @@ services:
       - SYCL_CACHE_PERSISTENT=1
       - SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS=1
       - ZE_FLAT_DEVICE_HIERARCHY=COMPOSITE
+      # Hide non-compute GPUs (e.g. A750 for transcode). Default 1 = second device
+      # when host enumerates [0]=A750 [1]=A770. Override in .env if order differs.
+      - ZE_AFFINITY_MASK=${ZE_AFFINITY_MASK:-1}
+      - ONEAPI_DEVICE_SELECTOR=${ONEAPI_DEVICE_SELECTOR:-level_zero:1}
       - DATASETS_DIR=/app/datasets
       - LORA_OUTPUT_DIR=/app/lora_output
 
@@ -78,15 +69,12 @@ services:
 
     shm_size: "2gb"
 
-    # Restart when the main process exits (crash, OOM kill, fatal error).
-    # Does NOT restart a hung process that is still alive — autoheal covers that.
     restart: unless-stopped
 
     labels:
       - autoheal=true
 
     healthcheck:
-      # Prefer dedicated /health when routes are up; fall back to Gradio root.
       test: >-
         curl -sf http://localhost:8001/health > /dev/null 2>&1 ||
         curl -sf http://localhost:8001/ > /dev/null 2>&1 ||
@@ -94,7 +82,6 @@ services:
         exit 1
       interval: 30s
       timeout: 15s
-      # Model load can take several minutes on first boot / after XL switch
       start_period: 360s
       retries: 5
 
@@ -154,8 +141,6 @@ services:
       start_period: 90s
       retries: 5
 
-  # Restarts any container with label autoheal=true after healthcheck stays failed.
-  # Covers "process alive but API dead" cases that restart: unless-stopped misses.
   autoheal:
     image: willfarrell/autoheal:latest
     container_name: acestep-autoheal
